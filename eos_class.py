@@ -7,7 +7,7 @@ import pdb
 import pandas as pd
 from tqdm import tqdm
 from numba import njit
-from eos import ideal_eos, metals_eos
+from eos import ideal_eos, metals_eos, scvh_eos
 from scipy.optimize import root, newton, brentq, brenth, minimize
 from scipy.ndimage import gaussian_filter1d, gaussian_filter
 from astropy.constants import k_B
@@ -169,12 +169,13 @@ class mixtures(hhe):
                     rhot_sp_inv = False,
                     srho_rhop_inv = False
                     ):
-
-        super().__init__(hhe_eos=hhe_eos)
+        if hhe_eos in ['cms', 'cd']:
+            super().__init__(hhe_eos=hhe_eos)
 
         self.y_prime = y_prime
         self.hg = hg
         self.z_eos = z_eos
+        self.hhe_eos = hhe_eos
 
         if self.z_eos == 'mixture':
             self.zmix_eos1 = zmix_eos1
@@ -398,17 +399,14 @@ class mixtures(hhe):
             if self.hhe_eos == 'cms':
                 smix_xy_nonideal = self.smix_interp(_lgp, _lgt) * (1 - _y_prime) * _y_prime - smix_xy_ideal
 
-        s_xy = np.zeros_like(_lgp)
+        if self.hhe_eos in ['cms', 'cd']:
+            s_x = 10 ** self.get_s_h(_lgp, _lgt)
+            s_y = 10 ** self.get_s_he(_lgp, _lgt)
 
-        # logt_span = np.where(_lgt[_lgt >= 2.1])[0]
-        # logt_cold = np.where(_lgt[_lgt < 2.1])[0]
+            s_xy = s_x * (1 - _y_prime) + s_y * _y_prime
 
-        s_x = 10 ** self.get_s_h(_lgp, _lgt)
-        s_y = 10 ** self.get_s_he(_lgp, _lgt)
-
-        #s_xy[logt_span] = s_x[logt_span] * (1 - _y_prime[logt_span]) + s_y[logt_span] * _y_prime[logt_span]
-        s_xy = s_x * (1 - _y_prime) + s_y * _y_prime
-        #s_xy[logt_cold] = ideal_xy.get_s_pt(_lgp[logt_cold], _lgt[logt_cold], _y_prime[logt_cold]) / erg_to_kbbar
+        elif self.hhe_eos == 'scvh':
+            s_xy = scvh_eos.get_s_pt_tab(_lgp, _lgt, _y_prime) - smix_xy_ideal # subtract ideal entropy of mixing
 
         if self.z_eos == 'mixture':
             s_z = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
@@ -460,11 +458,17 @@ class mixtures(hhe):
 
         _y = _y_prime * (1 - _z)
         validate_mass_fractions(_y_prime, _z)
-
         vmix = calculate_vmix(_lgp, _lgt, _y_prime)
 
-        rho_h = 10 ** self.get_logrho_h(_lgp, _lgt)
-        rho_he = 10 ** self.get_logrho_he(_lgp, _lgt)
+        if self.hhe_eos in ['cms', 'cd']:
+
+            rho_h = 10 ** self.get_logrho_h(_lgp, _lgt)
+            rho_he = 10 ** self.get_logrho_he(_lgp, _lgt)
+            v_xy = (1 - _y_prime) / rho_h + _y_prime / rho_he + vmix
+
+        elif self.hhe_eos == 'scvh':
+            rho_xy = 10 ** scvh_eos.get_rho_pt_tab(_lgp, _lgt, _y_prime)  # rho_xy is in g/cc
+            v_xy = 1 / rho_xy + vmix # vmix is zero since there are no interaction terms
 
         if self.z_eos == 'mixture':
             rho_z = 10 ** metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
@@ -475,7 +479,8 @@ class mixtures(hhe):
         else:
             rho_z = 10 ** metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=self.z_eos)
 
-        mixture_density = (1 - _y_prime) * (1 - _z) / rho_h + _y_prime * (1 - _z) / rho_he + vmix * (1 - _z) + _z / rho_z
+        #mixture_density = (1 - _y_prime) * (1 - _z) / rho_h + _y_prime * (1 - _z) / rho_he + vmix * (1 - _z) + _z / rho_z
+        mixture_density = v_xy * (1 - _z) + _z / rho_z
 
         return np.log10(1 / mixture_density)
 
@@ -501,8 +506,13 @@ class mixtures(hhe):
 
         umix = calculate_umix(_lgp, _lgt, _y_prime)
 
-        u_h = 10 ** self.get_logu_h(_lgp, _lgt)
-        u_he = 10 ** self.get_logu_he(_lgp, _lgt)
+        if self.hhe_eos in ['cms', 'cd']:
+            u_h = 10 ** self.get_logu_h(_lgp, _lgt)
+            u_he = 10 ** self.get_logu_he(_lgp, _lgt)
+            u_xy = u_h * (1 - _y_prime) + u_he * _y_prime + umix
+
+        elif self.hhe_eos == 'scvh':
+            u_xy = 10 ** scvh_eos.get_u_pt(_lgp, _lgt, _y_prime) + umix # umix is zero since there are no interaction terms
         if self.z_eos == 'mixture':
             u_z = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
@@ -512,10 +522,15 @@ class mixtures(hhe):
         else:
             u_z = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos=self.z_eos)
 
+        # mixture_energy = (
+        #     u_h * (1 - _y_prime) * (1 - _z)
+        #     + u_he * _y_prime * (1 - _z)
+        #     + umix * (1 - _z)
+        #     + u_z * _z
+        # )
+
         mixture_energy = (
-            u_h * (1 - _y_prime) * (1 - _z)
-            + u_he * _y_prime * (1 - _z)
-            + umix * (1 - _z)
+            u_xy * (1 - _z)
             + u_z * _z
         )
 

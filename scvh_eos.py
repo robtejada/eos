@@ -2,13 +2,13 @@ import numpy as np
 #import scvh_nr
 from scipy.optimize import root, root_scalar
 from scipy.interpolate import RegularGridInterpolator as RGI
-from eos import aneos, scvh_man, ideal_eos, cms_eos
+from eos import aneos, scvh_man, ideal_eos
 import os
 
 """
     This file provides thermodynamic quantities and derivatives for the Saumon, Chabrier, and van Horn (1995) H-He EOS.
 
-    The functions rely on precomputed tables, and such functions end with _tab. 
+    The functions rely on precomputed tables, and such functions end with _tab.
     The functions used to invert the tables are also available.
 
     All independnet thermodynamic quantities are ordered in the following manner in the function arguments: s, rho, p, t, y, z
@@ -28,7 +28,7 @@ import os
 """
 
 erg_to_kbbar = 1.202723550011625e-08
-mh = 1 
+mh = 1
 mhe = 4.0026
 
 CURR_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -318,7 +318,7 @@ def get_t_rhop(rho, p, y, alg='root'):
                 return sol.root
             except:
                 raise
-        
+
         sol = np.array([get_t_rhop(rho_, p_, y_) for rho_, p_, y_ in zip(rho, p, y)])
         return sol
 
@@ -376,7 +376,7 @@ def get_s_rhop(rho, p, y, z = 0.0):
     s = get_s_rhot_tab(rho, t, y)
     return s # in cgs
 
-def get_u_pt(p, t, y, z = 0.0): 
+def get_u_pt(p, t, y, z = 0.0):
     u = eos_scvh.get_logu(p, t, y) # volume law
     return u
 
@@ -411,9 +411,9 @@ def get_dsdy_rhop_srho(s, rho, y, z = 0.0, ds=0.1, dy=0.1):
     S0 = s/erg_to_kbbar
     S1 = S0*(1+ds)
     P0 = 10**get_p_srho_tab(S0*erg_to_kbbar, rho, y)
-    P1 = 10**get_p_srho_tab(S1*erg_to_kbbar, rho, y) 
-    P2 = 10**get_p_srho_tab(S0*erg_to_kbbar, rho, y*(1+dy))   
-    
+    P1 = 10**get_p_srho_tab(S1*erg_to_kbbar, rho, y)
+    P2 = 10**get_p_srho_tab(S0*erg_to_kbbar, rho, y*(1+dy))
+
     dpds_rhoy = (P1 - P0)/(S1 - S0)
     dpdy_srho = (P2 - P0)/(y*dy)
 
@@ -452,7 +452,7 @@ def get_c_v(s, rho, y, z = 0.0, ds=0.1):
 
     T0 = get_t_srho_tab(S0*erg_to_kbbar, rho, y)
     T1 = get_t_srho_tab(S1*erg_to_kbbar, rho, y)
- 
+
     return (S1 - S0)/(T1 - T0)
 
 def get_c_p(s, p, y, z = 0.0, ds=0.1):
@@ -498,14 +498,14 @@ def get_dtdy_srho(s, rho, y, z = 0.0, dy=0.01, tab=True):
         T1 = 10**get_t_srho(s, rho, y*(1+dy))
     else:
         T0 = 10**get_t_srho_tab(s, rho, y)
-        T1 = 10**get_t_srho_tab(s, rho, y*(1+dy)) 
+        T1 = 10**get_t_srho_tab(s, rho, y*(1+dy))
 
     return (T1 - T0)/(y*dy)
 
 ### density gradients ###
 
 def get_drhods_py(s, p, y, z = 0.0, ds=0.01):
-    
+
     S1 = s/erg_to_kbbar
     S2 = S1*(1+ds)
 
