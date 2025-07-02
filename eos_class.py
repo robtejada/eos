@@ -2714,7 +2714,7 @@ class multifraction_mixtures(mixtures):
         #                  interp_method=interp_method,
         #                  new_z_mix=new_z_mix)
 
-        # If user doesn't provide a list, use a default range of fractions:
+        # # If user doesn't provide a list, use a default range of fractions:
         # if z_eos_list is None:
         #     z_eos_list = [
         #         f'{zmix_eos1}_{zmix_eos2}_0.0',
@@ -2734,7 +2734,6 @@ class multifraction_mixtures(mixtures):
             ]
         if f_ppv_vals is None:
             f_ppv_vals = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-            #f_ppv_vals = np.array([0.0, 0.25, 0.5, 1.0])
 
         self.hhe_eos = hhe_eos
         self.y_prime = y_prime
