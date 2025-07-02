@@ -11,16 +11,16 @@ import warnings
 warnings.filterwarnings("ignore")
 
 """
-    This file provides access to the AQUA table (Haldemann et al. 2020). 
+    This file provides access to the AQUA table (Haldemann et al. 2020).
     The AQUA table accounts for different phases of water.
 
-    As with the H-He tables, this file reads pre-computed inverted tables and 
+    As with the H-He tables, this file reads pre-computed inverted tables and
     includes the inversion functions used to produce the tables.
 
     The pre-computed table function names end with _tab.
-    
+
     Authors: Roberto Tejada Arevalo
-    
+
 """
 
 mp = amu.to('g')
@@ -45,7 +45,7 @@ def aqua_reader(basis):
         cols = ['rho', 'u', 'press', 'grada', 's', 'temp', 'c', 'mmw', 'x_ion', 'x_d', 'phase']
         tab = np.loadtxt('%s/aqua/aqua_eos_%s_v1_0.dat' % (CURR_DIR, basis), skiprows=21)
 
-    
+
     tab_df = pd.DataFrame(tab, columns=cols)
 
     tab_df['logp'] = np.log10(tab_df['press']*Pa_to_dyn) # in dyn/cm2
@@ -94,12 +94,12 @@ def get_s_pt_tab(lgp, lgt):
         return float(s_rgi_pt(np.array([lgp, lgt]).T))
     return s_rgi_pt(np.array([lgp, lgt]).T)
 
-def get_rho_pt_tab(lgp, lgt):
+def get_logrho_pt_tab(lgp, lgt):
     if np.isscalar(lgp):
         return float(rho_rgi(np.array([lgp, lgt]).T))
     return rho_rgi(np.array([lgp, lgt]).T)
 
-def get_u_pt_tab(lgp, lgt):
+def get_logu_pt_tab(lgp, lgt):
     if np.isscalar(lgp):
         return float(u_rgi_pt(np.array([lgp, lgt]).T))
     return u_rgi_pt(np.array([lgp, lgt]).T)
@@ -327,7 +327,7 @@ def get_c_v(s, rho, ds=0.1):
 
     T0 = get_t_srho_tab(S0*erg_to_kbbar, rho)
     T1 = get_t_srho_tab(S1*erg_to_kbbar, rho)
- 
+
     return (S1 - S0)/(T1 - T0)
 
 def get_c_p(s, p, ds=0.1):

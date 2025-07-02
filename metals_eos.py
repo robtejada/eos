@@ -35,7 +35,7 @@ ideal_water = ideal_eos.IdealEOS(m=18) # default for ideal eos is water for now
 
 def get_rho_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
     if eos == 'aqua':
-        return aqua_eos.get_rho_pt_tab(p, t)
+        return aqua_eos.get_logrho_pt_tab(p, t)
     elif eos == 'aqua_mlcp':
         return aqua_mlcp_eos.get_logrho_pt_tab(p, t)
     elif eos == 'ice_aneos':
@@ -87,7 +87,7 @@ def get_s_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv'
 
 def get_u_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
     if eos == 'aqua':
-        return aqua_eos.get_u_pt_tab(p, t)
+        return aqua_eos.get_logu_pt_tab(p, t)
     elif eos == 'aqua_mlcp':
         return aqua_mlcp_eos.get_logu_pt_tab(p, t)
     elif eos == 'ice_aneos':

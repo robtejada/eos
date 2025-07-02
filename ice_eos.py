@@ -10,7 +10,7 @@ from astropy import units as u
 import importlib
 from tqdm import tqdm
 import os
-from eos import aqua_eos, ppv2_eos, iron2_eos#, ch4, nh3
+from eos import aqua_eos, ppv2_eos, iron2_eos, aqua_mlcp_eos
 
 mp = amu.to('g') # grams
 kb = k_B.to('erg/K') # ergs/K
@@ -24,7 +24,7 @@ class ice_eos:
     Class for calculating the equation of state of ices using the ICE EOS model.
     """
 
-    def __init__(self, path_to_data=None):
+    def __init__(self, path_to_data=None, use_mlcp=False):
         """
         Initialize the class with the path to the data files.
 
@@ -40,7 +40,10 @@ class ice_eos:
         self.methane = np.load('%s/methane_ammonia/methane_eos_pt_extended.npz' % CURR_DIR)
         self.ammonia = np.load('%s/methane_ammonia/ammonia_eos_pt_extended.npz' % CURR_DIR)
 
-        self.water = aqua_eos
+        if use_mlcp:
+            self.water = aqua_mlcp_eos
+        else:
+            self.water = aqua_eos
         self.rock = ppv2_eos
         self.iron = iron2_eos
 
@@ -177,7 +180,7 @@ class ice_eos:
         rho_ammonia = 10 ** logrho_ammonia
 
         # Water EOS: assume water.get_rho_pt_tab returns log10(rho) on the same grid.
-        logrho_water = self.water.get_rho_pt_tab(logp_arr, logt_arr)
+        logrho_water = self.water.get_logrho_pt_tab(logp_arr, logt_arr)
         rho_water = 10 ** logrho_water
 
         # Post-perovskite EOS: assume ppv2_eos.get_rho_pt_tab returns log10(rho) on the same grid.
@@ -256,7 +259,7 @@ class ice_eos:
         # Get pure-component internal energies (assumed in erg/g)
         u_methane = self.u_pt_methane_rgi(pts)
         u_ammonia = self.u_pt_ammonia_rgi(pts)
-        u_water = 10 ** self.water.get_u_pt_tab(logp_arr, logt_arr)
+        u_water = 10 ** self.water.get_logu_pt_tab(logp_arr, logt_arr)
         #u_rock = 10 ** self.rock.get_logu_pt_tab(logp_arr, logt_arr)
         #u_iron = 10 ** self.iron.get_logu_pt_tab(logp_arr, logt_arr)
 
@@ -315,8 +318,8 @@ class ice_eos:
         s_methane = self.s_pt_methane_rgi(pts)
         s_ammonia = self.s_pt_ammonia_rgi(pts)
         s_water   = self.water.get_s_pt_tab(logp_arr, logt_arr)
-        s_rock    = self.rock.get_s_pt_tab(logp_arr, logt_arr)
-        s_iron    = self.iron.get_s_pt_tab(logp_arr, logt_arr)
+        # s_rock    = self.rock.get_s_pt_tab(logp_arr, logt_arr)
+        # s_iron    = self.iron.get_s_pt_tab(logp_arr, logt_arr)
 
         # s_methane[(s_water > s_methane)] = s_water[(s_water > s_methane)]
         # s_ammonia[(s_water > s_ammonia)] = s_water[(s_water > s_ammonia)]
