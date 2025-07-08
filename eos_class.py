@@ -177,9 +177,9 @@ class mixtures(hhe):
         self.z_eos = z_eos
         self.new_z_mix = new_z_mix
 
-        if zmix_eos1 == 'aqua_mlcp':
+        if z_eos == 'ice_mixture' and zmix_eos1 == 'aqua_mlcp':
             self.ices = ice_eos.ice_eos(use_mlcp=True) # whether to use the updated MLCP 2021 water tables
-        else:
+        elif z_eos == 'ice_mixture' and zmix_eos1 == 'aqua':
             self.ices = ice_eos.ice_eos() # original AQUA table
 
         if self.z_eos == 'mixture' or self.z_eos == 'total_mixture':

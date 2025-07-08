@@ -17,27 +17,27 @@ erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/mp)
 def get_s_pt_val(_lgp, _lgt, _frock, _firon=0.0):
     s_water = aqua_mlcp.get_s_pt_tab(_lgp, _lgt)
     s_rock = ppv2.get_s_pt_tab(_lgp, _lgt)
-    #s_iron = iron2.get_s_pt_tab(_lgp, _lgt)
+    s_iron = iron2.get_s_pt_tab(_lgp, _lgt)
 
-    return s_water*(1 - _frock)*(1 - _firon) + s_rock*_frock*(1 - _firon)# + s_iron*_firon
+    return s_water*(1 - _frock)*(1 - _firon) + s_rock*_frock*(1 - _firon) + s_iron*_firon
 
 def get_logrho_pt_val(_lgp, _lgt, _frock, _firon=0.0):
     rho_water = 10**aqua_mlcp.get_logrho_pt_tab(_lgp, _lgt)
     rho_rock = 10**ppv2.get_logrho_pt_tab(_lgp, _lgt)
-    #rho_iron = 10**iron2.get_logrho_pt_tab(_lgp, _lgt)
+    rho_iron = 10**iron2.get_logrho_pt_tab(_lgp, _lgt)
 
-    rho_mix_inv = (1 - _frock)*(1 - _firon)/rho_water + _frock*(1 - _firon)/rho_rock# + _firon/rho_iron
+    rho_mix_inv = (1 - _frock)*(1 - _firon)/rho_water + _frock*(1 - _firon)/rho_rock + _firon/rho_iron
 
     return np.log10(1/rho_mix_inv)
-    
+
 
 def get_logu_pt_val(_lgp, _lgt, _frock, _firon=0.0):
 
     u_water = 10**aqua_mlcp.get_logu_pt_tab(_lgp, _lgt)
     u_rock = 10**ppv2.get_logu_pt_tab(_lgp, _lgt)
-    #u_iron = 10**iron2.get_logu_pt_tab(_lgp, _lgt)
-    
-    return np.log10(u_water*(1 - _frock)*(1 - _firon) + u_rock*_frock*(1 - _firon))# + u_iron*_firon)
+    u_iron = 10**iron2.get_logu_pt_tab(_lgp, _lgt)
+
+    return np.log10(u_water*(1 - _frock)*(1 - _firon) + u_rock*_frock*(1 - _firon) + u_iron*_firon)
 
 ##### INVERSION FUNCTIONS #####
 
@@ -63,7 +63,7 @@ def get_logt_sp_inv(_s, _lgp, _frock, _firon, ideal_guess=True, arr_guess=None, 
     def root_func(s_i, lgp_i, _frock_i, _firon_i, guess_i):
         def err(_lgt):
             # Error function for logt(S, logp)
-            
+
             s_test = get_s_pt_val(lgp_i, _lgt, _frock_i, _firon_i)*erg_to_kbbar
             return (s_test/s_i) - 1
 
@@ -186,7 +186,7 @@ def get_logp_srho_inv(_s, _lgrho, _frock, _firon, ideal_guess=True, arr_guess=No
     def root_func(s_i, lgrho_i, _frock_i, _firon_i, guess_i):
         def err(_lgp):
             # Error function for logt(S, logp)
-            
+
             logrho_test = get_logrho_sp_inv(s_i, _lgp, _frock_i, _firon_i)
             return (logrho_test/lgrho_i) - 1
 
@@ -309,7 +309,7 @@ def get_logt_srho_inv(_s, _lgrho, _frock, _firon):
 # logu_rgi_sp = RGI((svals_sp, logpvals_sp, frockvals_sp, fironvals_sp), logu_grid_sp, method='linear', \
 #             bounds_error=False, fill_value=None)
 
-# def get_logt_sp_tab(_s, _lgp, _frock, _firon): 
+# def get_logt_sp_tab(_s, _lgp, _frock, _firon):
 #     args = (_s, _lgp, _frock, _firon)
 #     v_args = [np.atleast_1d(arg) for arg in args]
 #     pts = np.column_stack(v_args)
@@ -358,7 +358,7 @@ logrho_rgi_sp = RGI((svals_sp, logpvals_sp, frockvals_sp), logrho_grid_sp, metho
 logu_rgi_sp = RGI((svals_sp, logpvals_sp, frockvals_sp), logu_grid_sp, method='linear', \
             bounds_error=False, fill_value=None)
 
-def get_logt_sp_tab(_s, _lgp, _frock, _firon=0.0): 
+def get_logt_sp_tab(_s, _lgp, _frock, _firon=0.0):
     args = (_s, _lgp, _frock)
     v_args = [np.atleast_1d(arg) for arg in args]
     pts = np.column_stack(v_args)
@@ -408,7 +408,7 @@ logt_rgi_srho = RGI((svals_srho, logrhovals_srho, frockvals_srho), logt_grid_srh
 logu_rgi_srho = RGI((svals_srho, logrhovals_srho, frockvals_srho), logu_grid_srho, method='linear', \
             bounds_error=False, fill_value=None)
 
-def get_logp_srho_tab(_s, _lgrho, _frock, _firon=0.0): 
+def get_logp_srho_tab(_s, _lgrho, _frock, _firon=0.0):
     args = (_s, _lgrho, _frock)
     v_args = [np.atleast_1d(arg) for arg in args]
     pts = np.column_stack(v_args)
@@ -457,7 +457,7 @@ def get_logu_srho_tab(_s, _lgrho, _frock, _firon=0.0): # returns in erg/g
 # logu_rgi_srho = RGI((svals_srho, logrhovals_srho, frockvals_srho, fironvals_srho), logu_grid_srho, method='linear', \
 #             bounds_error=False, fill_value=None)
 
-# def get_logp_srho_tab(_s, _lgrho, _frock, _firon): 
+# def get_logp_srho_tab(_s, _lgrho, _frock, _firon):
 #     args = (_s, _lgrho, _frock, _firon)
 #     v_args = [np.atleast_1d(arg) for arg in args]
 #     pts = np.column_stack(v_args)
@@ -495,7 +495,7 @@ def get_c_v(_s, _lgrho, _frock, _firon, ds=1e-3):
 
     lgt2 = get_logt_srho_tab(_s + ds, _lgrho, _frock, _firon)
     lgt1 = get_logt_srho_tab(_s - ds, _lgrho, _frock, _firon)
- 
+
     return (2 * ds / erg_to_kbbar)/((lgt2 - lgt1) * np.log(10))
 
 def get_c_p(_s, _lgp, _frock, _firon, ds=1e-3):
@@ -503,5 +503,5 @@ def get_c_p(_s, _lgp, _frock, _firon, ds=1e-3):
 
     lgt2 = get_logt_sp_tab(_s + ds, _lgp, _frock, _firon)
     lgt1 = get_logt_sp_tab(_s - ds, _lgp, _frock, _firon)
- 
+
     return (2 * ds / erg_to_kbbar)/((lgt2 - lgt1) * np.log(10))
