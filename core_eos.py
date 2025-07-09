@@ -616,3 +616,11 @@ class rock_eos:
         lgt1 = self.get_logt_sp_tab(_s - ds, _lgp, _firon=_firon)
 
         return (2 * ds / erg_to_kbbar)/((lgt2 - lgt1) * np.log(10))
+
+    def get_dlogrho_dlogt_p(self, _lgp, _lgt, _frock, _firon, dt=1e-2):
+        # dlogrho/dlogT_{P, Y}
+
+        logrho2 = self.get_logrho_pt_val(_lgp, _lgt + dt, _frock, _firon=_firon)
+        logrho1 = self.get_logrho_pt_val(_lgp, _lgt - dt, _frock, _firon=_firon)
+
+        return (logrho2 - logrho1) / (2 * dt)
