@@ -128,12 +128,12 @@ def get_s_rhot_tab(lgrho, lgt):
         return float(s_rgi_rhot(np.array([lgrho, lgt]).T))
     return s_rgi_rhot(np.array([lgrho, lgt]).T)
 
-def get_p_rhot_tab(lgrho, lgt):
+def get_logp_rhot_tab(lgrho, lgt):
     if np.isscalar(lgrho):
         float(p_rgi_rhot(np.array([lgrho, lgt]).T))
     return p_rgi_rhot(np.array([lgrho, lgt]).T)
 
-def get_u_rhot_tab(lgrho, lgt):
+def get_logu_rhot_tab(lgrho, lgt):
     if np.isscalar(lgrho):
         return float(u_rgi_rhot(np.array([lgrho, lgt]).T))
     return u_rgi_rhot(np.array([lgrho, lgt]).T)
@@ -186,20 +186,20 @@ get_rho_rgi_sp = RGI((svals_sp, logpvals_sp), logrho_res_sp, method='linear', \
 get_t_rgi_sp = RGI((svals_sp, logpvals_sp), logt_res_sp, method='linear', \
             bounds_error=False, fill_value=None)
 
-def get_rho_sp_tab(s, p):
+def get_logrho_sp_tab(s, p):
     if np.isscalar(s):
         return float(get_rho_rgi_sp(np.array([s, p]).T))
     else:
         return get_rho_rgi_sp(np.array([s, p]).T)
 
-def get_t_sp_tab(s, p):
+def get_logt_sp_tab(s, p):
     if np.isscalar(s):
         return float(get_t_rgi_sp(np.array([s, p]).T))
     else:
         return get_t_rgi_sp(np.array([s, p]).T)
 
 def get_rhot_sp_tab(s, p):
-    return get_rho_sp_tab(s, p), get_t_sp_tab(s, p)
+    return get_logrho_sp_tab(s, p), get_logt_sp_tab(s, p)
 
 ### p(s, rho), T(s, rho) ###
 
@@ -213,13 +213,13 @@ get_p_rgi_srho = RGI((svals_srho, logrhovals_srho), logp_res_srho, method='linea
 get_t_rgi_srho = RGI((svals_srho, logrhovals_srho), logt_res_srho, method='linear', \
             bounds_error=False, fill_value=None)
 
-def get_p_srho_tab(s, r):
+def get_logp_srho_tab(s, r):
     if np.isscalar(s):
         return float(get_p_rgi_srho(np.array([s, r]).T))
     else:
         return get_p_rgi_srho(np.array([s, r]).T)
 
-def get_t_srho_tab(s, r):
+def get_logt_srho_tab(s, r):
     if np.isscalar(s):
         return float(get_t_rgi_srho(np.array([s, r]).T))
     else:
@@ -238,7 +238,7 @@ def err_t_sp(logt, s_val, logp):
 
 def err_p_rhot(lgp, rhoval, lgtval):
     #if zval > 0.0:
-    logrho = get_rho_pt_tab(lgp, lgtval)
+    logrho = get_logrho_pt_tab(lgp, lgtval)
     #pdb.set_trace()
     return logrho/rhoval - 1
 
