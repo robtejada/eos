@@ -177,9 +177,9 @@ class mixtures(hhe):
         self.z_eos = z_eos
         self.new_z_mix = new_z_mix
 
-        if z_eos == 'ice_mixture' and zmix_eos1 == 'aqua_mlcp':
+        if 'ice' in z_eos and zmix_eos1 == 'aqua_mlcp':
             self.ices = ice_eos.ice_eos(use_mlcp=True) # whether to use the updated MLCP 2021 water tables
-        elif z_eos == 'ice_mixture' and zmix_eos1 == 'aqua':
+        elif 'ice' in z_eos and zmix_eos1 == 'aqua':
             self.ices = ice_eos.ice_eos() # original AQUA table
 
         if self.z_eos == 'mixture' or self.z_eos == 'total_mixture':
@@ -481,7 +481,7 @@ class mixtures(hhe):
             s_z = self.ices.get_s_pt_val(_lgp, _lgt, _zm, _za)
             smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=_zm, _za=_za, _zr=0.0, _zfe=0.0) / erg_to_kbbar
 
-        elif self.z_eos == 'ice_rock_mixture':
+        elif 'ice_rock' in self.z_eos:
             s_z_ice = self.ices.get_s_pt_val(_lgp, _lgt, _zm, _za)
             s_z_rock = metals_eos.get_s_pt_tab(_lgp, _lgt, eos='ppv2')
 
@@ -551,7 +551,7 @@ class mixtures(hhe):
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
         elif self.z_eos == 'ice_mixture':
             rho_z = 10 ** self.ices.get_logrho_pt_val(_lgp, _lgt, _zm, _za)
-        elif self.z_eos == 'ice_rock_mixture':
+        elif 'ice_rock' in self.z_eos:
             rho_z_ice = 10 ** self.ices.get_logrho_pt_val(_lgp, _lgt, _zm, _za)
             rho_z_rock = 10 ** metals_eos.get_rho_pt_tab(_lgp, _lgt, eos='ppv2')
 
@@ -597,7 +597,7 @@ class mixtures(hhe):
         elif self.z_eos == 'ice_mixture':
             u_z = self.ices.get_u_pt_val(_lgp, _lgt, _zm, _za)
 
-        elif self.z_eos == 'ice_rock_mixture':
+        elif 'ice_rock' in self.z_eos:
             u_z_ice = self.ices.get_u_pt_val(_lgp, _lgt, _zm, _za)
             u_z_rock = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos='ppv2')
 
