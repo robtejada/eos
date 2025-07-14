@@ -2735,8 +2735,8 @@ class multifraction_mixtures(mixtures):
                 '0.25_0.75_ice_rock_mixture',
                 '0.0_1.0_ice_rock_mixture',
             ]
-        if f_ppv_vals is None:
-            f_ppv_vals = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+        #if f_ppv_vals is None:
+        f_ppv_vals = np.sort([float(s.split('_', 1)[0]) for s in z_eos_list])
 
         self.hhe_eos = hhe_eos
         self.y_prime = y_prime
