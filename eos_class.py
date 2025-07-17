@@ -477,7 +477,7 @@ class mixtures(hhe):
         if self.z_eos == 'mixture':
             s_z = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
-        elif self.z_eos == 'ice_mixture':
+        elif 'ice_mixture' in self.z_eos:
             s_z = self.ices.get_s_pt_val(_lgp, _lgt, _zm, _za)
             smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=_zm, _za=_za, _zr=0.0, _zfe=0.0) / erg_to_kbbar
 
@@ -549,7 +549,7 @@ class mixtures(hhe):
         if self.z_eos == 'mixture':
             rho_z = 10 ** metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
-        elif self.z_eos == 'ice_mixture':
+        elif 'ice_mixture' in self.z_eos:
             rho_z = 10 ** self.ices.get_logrho_pt_val(_lgp, _lgt, _zm, _za)
         elif 'ice_rock' in self.z_eos:
             rho_z_ice = 10 ** self.ices.get_logrho_pt_val(_lgp, _lgt, _zm, _za)
@@ -594,7 +594,7 @@ class mixtures(hhe):
         if self.z_eos == 'mixture':
             u_z = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
-        elif self.z_eos == 'ice_mixture':
+        elif 'ice_mixture' in self.z_eos:
             u_z = self.ices.get_u_pt_val(_lgp, _lgt, _zm, _za)
 
         elif 'ice_rock' in self.z_eos:
