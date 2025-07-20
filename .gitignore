@@ -19,9 +19,11 @@ water_eos4
 water_eos5
 water_table.txt
 cd/*ice_rock*
+cd/*ice_mixture*
 cd/*aqua_ppv2*
 cms/*aqua_ppv2*
 cd/*aqua_mlcp_ppv2*
+cd/*ice_mixture*
 cms/*aqua_mlcp_ppv2*
 methane_ammonia/*
 FPEOS/*

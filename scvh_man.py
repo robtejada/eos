@@ -8,7 +8,6 @@ import pickle
 from astropy.constants import k_B
 from astropy import units as u
 from astropy.constants import u as amu
-from eos.cms_eos import get_smix_id_y
 import pdb
 
 # kb = k_B.to('erg/K').value
@@ -22,6 +21,31 @@ erg_to_kbbar = 1.202723550011625e-08
     tables used in scvh_eos.py, but those tables do not have the interal energy of mixtures.
 
 """
+
+mh = 1 #* amu.value
+mhe = 4.0026
+
+def Y_to_n(Y):
+    return ((Y/mhe)/(((1 - Y)/mh) + (Y/mhe)))
+def n_to_Y(x):
+    return (mhe * x)/(1 + 3.0026*x)
+
+def guarded_log(x):
+    if np.isscalar(x):
+        if x == 0:
+            return 0
+        elif x  < 0:
+            raise ValueError('a')
+        return x * np.log(x)
+
+    return np.array([guarded_log(x_) for x_ in x])
+
+def get_smix_id_y(Y):
+    #smix_hg23 = smix_interp.ev(lgt, lgp)*(1 - Y)*Y
+    xhe = Y_to_n(Y)
+    xh = 1 - xhe
+    q = mh*xh + mhe*xhe
+    return -1*(guarded_log(xh) + guarded_log(xhe)) / q
 
 class eos:
     def __init__(self, path_to_data=None, fac_for_numerical_partials=1e-10):
