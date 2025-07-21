@@ -471,8 +471,6 @@ class mixtures(hhe):
         if self.hhe_eos in ['cms', 'cd']:
             s_x = 10 ** self.get_s_h(_lgp, _lgt)
             s_y = 10 ** self.get_s_he(_lgp, _lgt)
-
-        s_xy = s_x * (1 - _y_prime) + s_y * _y_prime
             s_xy = s_x * (1 - _y_prime) + s_y * _y_prime
 
         elif self.hhe_eos == 'scvh':
