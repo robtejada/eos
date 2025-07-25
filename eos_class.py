@@ -2263,12 +2263,16 @@ class mixtures(hhe):
         return (s2 - 2 * s0 + s1)/(dy * log10_to_loge) ** 2
 
     def get_dsdz_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, dz=0.1):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_lgp)
         dz = _z*0.1 if dz is None else dz
         s1 = self.get_s_pt_tab(_lgp, _lgt, _y, _z - dz, _frock)
         s2 = self.get_s_pt_tab(_lgp, _lgt, _y, _z + dz, _frock)
         return (s2 - s1)/(2 * dz)
 
     def get_d2sdz2_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, dz=0.1):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_lgp)
         dz = _z*0.1 if dz is None else dz
         s0 = self.get_s_pt_tab(_lgp, _lgt, _y, _z, _frock)
         s1 = self.get_s_pt_tab(_lgp, _lgt, _y, _z - dz, _frock)
@@ -2322,6 +2326,8 @@ class mixtures(hhe):
 
     def get_dlogp_dz_rhot(self, _lgrho, _lgt,  _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
         # Chi_Z
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         lgp1 = self.get_logp_rhot(_lgrho, _lgt, _y, _z - dz, _frock, **kwargs)
         lgp2 = self.get_logp_rhot(_lgrho, _lgt, _y, _z + dz, _frock, **kwargs)
@@ -2338,6 +2344,8 @@ class mixtures(hhe):
 
     # Chi_Y/Chi_T
     def get_dlogt_dy_rhop_rhot(self, _lgrho, _lgt,  _y, _z, _frock=0.0, dy=0.1, dt=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         Chi_Y = self.get_dlogp_dy_rhot(_lgrho, _lgt,  _y, _z, _frock, dy=dy, **kwargs)
         Chi_T = self.get_dlogp_dlogt_rhoy_rhot(_lgrho, _lgt,  _y, _z, _frock, dt=dt, **kwargs)
@@ -2346,6 +2354,8 @@ class mixtures(hhe):
 
     # Chi_Z/Chi_T
     def get_dlogt_dz_rhop_rhot(self, _lgrho, _lgt,  _y, _z, _frock=0.0, dz=0.1, dt=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         Chi_Z = self.get_dlogp_dz_rhot(_lgrho, _lgt,  _y, _z,_frock, dz=dz, **kwargs)
         Chi_T = self.get_dlogp_dlogt_rhoy_rhot(_lgrho, _lgt,  _y, _z, _frock, dt=dt, **kwargs)
@@ -2372,6 +2382,8 @@ class mixtures(hhe):
 
 
     def get_dpdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         dz = _z*0.1 if dz is None else dz
         p1 = 10**self.get_logp_srho(_s, _lgrho, _y, _z - dz, _frock, **kwargs)
@@ -2416,6 +2428,8 @@ class mixtures(hhe):
 
 
     def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         #dPdS|{rho, Y, Z}:
         dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=ds, **kwargs)
@@ -2428,6 +2442,8 @@ class mixtures(hhe):
         return dsdz_rhopy
 
     def get_d2sdz2_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         dsdz_rhopy1 = self.get_dsdz_rhop_srho(_s, _lgrho, _y, _z - dz, _frock, ds=ds, dz=dz, **kwargs)
         dsdz_rhopy2 = self.get_dsdz_rhop_srho(_s, _lgrho, _y, _z + dz, _frock, ds=ds, dz=dz, **kwargs)
@@ -2507,6 +2523,8 @@ class mixtures(hhe):
         return (u2 - u1)/(2 * dy)
 
     def get_dudz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_p_guess=None, arr_t_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_p_guess': arr_p_guess, 'arr_t_guess': arr_p_guess, 'method': method, 'tab':tab}
         dz = _z*0.1 if dz is None else dz
         u1 = 10**self.get_logu_srho(_s, _lgrho, _y, _z - dz, _frock, **kwargs)
@@ -2524,6 +2542,8 @@ class mixtures(hhe):
         return (t2 - t1)/(2 * dy)
 
     def get_dtdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        if np.all(_z == 0.0):
+            return np.zeros_like(_y)
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         t1 = 10**self.get_logt_srho(_s, _lgrho, _y, _z - dz, _frock, **kwargs)
         t2 = 10**self.get_logt_srho(_s, _lgrho, _y, _z + dz, _frock, **kwargs)
