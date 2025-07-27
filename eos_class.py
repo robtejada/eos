@@ -167,7 +167,8 @@ class mixtures(hhe):
                     interp_method='linear',
                     new_z_mix=False,
                     rhot_sp_inv = False,
-                    srho_rhop_inv = False
+                    srho_rhop_inv = False,
+                    highS = False
                     ):
         if hhe_eos in ['cms', 'cd']:
             super().__init__(hhe_eos=hhe_eos)
@@ -176,6 +177,7 @@ class mixtures(hhe):
         self.hg = hg
         self.z_eos = z_eos
         self.hhe_eos = hhe_eos
+        self.highS = highS
 
         if self.z_eos == 'mixture':
             self.zmix_eos1 = zmix_eos1
@@ -224,7 +226,11 @@ class mixtures(hhe):
                 self.rhot_data = np.load('eos/{}/{}_{}_rhot.npz'.format(hhe_eos, hhe_eos, z_eos_rhot))
 
                 # S, P table can be aqua_smooth (output of smoothed inversion) or aqua_smooth2 (output of pressure smoothing)
-                self.sp_data = np.load('eos/{}/{}_{}_sp.npz'.format(hhe_eos, hhe_eos, self.z_eos))
+                if self.highS:
+                    self.sp_data = np.load('eos/{}/{}_{}_sp_highS.npz'.format(hhe_eos, hhe_eos, self.z_eos))
+                else:
+                    self.sp_data = np.load('eos/{}/{}_{}_sp.npz'.format(hhe_eos, hhe_eos, self.z_eos))
+
                 # # 1-D independent grids (S, P)
                 self.svals_sp = self.sp_data['s_vals'] # kb/baryon
                 self.logpvals_sp = self.sp_data['logpvals']
@@ -276,7 +282,11 @@ class mixtures(hhe):
                 #     z_eos_srho = 'aqua'
 
                 self.rhop_data = np.load('eos/{}/{}_{}_rhop.npz'.format(hhe_eos, hhe_eos, z_eos_rhop))
-                self.srho_data = np.load('eos/{}/{}_{}_srho.npz'.format(hhe_eos, hhe_eos, self.z_eos))
+
+                if self.highS:
+                    self.srho_data = np.load('eos/{}/{}_{}_srho_highS.npz'.format(hhe_eos, hhe_eos, self.z_eos))
+                else:
+                    self.srho_data = np.load('eos/{}/{}_{}_srho.npz'.format(hhe_eos, hhe_eos, self.z_eos))
                 # 1-D independent grids (rho, P)
                 self.logpvals_rhop = self.rhop_data['logpvals']
                 self.logrhovals_rhop = self.rhop_data['logrhovals'] # log10 g/cc -- rho, P table range
