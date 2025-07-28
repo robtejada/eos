@@ -8,17 +8,17 @@ from astropy import units as u
 from astropy.constants import k_B
 from astropy.constants import u as amu
 
-""" 
-    This file puts together all of the available metal EOSes of this repo. 
+"""
+    This file puts together all of the available metal EOSes of this repo.
     Instead of calling each module individually, one can import this file
-    and select the metal EOS to use with the EOS argument in each function. 
-    
+    and select the metal EOS to use with the EOS argument in each function.
+
     This file further provides access to metal mixtures. For now, the 'mixture'
     option provides a mixture of 50% water, 33.3% post-perovskite, and 16.6%
     iron. A dependency on water fraction will be added in the near future.
 
     Author: Roberto Tejada Arevalo
-    
+
 """
 
 mp = amu.to('g') # grams
@@ -85,7 +85,7 @@ def get_u_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv'
     if eos == 'aqua':
         return aqua_eos.get_u_pt_tab(p, t)
     elif eos == 'aqua_mlcp':
-        return aqua_mlcp_eos.get_logu_pt_tab(p, t) 
+        return aqua_mlcp_eos.get_logu_pt_tab(p, t)
     elif eos == 'ice_aneos':
         return ice_aneos_eos.get_logu_pt_tab(p, t)
     elif eos == 'ppv':
@@ -240,8 +240,8 @@ def get_p_srho_tab(s, rho, eos, f_ppv=0.333, f_fe=0.166):
 #     S1 = S0*(1+ds)
 #     P0 = 10**get_p_srho_tab(S0*erg_to_kbbar, rho, y)
 #     P1 = 10**get_p_srho_tab(S1*erg_to_kbbar, rho, y)
-#     P2 = 10**get_p_srho_tab(S0*erg_to_kbbar, rho, y*(1+dy))      
-    
+#     P2 = 10**get_p_srho_tab(S0*erg_to_kbbar, rho, y*(1+dy))
+
 #     dpds_rhoy = (P1 - P0)/(S1 - S0)
 #     dpdy_srho = (P2 - P0)/(y*dy)
 
@@ -274,7 +274,7 @@ def get_c_v(s, rho, eos, f_ppv, f_fe, ds=1e-3):
 
     lgt2 = get_t_srho_tab(s + ds, rho, eos, f_ppv=f_ppv, f_fe=f_fe)
     lgt1 = get_t_srho_tab(s - ds, rho, eos, f_ppv=f_ppv, f_fe=f_fe)
- 
+
     return (2 * ds / erg_to_kbbar)/((lgt2 - lgt1) * np.log(10))
 
 def get_c_p(s, p, eos, f_ppv, f_fe, ds=1e-3):
@@ -282,5 +282,5 @@ def get_c_p(s, p, eos, f_ppv, f_fe, ds=1e-3):
 
     lgt2 = get_t_sp_tab(s + ds, p, eos, f_ppv=f_ppv, f_fe=f_fe)
     lgt1 = get_t_sp_tab(s - ds, p, eos, f_ppv=f_ppv, f_fe=f_fe)
- 
+
     return (2 * ds / erg_to_kbbar)/((lgt2 - lgt1) * np.log(10))
