@@ -33,3 +33,8 @@ cd/cd_ice_mixture_pt.npz
 cd/cd_ice_mixture_rhot.npz
 cd/cd_ice_mixture_sp.npz
 cd/cd_ice_mixture_srho.npz
+assets/ammonia_fluid_ice_phase_diagram.csv
+assets/methane_fluid_phase_diagram.csv
+assets/valleta_2022_neptune_formation_massgrid.csv
+assets/valleta_2022_uranus_formation_massgrid.csv
+misc/Z1Z2_P_T_table_watermisc_lowpressure.npz
