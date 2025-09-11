@@ -165,7 +165,7 @@ class mixtures(hhe):
                     hg=True,
                     y_prime=False,
                     interp_method='linear',
-                    new_z_mix=False,
+                    new_z_mix=False, # if true, no tables are loaded and uses volume addition laws
                     rhot_sp_inv = False,
                     srho_rhop_inv = False,
                     highS = False
@@ -194,6 +194,8 @@ class mixtures(hhe):
                 z_eos_pt = 'aqua'
             elif self.z_eos == 'aqua':
                 z_eos_pt = 'aqua'
+            else:
+                z_eos_pt = self.z_eos
             self.pt_data = np.load('eos/{}/{}_{}_pt.npz'.format(hhe_eos, hhe_eos, z_eos_pt))
 
             # RGI interpolation functions
@@ -223,6 +225,8 @@ class mixtures(hhe):
                     z_eos_rhot = 'aqua_smooth'
                 elif self.z_eos == 'aqua':
                     z_eos_rhot = 'aqua'
+                else:
+                    z_eos_rhot = self.z_eos
                 self.rhot_data = np.load('eos/{}/{}_{}_rhot.npz'.format(hhe_eos, hhe_eos, z_eos_rhot))
 
                 # S, P table can be aqua_smooth (output of smoothed inversion) or aqua_smooth2 (output of pressure smoothing)
@@ -276,6 +280,8 @@ class mixtures(hhe):
                     z_eos_rhop = 'aqua'
                 elif self.z_eos == 'aqua':
                     z_eos_rhop = 'aqua'
+                else:
+                    z_eos_rhop = self.z_eos
                 # elif self.z_eos == 'aqua_smooth':
                 #     z_eos_srho = 'aqua_smooth'
                 # elif self.z_eos == 'aqua':
@@ -2611,10 +2617,10 @@ class multifraction_mixtures(mixtures):
     """
 
     def __init__(self,
-                 zmix_eos1,
-                 zmix_eos2,
-                 zmix_eos3,
                  hhe_eos = 'cd',
+                 zmix_eos1='aqua',
+                 zmix_eos2='ppv2',
+                 zmix_eos3='iron',
                  z_eos_list: list = None,
                  f_ppv_vals: np.ndarray = None,
                  f_ppv: float = 0.0,
@@ -2622,7 +2628,8 @@ class multifraction_mixtures(mixtures):
                  hg: bool = False,
                  y_prime: bool = False,
                  interp_method: str = 'linear',
-                 new_z_mix: bool = False):
+                 new_z_mix: bool = False,
+                 highS: bool = False):
         """
         Initialize the MultiFractionMixtures class.
 
