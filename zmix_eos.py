@@ -7,8 +7,8 @@ from scipy.optimize import root, root_scalar
 import os
 
 """
-    This file computes metallicity mixtures for any two metal 
-    fractions of ppv and iron (_z2 and _z3) with water. 
+    This file computes metallicity mixtures for any two metal
+    fractions of ppv and iron (_z2 and _z3) with water.
 
     This will be further developed in the near future.
 
@@ -176,7 +176,7 @@ metal_mixtures_sp = ['sp_ppv50_iron50', 'sp_aqua_25_ppv50_iron25', 'sp_aqua_33_p
 metal_mixtures_rhot = ['rhot_ppv50_iron50', 'rhot_aqua_25_ppv50_iron25', 'rhot_aqua_33_ppv33_iron33', 'rhot_aqua_50_ppv33_iron16',\
                     'rhot_aqua_75_ppv20_iron05']
 
-logrho_res_sp_mix = [] 
+logrho_res_sp_mix = []
 logt_res_sp_mix = []
 
 for file in metal_mixtures_sp:
@@ -185,7 +185,7 @@ for file in metal_mixtures_sp:
     logrho_res_sp_mix.append(logrho_sp)
     logt_res_sp_mix.append(logt_sp)
 
-logp_res_rhot_mix = [] 
+logp_res_rhot_mix = []
 s_res_rhot_mix = []
 
 for file in metal_mixtures_rhot:
@@ -194,7 +194,7 @@ for file in metal_mixtures_rhot:
     logp_res_rhot_mix.append(logp_rhot)
     s_res_rhot_mix.append(s_rhot)
 
-logp_res_srho_mix = [] 
+logp_res_srho_mix = []
 logt_res_srho_mix = []
 
 for file in metal_mixtures_srho:
