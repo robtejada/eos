@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator as RGI
 # from scipy.optimize import root, root_scalar
-from eos import ideal_eos, aqua_eos, aqua_mlcp_eos, ppv_eos, ppv2_eos, serpentine_eos, aneos_forsterite_eos, fe_eos, iron2_eos, zmix_eos, mgsio3_liquid_eos, mgsio3_solid_eos
+from eos import ideal_eos, aqua_eos, aqua_mlcp_eos, ppv_eos, ppv2_eos, serpentine_eos, aneos_forsterite_eos, fe_eos, iron2_eos, zmix_eos, mgsio3_liquid_eos_formix
 import os
 
 from astropy import units as u
@@ -31,14 +31,15 @@ MJ_to_kbbar = (u.MJ/u.Kelvin/u.kg).to(k_B/amu)
 
 ideal_water = ideal_eos.IdealEOS(m=18) # default for ideal eos is water for now
 
-eos_l = mgsio3_liquid_eos.MGSIO3_LIQUID_EOS()
-eos_s = mgsio3_solid_eos.MGSIO3_SOLID_EOS()
+eos_l = mgsio3_liquid_eos_formix.MGSIO3_LIQUID_EOS()
 
 #### P, T ####
 
-def get_rho_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
+def get_rho_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='mgsio3_l', z_eos3='iron'):
     if eos == 'aqua':
         return aqua_eos.get_logrho_pt_tab(p, t)
+    elif eos == 'mgsio3_l':
+        return eos_l.get_rho_pt(p, t)
     elif eos == 'aqua_mlcp':
         return aqua_mlcp_eos.get_logrho_pt_tab(p, t)
     elif eos == 'ice_aneos':
@@ -59,16 +60,17 @@ def get_rho_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='pp
         return ideal_water.get_rho_pt(p, t, 0)
     elif eos == 'mixture':
         return zmix_eos.get_rho_pt_tab(p, t, f_ppv, f_fe, z_eos1=z_eos1, z_eos2=z_eos2, z_eos3=z_eos3) # the standard was 0.333 and 0.166 for ppv and iron fractions
-    elif eos == 'mgsio3_l':
-        return eos_l.get_rho_pt_tab(p, t)
-    elif eos == 'mgsio3_s':
-        return eos_s.get_rho_pt_tab(p, t)
+
+    # elif eos == 'mgsio3_s':
+    #     return eos_s.get_rho_pt_tab(p, t)
     else:
         raise Exception('EOS must be aqua, ppv, serpentine, iron, or ideal')
 
-def get_s_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
+def get_s_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='mgsio3_l', z_eos3='iron'):
     if eos == 'aqua':
         return aqua_eos.get_s_pt_tab(p, t)
+    elif eos == 'mgsio3_l':
+        return eos_l.get_s_pt(p, t)
     elif eos == 'aqua_mlcp':
         return aqua_mlcp_eos.get_s_pt_tab(p, t)
     elif eos == 'ice_aneos':
@@ -89,16 +91,17 @@ def get_s_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv'
         return ideal_water.get_s_pt(p, t, 0)/erg_to_kbbar
     elif eos == 'mixture':
         return zmix_eos.get_s_pt_tab(p, t, f_ppv, f_fe, z_eos1=z_eos1, z_eos2=z_eos2, z_eos3=z_eos3)
-    elif eos == 'mgsio3_l':
-        return eos_l.get_s_pt_tab(p, t)
-    elif eos == 'mgsio3_s':
-        return eos_s.get_s_pt_tab(p, t)
+
+    # elif eos == 'mgsio3_s':
+    #     return eos_s.get_s_pt_tab(p, t)
     else:
         raise Exception('EOS must be aqua, ppv, serpentine, iron, or ideal')
 
-def get_u_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
+def get_u_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='mgsio3_l', z_eos3='iron'):
     if eos == 'aqua':
         return aqua_eos.get_logu_pt_tab(p, t)
+    elif eos == 'mgsio3_l':
+        return eos_l.get_u_pt(p, t) # not log
     elif eos == 'aqua_mlcp':
         return aqua_mlcp_eos.get_logu_pt_tab(p, t)
     elif eos == 'ice_aneos':
@@ -119,10 +122,9 @@ def get_u_pt_tab(p, t, eos, f_ppv=0.333, f_fe=0.166, z_eos1='aqua', z_eos2='ppv'
         return ideal_water.get_u_pt(p, t)
     elif eos == 'mixture':
         return zmix_eos.get_u_pt_tab(p, t, f_ppv, f_fe, z_eos1=z_eos1, z_eos2=z_eos2, z_eos3=z_eos3)
-    elif eos == 'mgsio3_l':
-        return eos_l.get_u_pt_tab(p, t) # not log
-    elif eos == 'mgsio3_s':
-        return eos_s.get_u_pt_tab(p, t) # not log
+
+    # elif eos == 'mgsio3_s':
+    #     return eos_s.get_u_pt_tab(p, t) # not log
     else:
         raise Exception('EOS must be aqua, ppv, serpentine, iron, or ideal')
 

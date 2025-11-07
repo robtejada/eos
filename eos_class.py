@@ -477,8 +477,9 @@ class mixtures(hhe):
             s_xy = scvh_eos.get_s_pt_tab(_lgp, _lgt, _y_prime) - smix_xy_ideal # subtract ideal entropy of mixing
 
         if self.z_eos == 'mixture':
-            s_z = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
+            s_z = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=_zr, f_fe=0.0,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
+            smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=0.0, _za=0.0, _zr=_zr, _zfe=0.0) / erg_to_kbbar
         elif 'ice_mixture' in self.z_eos:
             s_z = self.ices.get_s_pt_val(_lgp, _lgt, _zm, _za)
             smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=_zm, _za=_za, _zr=0.0, _zfe=0.0) / erg_to_kbbar
@@ -555,7 +556,7 @@ class mixtures(hhe):
             v_xy = 1 / rho_xy + vmix # vmix is zero since there are no interaction terms
 
         if self.z_eos == 'mixture':
-            rho_z = 10 ** metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
+            rho_z = 10 ** metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=_zr, f_fe=_zfe,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
         elif 'ice_mixture' in self.z_eos:
             rho_z = 10 ** self.ices.get_logrho_pt_val(_lgp, _lgt, _zm, _za)
@@ -606,7 +607,7 @@ class mixtures(hhe):
         elif self.hhe_eos == 'scvh':
             u_xy = 10 ** scvh_eos.get_u_pt(_lgp, _lgt, _y_prime) + umix # umix is zero since there are no interaction terms
         if self.z_eos == 'mixture':
-            u_z = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=self.f_ppv, f_fe=self.f_fe,
+            u_z = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos=self.z_eos, f_ppv=_zr, f_fe=_zfe,
                                             z_eos1=self.zmix_eos1, z_eos2=self.zmix_eos2, z_eos3=self.zmix_eos3)
         elif 'ice_mixture' in self.z_eos:
             u_z = self.ices.get_u_pt_val(_lgp, _lgt, _zm, _za)

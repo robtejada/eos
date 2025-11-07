@@ -39,7 +39,7 @@ def x_z3(_z2, _z3, mz1, mz2, mz3):
     Ntot = (1-_z2)*(1-_z3)/mz1 + (_z2*(1-_z3)/mz2) + _z3/mz3
     return (_z3/mz3)/Ntot
 
-def get_s_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
+def get_s_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='mgsio3_l', z_eos3='iron'):
     s_z1 = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=z_eos1)
     s_z2 = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=z_eos2)
     s_z3 = metals_eos.get_s_pt_tab(_lgp, _lgt, eos=z_eos3)
@@ -60,18 +60,21 @@ def get_s_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='ppv', z_eos3='iron
 
     return (1 - _z2) * (1 - _z3) * s_z1 + _z2 * (1 - _z3) * s_z2 + _z3 * s_z3 #+ s_id_zmix
 
-def get_rho_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
+def get_rho_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='mgsio3_l', z_eos3='iron'):
     rho_aqua = 10**metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=z_eos1)
-    rho_ppv = 10**metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=z_eos2)
+    rho_ppv = metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=z_eos2)
     rho_fe = 10**metals_eos.get_rho_pt_tab(_lgp, _lgt, eos=z_eos3)
 
     mix = ((1 - _z2) * (1 - _z3) / rho_aqua) + (_z2 * (1 - _z3) / rho_ppv) + _z3 / rho_fe
 
     return np.log10(1/mix)
 
-def get_u_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='ppv', z_eos3='iron'):
+def get_u_pt_tab(_lgp, _lgt, _z2, _z3, z_eos1='aqua', z_eos2='mgsio3_l', z_eos3='iron'):
     u_aqua = 10**metals_eos.get_u_pt_tab(_lgp, _lgt, eos=z_eos1)
-    u_ppv = 10**metals_eos.get_u_pt_tab(_lgp, _lgt, eos=z_eos2)
+    if z_eos2 == 'mgsio3_l':
+        u_ppv = metals_eos.get_u_pt_tab(_lgp, _lgt, eos=z_eos2)
+    else:
+        u_ppv = 10 ** metals_eos.get_u_pt_tab(_lgp, _lgt, eos=z_eos2)
     u_iron = 10**metals_eos.get_u_pt_tab(_lgp, _lgt, eos=z_eos3)
 
     return np.log10((1 - _z2) * (1 - _z3) * u_aqua + _z2 * (1 - _z3) * u_ppv + _z3 * u_iron)
