@@ -20,9 +20,10 @@ water_eos5
 water_table.txt
 cd/*ice_rock*
 cd/*ice_mixture*
-cd/*aqua_ppv2*
-cms/*aqua_ppv2*
+# cd/*aqua_ppv2*
+# cms/*aqua_ppv2*
 cd/*aqua_mlcp_ppv2*
+cd/*aqua_mgsio3_l*
 cd/*ice_mixture*
 cms/*aqua_mlcp_ppv2*
 methane_ammonia/*
@@ -35,3 +36,10 @@ cd/cd_ice_mixture_pt.npz
 cd/cd_ice_mixture_rhot.npz
 cd/cd_ice_mixture_sp.npz
 cd/cd_ice_mixture_srho.npz
+rock_eos/*
+fesi16_eos.py
+mgsio3_comb_eos.py
+mgsio3_liquid_eos.py
+mgsio3_liquid_eos_formix.py
+mgsio3_ppv2_old.py
+mgsio3_solid_eos.py
