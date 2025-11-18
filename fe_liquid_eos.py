@@ -126,13 +126,59 @@ def get_alpha_pt(P, T):
     vals = get_alpha_Fel(pts).reshape(P_arr.shape)
     return float(vals) if scalar else vals
 
+T_min_Fe = 0
+T_max_Fe = 200000
+
+def get_T_sp_inv(_s, _P, xtol=1e-8, maxiter=500):
+    """
+    Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
+
+    Parameters
+    ----------
+    _s : float or array_like
+        Entropy value(s) in kB/baryon.
+    _P : float or array_like
+        Pressure value(s) in Pa.
+    xtol : float, optional
+        Tolerance on the temperature root (passed to brentq).
+    maxiter : int, optional
+        Maximum number of iterations for brentq.
+
+    Returns
+    -------
+    T_sol : float or ndarray
+        Temperature(s) in K.  If any root‐finding fails, the corresponding
+        entry is set to np.nan.
+    """
+    s_arr = np.atleast_1d(_s)
+    P_arr = np.atleast_1d(_P)
+    s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+
+    def _find_T(s_val, P_val):
+        # The function whose root in T we seek:
+        def err(T_val):
+            return get_s_pt(P_val, T_val) * erg_to_kbbar / s_val - 1
+
+        try:
+            return brentq(err, T_min_Fe, T_max_Fe, xtol=xtol, maxiter=maxiter)
+        except ValueError:
+            # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
+            return np.nan
+
+    # vectorize over the pair (s_val, P_val)
+    T_roots = np.vectorize(_find_T)(s_arr, P_arr)
+
+    # return scalar if inputs were scalars
+    if T_roots.size == 1:
+        return float(T_roots)
+    return T_roots
 
 ###### S, P basis ######
 
 sp_data_Fel = np.load('eos/zhang_eos/zhang_multiphase/iron2_sp.npz')
 
 svals_sp_Fel = sp_data_Fel['s_vals'] # kb/baryon
-logpvals_sp_Fel = sp_data_Fel['logpvals'] # log K
+logpvals_sp_Fel = sp_data_Fel['logpvals'] # log dyn/cm^2
 
 logrho_grid_sp_Fel = sp_data_Fel['logrho_sp'] # in g/cm^3
 logt_grid_sp_Fel = sp_data_Fel['logt_sp'] # in K
