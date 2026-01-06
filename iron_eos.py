@@ -5,7 +5,13 @@ from astropy.constants import k_B
 from astropy.constants import u as amu
 from astropy import units as u
 
-class Fe_EOS:
+erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu) # erg/K/g to kb/baryon
+dyn_to_Pa = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
+dyn_to_GPa = (u.dyn/u.cm**2).to('GPa') # dyn/cm² to GPa conversion
+U_conv_cgs = (1.0 * u.J/u.kg).to(u.erg/u.g).value          # 1 J/kg -> erg/g
+S_conv_cgs = (1.0 * u.J/u.kg/u.K).to(u.erg/u.g/u.K).value  # 1 J/kg/K -> erg/g/K
+
+class Fe_EOS_analytic:
     """
     Dorogokupets et al. (2017) thermodynamic model for Fe phases.
 
@@ -46,18 +52,26 @@ class Fe_EOS:
         solid_phase="hcp",
         melt_curve="gonzalez2023",
         phase_hysteresis_K=0.0,
-        melt_smooth_width_K=200.0,   # <--- ADD (ΔT)
+        melt_smooth_width_K=200.0,
         auto_max_iter=3,
+        # NEW:
+        solid_lowP="bcc",
+        solid_switch_P_GPa=13.0,
+        solid_switch_width_GPa=2.0,
     ):
+
         phase = phase.lower()
         solid_phase = solid_phase.lower()
         melt_curve = melt_curve.lower()
+
+        self.melt_curve = melt_curve
 
         if phase == "auto":
             if solid_phase not in ("bcc", "fcc", "hcp"):
                 raise ValueError("solid_phase must be one of: 'bcc','fcc','hcp'")
             if melt_curve not in ("gonzalez2023", "zhang2015"):
                 raise ValueError("melt_curve must be 'gonzalez2023' or 'zhang2015'")
+
             self.phase = "auto"
             self.solid_phase = solid_phase
             self.melt_curve = melt_curve
@@ -65,20 +79,24 @@ class Fe_EOS:
             self.phase_hysteresis_K = float(phase_hysteresis_K)
             self.auto_max_iter = int(auto_max_iter)
 
+            # NEW: low-P solid for tension-avoidance + physical α→ε behavior
+            self.solid_lowP = solid_lowP.lower()
+            if self.solid_lowP not in ("bcc", "fcc", "hcp"):
+                raise ValueError("solid_lowP must be one of: 'bcc','fcc','hcp'")
+
+            self.solid_switch_P = float(solid_switch_P_GPa) * 1e9
+            self.solid_switch_width_P = float(solid_switch_width_GPa) * 1e9
+
             # Internal explicit-phase EOS objects
-            self._solid = Fe_EOS(phase=solid_phase)
-            self._liquid = Fe_EOS(phase="liquid")
+            self._solid_lo = Fe_EOS_analytic(phase=self.solid_lowP)     # typically bcc
+            self._solid_hi = Fe_EOS_analytic(phase=self.solid_phase)    # typically hcp
+            self._liquid   = Fe_EOS_analytic(phase="liquid")
             return
+
 
         if phase not in ("bcc", "fcc", "hcp", "liquid"):
             raise ValueError("phase must be one of: 'bcc', 'fcc', 'hcp', 'liquid', 'auto'")
         self.phase = phase
-
-        self.erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu) # erg/K/g to kb/baryon
-        self.dyn_to_Pa = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
-        self.dyn_to_GPa = (u.dyn/u.cm**2).to('GPa') # dyn/cm² to GPa conversion
-        self.U_conv_cgs = (1.0 * u.J/u.kg).to(u.erg/u.g).value          # 1 J/kg -> erg/g
-        self.S_conv_cgs = (1.0 * u.J/u.kg/u.K).to(u.erg/u.g/u.K).value  # 1 J/kg/K -> erg/g/K
 
         params = {
             "bcc": dict(U0_kJmol=0.0,     V0_cm3mol=7.092,  K0_GPa=164.0, K0p=5.50,
@@ -122,75 +140,6 @@ class Fe_EOS:
 
         self.eta = 1.5 * (self.K0p - 1.0)
         self.p_mag = 0.4 if phase == "bcc" else 0.28
-
-        #### P,T basis tables ####
-
-        # self.pt_data = np.load('eos/dorogokupets_iron_eos/iron_eos_PT.npz')
-
-        # self.pvals_pt = self.pt_data['pvals_pt'] # Pa
-        # self.tvals_pt = self.pt_data['tvals_pt'] # K
-        # self.rho_grid_pt = self.pt_data['rho_grid_pt'] # in g/cm^3
-        # self.s_grid_pt = self.pt_data['s_grid_pt'] # in erg/g/K
-        # self.u_grid_pt = self.pt_data['u_grid_pt'] # in erg/g
-
-        # self.rho_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.rho_grid_pt, method='linear', \
-        #         bounds_error=False, fill_value=None)
-        # self.s_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.s_grid_pt, method='linear', \
-        #         bounds_error=False, fill_value=None)
-        # self.u_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.u_grid_pt, method='linear', \
-        #         bounds_error=False, fill_value=None)
-
-    def get_rho_pt(self, P, T, tab=True):
-        """
-        Get the density of iron at pressure P and temperature T.
-        P in Pa, T in K.
-        """
-        scalar = np.isscalar(P) and np.isscalar(T)
-        P_arr = np.array(P, ndmin=1)
-        T_arr = np.array(T, ndmin=1)
-        if P_arr.shape != T_arr.shape:
-            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
-        if tab:
-            pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
-            vals = self.rho_rgi_pt(pts).reshape(P_arr.shape)
-            return float(vals) if scalar else vals
-        else:    
-            return self.get_rho_pt_inv(P_arr, T_arr)
-
-    def get_s_pt(self, P, T, tab=True):
-        """
-        Get the entropy of iron at pressure P and temperature T.
-        P in Pa, T in K.
-        """
-        scalar = np.isscalar(P) and np.isscalar(T)
-        P_arr = np.array(P, ndmin=1)
-        T_arr = np.array(T, ndmin=1)
-        if P_arr.shape != T_arr.shape:
-            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
-        if tab:
-            pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
-            vals = self.s_rgi_pt(pts).reshape(P_arr.shape)
-            return float(vals) if scalar else vals
-        else:    
-            return self.get_s_pt_inv(P_arr, T_arr)
-
-    def get_u_pt(self, P, T, tab=True):
-
-        """
-        Get the internal energy of iron at pressure P and temperature T.
-        P in Pa, T in K.
-        """
-        scalar = np.isscalar(P) and np.isscalar(T)
-        P_arr = np.array(P, ndmin=1)
-        T_arr = np.array(T, ndmin=1)
-        if P_arr.shape != T_arr.shape:
-            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
-        if tab:
-            pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
-            vals = self.u_rgi_pt(pts).reshape(P_arr.shape)
-            return float(vals) if scalar else vals
-        else:    
-            return self.get_u_pt_inv(P_arr, T_arr)
 
     # -------------------------
     # Utilities
@@ -573,65 +522,74 @@ class Fe_EOS:
         """Return w in [0,1] using tanh smoothstep."""
         return 0.5 * (1.0 + np.tanh(x))
 
-    def _auto_blend_weight_and_pressure(self, rho, T):
+    def _auto_blend_weights_and_pressure(self, rho, T):
         """
-        Auto mode:
-          - compute P_solid(rho,T) and P_liquid(rho,T)
-          - iterate P -> Tm(P) -> w -> P_blend
-    
+        Auto mode with TWO smooth transitions:
+        (1) solid-solid: lowP solid (usually bcc) -> highP solid (usually hcp), in pressure-space
+        (2) solid-liquid: via melt curve, in temperature-space
+
         Returns:
-          w       : liquid fraction in [0,1]
-          P_blend : blended pressure [Pa]
-          P_sol   : solid pressure [Pa]
-          P_liq   : liquid pressure [Pa]
-          Tm      : melt temperature evaluated at final P_blend [K]
+        w_melt : liquid fraction in [0,1]
+        w_hi   : highP-solid fraction in [0,1]  (e.g. hcp fraction within the solid)
+        P_blend: blended pressure [Pa]
+        P_sol  : blended solid pressure [Pa]
+        P_liq  : liquid pressure [Pa]
+        Tm     : melt temperature evaluated at final P_blend [K]
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
-    
-        # Phase pressures at same (rho,T)
-        P_sol = self._solid.P(rho_arr, T_arr)
+
+        # Endmember pressures at same (rho, T)
+        P_lo  = self._solid_lo.P(rho_arr, T_arr)
+        P_hi  = self._solid_hi.P(rho_arr, T_arr)
         P_liq = self._liquid.P(rho_arr, T_arr)
-    
-        dT = self.melt_smooth_width_K
-    
-        # initial guess for P used in Tm(P)
-        P = 0.5 * (P_sol + P_liq)
-    
+
+        dT_melt = self.melt_smooth_width_K
+        Ptr = self.solid_switch_P
+        dP  = self.solid_switch_width_P
+
+        # initial P guess
+        P = 0.5 * (P_lo + P_hi)
+
         for _ in range(max(1, self.auto_max_iter)):
-            Tm = self.Tmelt(np.maximum(P, 0.0), curve=self.melt_curve)
-    
-            if dT <= 0.0:
-                w = (T_arr >= Tm).astype(float)
+            # --- solid-solid weight (pressure-space) ---
+            if dP <= 0.0:
+                w_hi = (P >= Ptr).astype(float)
             else:
-                w = self._smooth_weight((T_arr - Tm) / dT)
-    
-            P_new = (1.0 - w) * P_sol + w * P_liq
-    
-            # convergence (cheap + stable)
+                w_hi = self._smooth_weight((P - Ptr) / dP)
+
+            P_sol = (1.0 - w_hi) * P_lo + w_hi * P_hi
+
+            # --- melt weight (temperature-space, using melt curve evaluated at current P) ---
+            Tm = self.Tmelt(np.maximum(P, 0.0), curve=self.melt_curve)
+
+            if dT_melt <= 0.0:
+                w_melt = (T_arr >= Tm).astype(float)
+            else:
+                w_melt = self._smooth_weight((T_arr - Tm) / dT_melt)
+
+            P_new = (1.0 - w_melt) * P_sol + w_melt * P_liq
+
             if np.allclose(P_new, P, rtol=1e-10, atol=0.0):
                 P = P_new
                 break
             P = P_new
-    
-        # final update
-        Tm = self.Tmelt(np.maximum(P, 0.0), curve=self.melt_curve)
-        if dT <= 0.0:
-            w = (T_arr >= Tm).astype(float)
+
+        # final update with converged P
+        if dP <= 0.0:
+            w_hi = (P >= Ptr).astype(float)
         else:
-            w = self._smooth_weight((T_arr - Tm) / dT)
-    
-        P_blend = (1.0 - w) * P_sol + w * P_liq
-        return w, P_blend, P_sol, P_liq, Tm
+            w_hi = self._smooth_weight((P - Ptr) / dP)
+        P_sol = (1.0 - w_hi) * P_lo + w_hi * P_hi
 
+        Tm = self.Tmelt(np.maximum(P, 0.0), curve=self.melt_curve)
+        if dT_melt <= 0.0:
+            w_melt = (T_arr >= Tm).astype(float)
+        else:
+            w_melt = self._smooth_weight((T_arr - Tm) / dT_melt)
 
-    def get_phase_rhot(self, rho, T):
-        if self.phase != "auto":
-            return np.array(self.phase, ndmin=1)
+        P_blend = (1.0 - w_melt) * P_sol + w_melt * P_liq
+        return w_melt, w_hi, P_blend, P_sol, P_liq, Tm
 
-        rho_arr, T_arr = self._as_arrays(rho, T)
-        is_liq = self._auto_phase_mask(rho_arr, T_arr)
-        out = np.where(is_liq, "liquid", self.solid_phase)
-        return out.reshape(rho_arr.shape)
 
     # -------------------------
     # Public rho,T API (dispatching if auto)
@@ -673,37 +631,28 @@ class Fe_EOS:
         return P.reshape(rho_arr.shape), u.reshape(rho_arr.shape), s.reshape(rho_arr.shape), f.reshape(rho_arr.shape)
 
     def get_p_rhot(self, rho, T):
-        """
-        Get the pressure at a given density and temperature.
-        rho: kg/m^3
-        T: K
-        Returns:
-          P: Pa
-        """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, P_blend, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            w_melt, w_hi, P_blend, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
             return P_blend.reshape(rho_arr.shape)
         return self.P(rho_arr, T_arr).reshape(rho_arr.shape)
 
 
+
     def get_u_rhot(self, rho, T):
-        """
-        Get the internal energy at a given density and temperature.
-        rho: kg/m^3
-        T: K
-        Returns:
-          u: erg/g
-        """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            u_sol = self._solid.get_u_rhot(rho_arr, T_arr)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            u_lo  = self._solid_lo.get_u_rhot(rho_arr, T_arr)
+            u_hi  = self._solid_hi.get_u_rhot(rho_arr, T_arr)
             u_liq = self._liquid.get_u_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * u_sol + w * u_liq).reshape(rho_arr.shape)
-    
+
+            u_sol = (1.0 - w_hi) * u_lo + w_hi * u_hi
+            return ((1.0 - w_melt) * u_sol + w_melt * u_liq).reshape(rho_arr.shape)
+
         V = self.V_molar(rho_arr)
-        return (self.U_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.U_conv_cgs
+        return (self.U_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * U_conv_cgs
     
     def get_s_rhot(self, rho, T):
         """
@@ -715,13 +664,17 @@ class Fe_EOS:
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            s_sol = self._solid.get_s_rhot(rho_arr, T_arr)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            s_lo  = self._solid_lo.get_s_rhot(rho_arr, T_arr)
+            s_hi  = self._solid_hi.get_s_rhot(rho_arr, T_arr)
             s_liq = self._liquid.get_s_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * s_sol + w * s_liq).reshape(rho_arr.shape)
+
+            s_sol = (1.0 - w_hi) * s_lo + w_hi * s_hi
+            return ((1.0 - w_melt) * s_sol + w_melt * s_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
-        return (self.S_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.S_conv_cgs
+        return (self.S_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_conv_cgs
     
     def get_f_rhot(self, rho, T):
         """
@@ -733,13 +686,17 @@ class Fe_EOS:
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            f_sol = self._solid.get_f_rhot(rho_arr, T_arr)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            f_lo  = self._solid_lo.get_f_rhot(rho_arr, T_arr)
+            f_hi  = self._solid_hi.get_f_rhot(rho_arr, T_arr)
             f_liq = self._liquid.get_f_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * f_sol + w * f_liq).reshape(rho_arr.shape)
+
+            f_sol = (1.0 - w_hi) * f_lo + w_hi * f_hi
+            return ((1.0 - w_melt) * f_sol + w_melt * f_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
-        return (self.F_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.U_conv_cgs
+        return (self.F_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * U_conv_cgs
 
 
     def get_KT_rhot(self, rho, T):
@@ -752,10 +709,14 @@ class Fe_EOS:
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            KT_sol = self._solid.get_KT_rhot(rho_arr, T_arr)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            KT_lo  = self._solid_lo.get_KT_rhot(rho_arr, T_arr)
+            KT_hi  = self._solid_hi.get_KT_rhot(rho_arr, T_arr)
             KT_liq = self._liquid.get_KT_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * KT_sol + w * KT_liq).reshape(rho_arr.shape)
+
+            KT_sol = (1.0 - w_hi) * KT_lo + w_hi * KT_hi
+            return ((1.0 - w_melt) * KT_sol + w_melt * KT_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
         return self.KT_molar(V, T_arr).reshape(rho_arr.shape)
@@ -770,10 +731,14 @@ class Fe_EOS:
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            a_sol = self._solid.get_alpha_rhot(rho_arr, T_arr)
-            a_liq = self._liquid.get_alpha_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * a_sol + w * a_liq).reshape(rho_arr.shape)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            alpha_lo  = self._solid_lo.get_alpha_rhot(rho_arr, T_arr)
+            alpha_hi  = self._solid_hi.get_alpha_rhot(rho_arr, T_arr)
+            alpha_liq = self._liquid.get_alpha_rhot(rho_arr, T_arr)
+
+            alpha_sol = (1.0 - w_hi) * alpha_lo + w_hi * alpha_hi
+            return ((1.0 - w_melt) * alpha_sol + w_melt * alpha_liq).reshape(rho_arr.shape)
         return self.alpha(rho_arr, T_arr).reshape(rho_arr.shape)
     
     def get_cv_rhot(self, rho, T):
@@ -786,13 +751,17 @@ class Fe_EOS:
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            cv_sol = self._solid.get_cv_rhot(rho_arr, T_arr)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            cv_lo  = self._solid_lo.get_cv_rhot(rho_arr, T_arr)
+            cv_hi  = self._solid_hi.get_cv_rhot(rho_arr, T_arr)
             cv_liq = self._liquid.get_cv_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * cv_sol + w * cv_liq).reshape(rho_arr.shape)
+
+            cv_sol = (1.0 - w_hi) * cv_lo + w_hi * cv_hi
+            return ((1.0 - w_melt) * cv_sol + w_melt * cv_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
-        return (self.Cv_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.S_conv_cgs
+        return (self.Cv_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_conv_cgs
     
     def get_cp_rhot(self, rho, T):
         """
@@ -804,16 +773,20 @@ class Fe_EOS:
         """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
-            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
-            cp_sol = self._solid.get_cp_rhot(rho_arr, T_arr)
+            w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
+
+            cp_lo  = self._solid_lo.get_cp_rhot(rho_arr, T_arr)
+            cp_hi  = self._solid_hi.get_cp_rhot(rho_arr, T_arr)
             cp_liq = self._liquid.get_cp_rhot(rho_arr, T_arr)
-            return ((1.0 - w) * cp_sol + w * cp_liq).reshape(rho_arr.shape)
+
+            cp_sol = (1.0 - w_hi) * cp_lo + w_hi * cp_hi
+            return ((1.0 - w_melt) * cp_sol + w_melt * cp_liq).reshape(rho_arr.shape)
     
         cv = self.get_cv_rhot(rho_arr, T_arr)
         a  = self.get_alpha_rhot(rho_arr, T_arr)
         KT = self.get_KT_rhot(rho_arr, T_arr)
         cp = cv + (a*a) * T_arr * KT / rho_arr
-        return cp.reshape(rho_arr.shape) * self.S_conv_cgs
+        return cp.reshape(rho_arr.shape) * S_conv_cgs
 
 
     # -------------------------
@@ -866,7 +839,7 @@ class Fe_EOS:
             t = float(T_arr[idx])
 
             def f(r):
-                return float(self.get_p_rhot(r, t) - p_tgt)
+                return float(self.get_p_rhot(r, t)/p_tgt - 1)
 
             def fp(r):
                 return float(dP_drho_num(r, t))
@@ -918,15 +891,247 @@ class Fe_EOS:
         Returns:
           S: erg/g/K
         """
-        args = (P,
-            T,
-            rho0,
-            rho_bracket,
-            tol,
-            maxiter,
-            newton_first,
-            dPdrho_eps_rel)
         
-        rho = self.get_rho_pt_inv(*args)
+        rho = self.get_rho_pt_inv(P, T)
 
         return self.get_s_rhot(rho, T)
+
+    def get_T_sp_inv(self, _s, _P, bracket = (0, 200000), xtol=1e-8, maxiter=500):
+        """
+        Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
+
+        Parameters
+        ----------
+        _s : float or array_like
+            Entropy value(s) in kB/baryon.
+        _P : float or array_like
+            Pressure value(s) in Pa.
+        xtol : float, optional
+            Tolerance on the temperature root (passed to brentq).
+        maxiter : int, optional
+            Maximum number of iterations for brentq.
+
+        Returns
+        -------
+        T_sol : float or ndarray
+            Temperature(s) in K.  If any root‐finding fails, the corresponding
+            entry is set to np.nan.
+        """
+        s_arr = np.atleast_1d(_s)
+        P_arr = np.atleast_1d(_P)
+        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+
+        def _find_T(s_val, P_val):
+            # The function whose root in T we seek:
+            def err(T_val):
+                return self.get_s_pt_inv(P_val, T_val) * erg_to_kbbar / s_val - 1
+
+            try:
+                return brentq(err, bracket[0], bracket[1], xtol=xtol, maxiter=maxiter)
+            except ValueError:
+                # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
+                return np.nan
+
+        # vectorize over the pair (s_val, P_val)
+        T_roots = np.vectorize(_find_T)(s_arr, P_arr)
+
+        # return scalar if inputs were scalars
+        if T_roots.size == 1:
+            return float(T_roots)
+        return T_roots
+
+    def get_T_srho_inv(self, _s, _rho, bracket = (0, 200000), xtol=1e-8, maxiter=500):
+        """
+        Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
+
+        Parameters
+        ----------
+        _s : float or array_like
+            Entropy value(s) in kB/baryon.
+        _P : float or array_like
+            Pressure value(s) in Pa.
+        xtol : float, optional
+            Tolerance on the temperature root (passed to brentq).
+        maxiter : int, optional
+            Maximum number of iterations for brentq.
+
+        Returns
+        -------
+        T_sol : float or ndarray
+            Temperature(s) in K.  If any root‐finding fails, the corresponding
+            entry is set to np.nan.
+        """
+        s_arr = np.atleast_1d(_s)
+        rho_arr = np.atleast_1d(_rho)
+        s_arr, rho_arr = np.broadcast_arrays(s_arr, rho_arr)
+
+        def _find_T(s_val, rho_val):
+            # The function whose root in T we seek:
+            def err(T_val):
+                return self.get_s_rhot(rho_val, T_val) * erg_to_kbbar / s_val - 1
+
+            try:
+                return brentq(err, bracket[0], bracket[1], xtol=xtol, maxiter=maxiter)
+            except ValueError:
+                # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
+                return np.nan
+
+        # vectorize over the pair (s_val, P_val)
+        T_roots = np.vectorize(_find_T)(s_arr, rho_arr)
+
+        # return scalar if inputs were scalars
+        if T_roots.size == 1:
+            return float(T_roots)
+        return T_roots
+
+class Fe_EOS(Fe_EOS_analytic):
+    """
+    Fe EOS with optional PT tables (rho, s, u) loaded from an NPZ.
+
+    Behavior:
+      - tab=True  -> PT-table interpolation
+      - tab=False -> analytic inversion via Fe_EOS.get_rho_pt_inv + analytic getters
+
+    Table expectations (default keys):
+      pvals_pt     [Pa]
+      tvals_pt     [K]
+      rho_grid_pt  [g/cm^3 by default]  (converted to kg/m^3 internally)
+      s_grid_pt    [erg/g/K]
+      u_grid_pt    [erg/g]
+    """
+
+    def __init__(
+        self,
+        *args,
+        rgi_kwargs=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        if rgi_kwargs is None:
+            rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
+
+        data = np.load('eos/dorogokupets_iron_eos/iron_eos_PT.npz')
+
+        self.pvals_pt = np.asarray(data['pvals_pt'], dtype=float)  # Pa
+        self.tvals_pt = np.asarray(data['tvals_pt'], dtype=float)  # K
+
+        self.rho_grid_pt = np.asarray(data['rho_grid_pt'], dtype=float) # kg/m^3
+        self.s_grid_pt = np.asarray(data['s_grid_pt'], dtype=float)  # erg/g/K
+        self.u_grid_pt = np.asarray(data['u_grid_pt'], dtype=float)  # erg/g
+
+        # Interpolators: input points are (P, T)
+        self.rho_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.rho_grid_pt, **rgi_kwargs)
+        self.s_rgi_pt   = RGI((self.pvals_pt, self.tvals_pt), self.s_grid_pt, **rgi_kwargs)
+        self.u_rgi_pt   = RGI((self.pvals_pt, self.tvals_pt), self.u_grid_pt, **rgi_kwargs)
+
+    @staticmethod
+    def _broadcast_PT(P, T):
+        scalar = np.isscalar(P) and np.isscalar(T)
+        P_arr = np.array(P, ndmin=1, dtype=float)
+        T_arr = np.array(T, ndmin=1, dtype=float)
+        if P_arr.shape != T_arr.shape:
+            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
+        return scalar, P_arr, T_arr
+
+    def _interp_PT(self, rgi, P_arr, T_arr):
+        pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
+        return rgi(pts).reshape(P_arr.shape)
+
+    # -------------------------
+    # PT table API (override)
+    # -------------------------
+    def get_rho_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        """
+        rho(P,T) in kg/m^3.
+        If tab=False, uses Fe_EOS.get_rho_pt_inv.
+        """
+        scalar, P_arr, T_arr = self._broadcast_PT(P, T)
+
+        if tab:
+            vals = self._interp_PT(self.rho_rgi_pt, P_arr, T_arr)
+            return float(vals) if scalar else vals
+
+        # If you have tables, using them as an initial guess can speed up inversion
+        if rho0 is None:
+            try:
+                rho0 = self._interp_PT(self.rho_rgi_pt, P_arr, T_arr)
+            except Exception:
+                rho0 = None
+
+        vals = self.get_rho_pt_inv(P_arr, T_arr, rho0=rho0, **inv_kwargs)
+        return float(vals) if scalar else vals
+
+    def get_s_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        """
+        s(P,T) in erg/g/K.
+        If tab=False, inverts for rho then evaluates analytic s(rho,T).
+        """
+        scalar, P_arr, T_arr = self._broadcast_PT(P, T)
+
+        if tab:
+            vals = self._interp_PT(self.s_rgi_pt, P_arr, T_arr)
+            return float(vals) if scalar else vals
+
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
+        vals = self.get_s_rhot(rho, T_arr)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_u_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        """
+        u(P,T) in erg/g.
+        If tab=False, inverts for rho then evaluates analytic u(rho,T).
+        """
+        scalar, P_arr, T_arr = self._broadcast_PT(P, T)
+
+        if tab:
+            vals = self._interp_PT(self.u_rgi_pt, P_arr, T_arr)
+            return float(vals) if scalar else vals
+
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
+        vals = self.get_u_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_T_sp_inv(self, _s, _P, *, bracket = (0, 200000), xtol=1e-8, maxiter=500):
+        """
+        Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
+
+        Parameters
+        ----------
+        _s : float or array_like
+            Entropy value(s) in kB/baryon.
+        _P : float or array_like
+            Pressure value(s) in Pa.
+        xtol : float, optional
+            Tolerance on the temperature root (passed to brentq).
+        maxiter : int, optional
+            Maximum number of iterations for brentq.
+
+        Returns
+        -------
+        T_sol : float or ndarray
+            Temperature(s) in K.  If any root‐finding fails, the corresponding
+            entry is set to np.nan.
+        """
+        s_arr = np.atleast_1d(_s)
+        P_arr = np.atleast_1d(_P)
+        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+
+        def _find_T(s_val, P_val):
+            # The function whose root in T we seek:
+            def err(T_val):
+                return self.get_s_pt(P_val, T_val) * erg_to_kbbar / s_val - 1
+
+            try:
+                return brentq(err, bracket[0], bracket[1], xtol=xtol, maxiter=maxiter)
+            except ValueError:
+                # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
+                return np.nan
+
+        # vectorize over the pair (s_val, P_val)
+        T_roots = np.vectorize(_find_T)(s_arr, P_arr)
+
+        # return scalar if inputs were scalars
+        if T_roots.size == 1:
+            return float(T_roots)
+        return T_roots
