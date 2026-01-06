@@ -181,7 +181,7 @@ def get_T_sp_inv(_s, _P, xtol=1e-8, maxiter=500):
 sp_data_FeSi = np.load('eos/zhang_eos/zhang_multiphase/Fe16Si_fischer_sp.npz')
 
 svals_sp_FeSi = sp_data_FeSi['s_vals'] # kb/baryon
-pvals_sp_FeSi = sp_data_FeSi['P_grid_Pa'] # log K
+pvals_sp_FeSi = sp_data_FeSi['P_grid_Pa'] # Pa
 
 rho_grid_sp_FeSi = sp_data_FeSi['rho_SP_grid'] # in g/cm^3
 t_grid_sp_FeSi = sp_data_FeSi['T_SP_grid_K'] # in K

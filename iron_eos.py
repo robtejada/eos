@@ -1,0 +1,932 @@
+import numpy as np
+from scipy.optimize import newton, brentq
+from scipy.interpolate import RegularGridInterpolator as RGI
+from astropy.constants import k_B
+from astropy.constants import u as amu
+from astropy import units as u
+
+class Fe_EOS:
+    """
+    Dorogokupets et al. (2017) thermodynamic model for Fe phases.
+
+    Explicit phases: 'bcc', 'fcc', 'hcp', 'liquid'
+    Auto phase: 'auto'  (switches between solid_phase (default 'hcp') and 'liquid'
+                         using a chosen melting curve)
+
+    Inputs:
+      rho : kg/m^3
+      T   : K
+
+    Core outputs:
+      P : Pa
+      s : J/kg/K
+      u : J/kg
+      f : J/kg  (Helmholtz free energy)
+
+    Added thermo:
+      KT    : Pa         isothermal bulk modulus
+      alpha : 1/K        thermal expansivity
+      cv    : J/kg/K
+      cp    : J/kg/K
+
+    Auto melt curves (P in Pa internally):
+      - 'gonzalez2023' : 6469 * (1 + (P_GPa-300)/434.822)**1.839
+      - 'zhang2015'    : 1900 * (P_GPa/31.3 + 1)**(1/1.99)
+    """
+
+    # Physical constants (SI)
+    R = 8.31446261815324  # J/mol/K
+    M_Fe = 55.845e-3      # kg/mol
+    n = 1.0               # atoms per formula unit
+
+    def __init__(
+        self,
+        phase="auto",
+        *,
+        solid_phase="hcp",
+        melt_curve="gonzalez2023",
+        phase_hysteresis_K=0.0,
+        melt_smooth_width_K=200.0,   # <--- ADD (ΔT)
+        auto_max_iter=3,
+    ):
+        phase = phase.lower()
+        solid_phase = solid_phase.lower()
+        melt_curve = melt_curve.lower()
+
+        if phase == "auto":
+            if solid_phase not in ("bcc", "fcc", "hcp"):
+                raise ValueError("solid_phase must be one of: 'bcc','fcc','hcp'")
+            if melt_curve not in ("gonzalez2023", "zhang2015"):
+                raise ValueError("melt_curve must be 'gonzalez2023' or 'zhang2015'")
+            self.phase = "auto"
+            self.solid_phase = solid_phase
+            self.melt_curve = melt_curve
+            self.melt_smooth_width_K = float(melt_smooth_width_K)
+            self.phase_hysteresis_K = float(phase_hysteresis_K)
+            self.auto_max_iter = int(auto_max_iter)
+
+            # Internal explicit-phase EOS objects
+            self._solid = Fe_EOS(phase=solid_phase)
+            self._liquid = Fe_EOS(phase="liquid")
+            return
+
+        if phase not in ("bcc", "fcc", "hcp", "liquid"):
+            raise ValueError("phase must be one of: 'bcc', 'fcc', 'hcp', 'liquid', 'auto'")
+        self.phase = phase
+
+        self.erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu) # erg/K/g to kb/baryon
+        self.dyn_to_Pa = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
+        self.dyn_to_GPa = (u.dyn/u.cm**2).to('GPa') # dyn/cm² to GPa conversion
+        self.U_conv_cgs = (1.0 * u.J/u.kg).to(u.erg/u.g).value          # 1 J/kg -> erg/g
+        self.S_conv_cgs = (1.0 * u.J/u.kg/u.K).to(u.erg/u.g/u.K).value  # 1 J/kg/K -> erg/g/K
+
+        params = {
+            "bcc": dict(U0_kJmol=0.0,     V0_cm3mol=7.092,  K0_GPa=164.0, K0p=5.50,
+                        Theta0_K=303.0,   gamma0=1.736,    beta=1.125,  gamma_inf=0.0,
+                        e0_1e6Kinv=198.0, g=1.0,
+                        T_star_K=1043.0,  B0=2.22, a_s=0.0,
+                        Tref_K=298.15),
+            "fcc": dict(U0_kJmol=4.470,   V0_cm3mol=6.9285, K0_GPa=146.2, K0p=4.67,
+                        Theta0_K=222.5,   gamma0=2.203,    beta=0.01,   gamma_inf=0.0,
+                        e0_1e6Kinv=198.0, g=0.5,
+                        T_star_K=None,    B0=0.0,  a_s=0.0,
+                        Tref_K=298.15),
+            "hcp": dict(U0_kJmol=4.500,   V0_cm3mol=6.8175, K0_GPa=148.0, K0p=5.86,
+                        Theta0_K=227.0,   gamma0=2.20,     beta=0.01,   gamma_inf=0.0,
+                        e0_1e6Kinv=126.0, g=-0.83,
+                        T_star_K=None,    B0=0.0,  a_s=0.0,
+                        Tref_K=298.15),
+            "liquid": dict(U0_kJmol=-100.204, V0_cm3mol=7.957,  K0_GPa=83.7,  K0p=5.97,
+                           Theta0_K=263.0,   gamma0=2.033,     beta=1.168, gamma_inf=0.0,
+                           e0_1e6Kinv=198.0, g=0.884,
+                           T_star_K=None,    B0=0.0,  a_s=2.12,
+                           Tref_K=1811.0),
+        }[phase]
+
+        # Convert to SI
+        self.U0 = params["U0_kJmol"] * 1e3
+        self.V0 = params["V0_cm3mol"] * 1e-6
+        self.K0 = params["K0_GPa"] * 1e9
+        self.K0p = params["K0p"]
+        self.Theta0 = params["Theta0_K"]
+        self.gamma0 = params["gamma0"]
+        self.beta = params["beta"]
+        self.gamma_inf = params["gamma_inf"]
+        self.e0 = params["e0_1e6Kinv"] * 1e-6
+        self.g = params["g"]
+        self.a_s = params["a_s"]
+        self.Tref = params["Tref_K"]
+
+        self.T_star = params["T_star_K"]
+        self.B0 = params["B0"]
+
+        self.eta = 1.5 * (self.K0p - 1.0)
+        self.p_mag = 0.4 if phase == "bcc" else 0.28
+
+        #### P,T basis tables ####
+
+        # self.pt_data = np.load('eos/dorogokupets_iron_eos/iron_eos_PT.npz')
+
+        # self.pvals_pt = self.pt_data['pvals_pt'] # Pa
+        # self.tvals_pt = self.pt_data['tvals_pt'] # K
+        # self.rho_grid_pt = self.pt_data['rho_grid_pt'] # in g/cm^3
+        # self.s_grid_pt = self.pt_data['s_grid_pt'] # in erg/g/K
+        # self.u_grid_pt = self.pt_data['u_grid_pt'] # in erg/g
+
+        # self.rho_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.rho_grid_pt, method='linear', \
+        #         bounds_error=False, fill_value=None)
+        # self.s_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.s_grid_pt, method='linear', \
+        #         bounds_error=False, fill_value=None)
+        # self.u_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.u_grid_pt, method='linear', \
+        #         bounds_error=False, fill_value=None)
+
+    def get_rho_pt(self, P, T, tab=True):
+        """
+        Get the density of iron at pressure P and temperature T.
+        P in Pa, T in K.
+        """
+        scalar = np.isscalar(P) and np.isscalar(T)
+        P_arr = np.array(P, ndmin=1)
+        T_arr = np.array(T, ndmin=1)
+        if P_arr.shape != T_arr.shape:
+            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
+        if tab:
+            pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
+            vals = self.rho_rgi_pt(pts).reshape(P_arr.shape)
+            return float(vals) if scalar else vals
+        else:    
+            return self.get_rho_pt_inv(P_arr, T_arr)
+
+    def get_s_pt(self, P, T, tab=True):
+        """
+        Get the entropy of iron at pressure P and temperature T.
+        P in Pa, T in K.
+        """
+        scalar = np.isscalar(P) and np.isscalar(T)
+        P_arr = np.array(P, ndmin=1)
+        T_arr = np.array(T, ndmin=1)
+        if P_arr.shape != T_arr.shape:
+            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
+        if tab:
+            pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
+            vals = self.s_rgi_pt(pts).reshape(P_arr.shape)
+            return float(vals) if scalar else vals
+        else:    
+            return self.get_s_pt_inv(P_arr, T_arr)
+
+    def get_u_pt(self, P, T, tab=True):
+
+        """
+        Get the internal energy of iron at pressure P and temperature T.
+        P in Pa, T in K.
+        """
+        scalar = np.isscalar(P) and np.isscalar(T)
+        P_arr = np.array(P, ndmin=1)
+        T_arr = np.array(T, ndmin=1)
+        if P_arr.shape != T_arr.shape:
+            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
+        if tab:
+            pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
+            vals = self.u_rgi_pt(pts).reshape(P_arr.shape)
+            return float(vals) if scalar else vals
+        else:    
+            return self.get_u_pt_inv(P_arr, T_arr)
+
+    # -------------------------
+    # Utilities
+    # -------------------------
+    @staticmethod
+    def _as_arrays(a, b):
+        A = np.array(a, ndmin=1, dtype=float)
+        B = np.array(b, ndmin=1, dtype=float)
+        A, B = np.broadcast_arrays(A, B)
+        return A, B
+
+    @staticmethod
+    def _log1mexp_neg(y):
+        return np.log(-np.expm1(-y))
+
+    # -------------------------
+    # Molar volume from density
+    # -------------------------
+    def V_molar(self, rho):
+        rho = np.asarray(rho, dtype=float)
+        return self.M_Fe / rho
+
+    def x(self, V):
+        return V / self.V0
+
+    def gamma_V(self, V):
+        x = self.x(V)
+        return self.gamma_inf + (self.gamma0 - self.gamma_inf) * np.power(x, self.beta)
+
+    def q_V(self, V):
+        # Eq. (14): q = β x^β (γ0-γ∞) / γ
+        x = self.x(V)
+        gam = self.gamma_V(V)
+        return self.beta * np.power(x, self.beta) * (self.gamma0 - self.gamma_inf) / gam
+
+    def Theta_V(self, V):
+        x = self.x(V)
+        ln_x = np.log(x)
+        one_minus_xb = -np.expm1(self.beta * ln_x)  # 1 - x^beta
+
+        factor = (self.gamma0 - self.gamma_inf)
+        if abs(self.beta) < 1e-6:
+            expo = -factor * ln_x
+        else:
+            expo = (factor / self.beta) * one_minus_xb
+
+        return self.Theta0 * np.exp(-self.gamma_inf * ln_x + expo)
+
+    def e_V(self, V):
+        x = self.x(V)
+        return self.e0 * np.power(x, self.g)
+
+    # -------------------------
+    # Vinet cold: P0, E0, K0(V)
+    # -------------------------
+    def P_cold(self, V):
+        X = np.power(V / self.V0, 1.0 / 3.0)
+        return 3.0 * self.K0 * np.power(X, -2.0) * (1.0 - X) * np.exp(self.eta * (1.0 - X))
+
+    def E_cold(self, V):
+        X = np.power(V / self.V0, 1.0 / 3.0)
+        eta = self.eta
+        term = (1.0 - eta * (1.0 - X)) * np.exp(eta * (1.0 - X))
+        return 9.0 * self.K0 * self.V0 * (1.0 / (eta * eta)) * (1.0 - term)
+
+    def K_cold(self, V):
+        # Eq. (3)
+        X = np.power(V / self.V0, 1.0 / 3.0)
+        eta = self.eta
+        return self.K0 * np.power(X, -2.0) * np.exp(eta * (1.0 - X)) * (1.0 + (1.0 - X) * (eta * X + 1.0))
+
+    # -------------------------
+    # Einstein lattice: F_th, S_th, E_th, Cv_th, P_th, K_Tth
+    # -------------------------
+    def F_th(self, V, T):
+        T = np.asarray(T, dtype=float)
+        Theta = self.Theta_V(V)
+        y = Theta / T
+        return 3.0 * self.n * self.R * T * self._log1mexp_neg(y)
+
+    def S_th(self, V, T):
+        T = np.asarray(T, dtype=float)
+        Theta = self.Theta_V(V)
+        y = Theta / T
+        yclip = np.clip(y, None, 700.0)
+        denom = np.expm1(yclip)
+        frac = np.where(y > 700.0, 0.0, y / denom)
+        return 3.0 * self.n * self.R * (-self._log1mexp_neg(y) + frac)
+
+    def E_th(self, V, T):
+        T = np.asarray(T, dtype=float)
+        Theta = self.Theta_V(V)
+        y = Theta / T
+        yclip = np.clip(y, None, 700.0)
+        denom = np.expm1(yclip)
+        Eth = 3.0 * self.n * self.R * Theta / denom
+        return np.where(y > 700.0, 0.0, Eth)
+
+    def Cv_th(self, V, T):
+        # Eq. (9)
+        T = np.asarray(T, dtype=float)
+        Theta = self.Theta_V(V)
+        y = Theta / T
+        yclip = np.clip(y, None, 700.0)
+        expy = np.exp(yclip)
+        denom = np.expm1(yclip)
+        val = 3.0 * self.n * self.R * (y**2) * expy / (denom**2)
+        return np.where(y > 700.0, 0.0, val)
+
+    def P_th(self, V, T):
+        gam = self.gamma_V(V)
+        Eth = self.E_th(V, T)
+        return gam * Eth / V
+
+    def K_Tth(self, V, T):
+        gam = self.gamma_V(V)
+        q = self.q_V(V)
+        Pth = self.P_th(V, T)
+        Cv = self.Cv_th(V, T)  # J/mol/K
+        return Pth * (1.0 + gam - q) - (gam * gam) * T * Cv / V
+
+    # -------------------------
+    # Electronic: F_e, S_e, E_e, Cv_e, P_e, K_Te
+    # -------------------------
+    def F_e(self, V, T):
+        T = np.asarray(T, dtype=float)
+        e = self.e_V(V)
+        return -1.5 * self.n * self.R * e * T * T
+
+    def S_e(self, V, T):
+        T = np.asarray(T, dtype=float)
+        e = self.e_V(V)
+        return 3.0 * self.n * self.R * e * T
+
+    def E_e(self, V, T):
+        T = np.asarray(T, dtype=float)
+        e = self.e_V(V)
+        return 1.5 * self.n * self.R * e * T * T
+
+    def Cv_e(self, V, T):
+        T = np.asarray(T, dtype=float)
+        e = self.e_V(V)
+        return 3.0 * self.n * self.R * e * T
+
+    def P_e(self, V, T):
+        Ee = self.E_e(V, T)
+        return self.g * Ee / V
+
+    def K_Te(self, V, T):
+        Pe = self.P_e(V, T)
+        return Pe * (1.0 - self.g)
+
+    # -------------------------
+    # Magnetic (bcc only): F_mag, S_mag, E_mag, Cv_mag
+    # -------------------------
+    def _mag_D(self):
+        p = self.p_mag
+        return 518.0/1125.0 + 11692.0/15975.0 * (1.0/p - 1.0)
+
+    def _f_tau(self, tau):
+        p = self.p_mag
+        D = self._mag_D()
+        tau = np.asarray(tau, dtype=float)
+        f = np.empty_like(tau)
+
+        m = tau <= 1.0
+        if np.any(m):
+            t = tau[m]
+            A1 = 79.0 * t**(-1.0) / (140.0 * p)
+            A2 = (474.0/497.0) * (1.0/p - 1.0) * (t**3/6.0 + t**9/135.0 + t**15/600.0)
+            f[m] = 1.0 - (A1 + A2)/D
+
+        mp = ~m
+        if np.any(mp):
+            t = tau[mp]
+            f[mp] = -(t**(-5.0)/10.0 + t**(-15.0)/315.0 + t**(-25.0)/1500.0)/D
+
+        return f
+
+    def _df_dtau(self, tau):
+        p = self.p_mag
+        D = self._mag_D()
+        tau = np.asarray(tau, dtype=float)
+        df = np.empty_like(tau)
+
+        m = tau <= 1.0
+        if np.any(m):
+            t = tau[m]
+            factor = (474.0/497.0) * (1.0/p - 1.0)
+            dA1 = -79.0 / (140.0 * p) * t**(-2.0)
+            dA2 = factor * (0.5 * t**2 + (1.0/15.0) * t**8 + (1.0/40.0) * t**14)
+            df[m] = -(dA1 + dA2)/D
+
+        mp = ~m
+        if np.any(mp):
+            t = tau[mp]
+            df[mp] = (0.5 * t**(-6.0) + (1.0/21.0) * t**(-16.0) + (1.0/60.0) * t**(-26.0))/D
+
+        return df
+
+    def _d2f_dtau2(self, tau):
+        p = self.p_mag
+        D = self._mag_D()
+        tau = np.asarray(tau, dtype=float)
+        d2 = np.empty_like(tau)
+
+        m = tau <= 1.0
+        if np.any(m):
+            t = tau[m]
+            factor = (474.0/497.0) * (1.0/p - 1.0)
+            d2A1 = 2.0 * 79.0 / (140.0 * p) * t**(-3.0)
+            d2A2 = factor * (t + (8.0/15.0)*t**7 + (7.0/20.0)*t**13)
+            d2[m] = -(d2A1 + d2A2)/D
+
+        mp = ~m
+        if np.any(mp):
+            t = tau[mp]
+            d2[mp] = (-3.0*t**(-7.0) - (16.0/21.0)*t**(-17.0) - (13.0/30.0)*t**(-27.0))/D
+
+        return d2
+
+    def F_mag(self, T):
+        if (self.B0 is None) or (self.B0 <= 0.0) or (self.T_star is None):
+            return 0.0 * np.asarray(T, dtype=float)
+        T = np.asarray(T, dtype=float)
+        A = self.R * np.log(self.B0 + 1.0)
+        tau = T / self.T_star
+        f = self._f_tau(tau)
+        return A * T * (f - 1.0)
+
+    def S_mag(self, T):
+        if (self.B0 is None) or (self.B0 <= 0.0) or (self.T_star is None):
+            return 0.0 * np.asarray(T, dtype=float)
+        T = np.asarray(T, dtype=float)
+        A = self.R * np.log(self.B0 + 1.0)
+        tau = T / self.T_star
+        f = self._f_tau(tau)
+        df = self._df_dtau(tau)
+        return -A * ((f - 1.0) + tau * df)
+
+    def E_mag(self, T):
+        if (self.B0 is None) or (self.B0 <= 0.0) or (self.T_star is None):
+            return 0.0 * np.asarray(T, dtype=float)
+        T = np.asarray(T, dtype=float)
+        A = self.R * np.log(self.B0 + 1.0)
+        tau = T / self.T_star
+        df = self._df_dtau(tau)
+        return -A * T * tau * df
+
+    def Cv_mag(self, T):
+        # C_Vmag = dE_mag/dT (mag depends only on T)
+        if (self.B0 is None) or (self.B0 <= 0.0) or (self.T_star is None):
+            return 0.0 * np.asarray(T, dtype=float)
+        T = np.asarray(T, dtype=float)
+        A = self.R * np.log(self.B0 + 1.0)
+        tau = T / self.T_star
+        df = self._df_dtau(tau)
+        d2f = self._d2f_dtau2(tau)
+        Tstar = self.T_star
+        return -(A/Tstar) * (2.0*T*df + (T*T/Tstar)*d2f)
+
+    # -------------------------
+    # Full molar F, P, S, U
+    # -------------------------
+    def F_molar(self, V, T):
+        Tref = self.Tref
+        F = self.U0 + self.E_cold(V)
+        F += (self.F_th(V, T) - self.F_th(V, Tref))
+        F += (self.F_e(V, T)  - self.F_e(V, Tref))
+        if self.phase == "liquid":
+            F += -self.a_s * self.R * (T - Tref)
+        else:
+            F += (self.F_mag(T) - self.F_mag(Tref))
+        return F
+
+    def P(self, rho, T):
+        if self.phase == "auto":
+            return self.get_p_rhot(rho, T)
+
+        V = self.V_molar(rho)
+        Tref = self.Tref
+        return self.P_cold(V) + (self.P_th(V, T) - self.P_th(V, Tref)) + (self.P_e(V, T) - self.P_e(V, Tref))
+
+    def S_molar(self, V, T):
+        S = self.S_th(V, T) + self.S_e(V, T)
+        if self.phase == "liquid":
+            S += self.a_s * self.R
+        else:
+            S += self.S_mag(T)
+        return S
+
+    def U_molar(self, V, T):
+        Tref = self.Tref
+        U = self.U0 + self.E_cold(V)
+        U += (self.E_th(V, T) - self.E_th(V, Tref))
+        U += (self.E_e(V, T)  - self.E_e(V, Tref))
+        if self.phase == "liquid":
+            U += self.a_s * self.R * Tref
+        else:
+            U += (self.E_mag(T) - self.E_mag(Tref))
+        return U
+
+    # -------------------------
+    # KT, alpha, Cv, Cp (molar)
+    # -------------------------
+    def KT_molar(self, V, T):
+        Tref = self.Tref
+        KT = self.K_cold(V)
+        KT += (self.K_Tth(V, T) - self.K_Tth(V, Tref))
+        KT += (self.K_Te(V, T)  - self.K_Te(V, Tref))
+        return KT
+
+    def alpha(self, rho, T):
+        if self.phase == "auto":
+            return self.get_alpha_rhot(rho, T)
+
+        V = self.V_molar(rho)
+        KT = self.KT_molar(V, T)  # Pa
+        # (∂P/∂T)_V = gamma*Cv_th/V + g*Cv_e/V ; magnetic has no P(V,T)
+        dPdT_V = (self.gamma_V(V) * self.Cv_th(V, T) + self.g * self.Cv_e(V, T)) / V
+        return dPdT_V / KT
+
+    def Cv_molar(self, V, T):
+        Cv = self.Cv_th(V, T) + self.Cv_e(V, T)
+        if self.phase != "liquid":
+            Cv += self.Cv_mag(T)
+        return Cv
+
+    def Cp_molar(self, V, T):
+        KT = self.KT_molar(V, T)
+        a = self.alpha(self.M_Fe / V, T)  # alpha expects rho; rho = M/V
+        Cv = self.Cv_molar(V, T)
+        return Cv + (a*a) * T * V * KT
+
+    # -------------------------
+    # Auto phase logic + melting curves
+    # -------------------------
+    def Tmelt(self, P_pa, curve=None):
+        curve = (self.melt_curve if curve is None else curve).lower()
+        P_pa = np.asarray(P_pa, dtype=float)
+        P_GPa = P_pa / 1e9
+
+        if curve == "gonzalez2023":
+            return 6469.0 * (1.0 + (P_GPa - 300.0) / 434.822) ** 1.839
+        if curve == "zhang2015":
+            return 1900.0 * (P_GPa / 31.3 + 1.0) ** (1.0 / 1.99)
+
+        raise ValueError("curve must be 'gonzalez2023' or 'zhang2015'")
+
+    def _auto_phase_mask(self, rho, T):
+        """
+        Return boolean mask: True->liquid, False->solid.
+        Uses a short self-consistency iteration to reduce flip-flop.
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        h = self.phase_hysteresis_K
+
+        # start assuming solid everywhere
+        is_liq = np.zeros_like(rho_arr, dtype=bool)
+
+        for _ in range(max(1, self.auto_max_iter)):
+            # pressure using current phase assignment
+            P_now = np.where(is_liq,
+                             self._liquid.P(rho_arr, T_arr),
+                             self._solid.P(rho_arr, T_arr))
+            Tm = self.Tmelt(np.maximum(P_now, 0.0), curve=self.melt_curve)
+
+            # hysteresis band to avoid chatter near Tm
+            to_liq = T_arr > (Tm + h)
+            to_sol = T_arr < (Tm - h)
+            new_is_liq = np.where(to_liq, True, np.where(to_sol, False, is_liq))
+
+            if np.all(new_is_liq == is_liq):
+                break
+            is_liq = new_is_liq
+
+        return is_liq
+
+    def _smooth_weight(self, x):
+        """Return w in [0,1] using tanh smoothstep."""
+        return 0.5 * (1.0 + np.tanh(x))
+
+    def _auto_blend_weight_and_pressure(self, rho, T):
+        """
+        Auto mode:
+          - compute P_solid(rho,T) and P_liquid(rho,T)
+          - iterate P -> Tm(P) -> w -> P_blend
+    
+        Returns:
+          w       : liquid fraction in [0,1]
+          P_blend : blended pressure [Pa]
+          P_sol   : solid pressure [Pa]
+          P_liq   : liquid pressure [Pa]
+          Tm      : melt temperature evaluated at final P_blend [K]
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+    
+        # Phase pressures at same (rho,T)
+        P_sol = self._solid.P(rho_arr, T_arr)
+        P_liq = self._liquid.P(rho_arr, T_arr)
+    
+        dT = self.melt_smooth_width_K
+    
+        # initial guess for P used in Tm(P)
+        P = 0.5 * (P_sol + P_liq)
+    
+        for _ in range(max(1, self.auto_max_iter)):
+            Tm = self.Tmelt(np.maximum(P, 0.0), curve=self.melt_curve)
+    
+            if dT <= 0.0:
+                w = (T_arr >= Tm).astype(float)
+            else:
+                w = self._smooth_weight((T_arr - Tm) / dT)
+    
+            P_new = (1.0 - w) * P_sol + w * P_liq
+    
+            # convergence (cheap + stable)
+            if np.allclose(P_new, P, rtol=1e-10, atol=0.0):
+                P = P_new
+                break
+            P = P_new
+    
+        # final update
+        Tm = self.Tmelt(np.maximum(P, 0.0), curve=self.melt_curve)
+        if dT <= 0.0:
+            w = (T_arr >= Tm).astype(float)
+        else:
+            w = self._smooth_weight((T_arr - Tm) / dT)
+    
+        P_blend = (1.0 - w) * P_sol + w * P_liq
+        return w, P_blend, P_sol, P_liq, Tm
+
+
+    def get_phase_rhot(self, rho, T):
+        if self.phase != "auto":
+            return np.array(self.phase, ndmin=1)
+
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        is_liq = self._auto_phase_mask(rho_arr, T_arr)
+        out = np.where(is_liq, "liquid", self.solid_phase)
+        return out.reshape(rho_arr.shape)
+
+    # -------------------------
+    # Public rho,T API (dispatching if auto)
+    # -------------------------
+    def eos_rhoT(self, rho, T):
+        rho_arr, T_arr = self._as_arrays(rho, T)
+
+        if self.phase == "auto":
+            is_liq = self._auto_phase_mask(rho_arr, T_arr)
+
+            P = np.where(is_liq,
+                         self._liquid.get_p_rhot(rho_arr, T_arr),
+                         self._solid.get_p_rhot(rho_arr, T_arr))
+
+            u = np.where(is_liq,
+                         self._liquid.get_u_rhot(rho_arr, T_arr),
+                         self._solid.get_u_rhot(rho_arr, T_arr))
+
+            s = np.where(is_liq,
+                         self._liquid.get_s_rhot(rho_arr, T_arr),
+                         self._solid.get_s_rhot(rho_arr, T_arr))
+
+            f = np.where(is_liq,
+                         self._liquid.get_f_rhot(rho_arr, T_arr),
+                         self._solid.get_f_rhot(rho_arr, T_arr))
+
+            return P.reshape(rho_arr.shape), u.reshape(rho_arr.shape), s.reshape(rho_arr.shape), f.reshape(rho_arr.shape)
+
+        V = self.V_molar(rho_arr)
+        P = self.P(rho_arr, T_arr)
+        Fm = self.F_molar(V, T_arr)
+        Sm = self.S_molar(V, T_arr)
+        Um = self.U_molar(V, T_arr)
+
+        f = Fm / self.M_Fe
+        s = Sm / self.M_Fe
+        u = Um / self.M_Fe
+
+        return P.reshape(rho_arr.shape), u.reshape(rho_arr.shape), s.reshape(rho_arr.shape), f.reshape(rho_arr.shape)
+
+    def get_p_rhot(self, rho, T):
+        """
+        Get the pressure at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          P: Pa
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, P_blend, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            return P_blend.reshape(rho_arr.shape)
+        return self.P(rho_arr, T_arr).reshape(rho_arr.shape)
+
+
+    def get_u_rhot(self, rho, T):
+        """
+        Get the internal energy at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          u: erg/g
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            u_sol = self._solid.get_u_rhot(rho_arr, T_arr)
+            u_liq = self._liquid.get_u_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * u_sol + w * u_liq).reshape(rho_arr.shape)
+    
+        V = self.V_molar(rho_arr)
+        return (self.U_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.U_conv_cgs
+    
+    def get_s_rhot(self, rho, T):
+        """
+        Get the entropy at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          s: erg/g/K
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            s_sol = self._solid.get_s_rhot(rho_arr, T_arr)
+            s_liq = self._liquid.get_s_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * s_sol + w * s_liq).reshape(rho_arr.shape)
+    
+        V = self.V_molar(rho_arr)
+        return (self.S_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.S_conv_cgs
+    
+    def get_f_rhot(self, rho, T):
+        """
+        Get the Helmholtz free energy at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          f: erg/g
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            f_sol = self._solid.get_f_rhot(rho_arr, T_arr)
+            f_liq = self._liquid.get_f_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * f_sol + w * f_liq).reshape(rho_arr.shape)
+    
+        V = self.V_molar(rho_arr)
+        return (self.F_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.U_conv_cgs
+
+
+    def get_KT_rhot(self, rho, T):
+        """
+        Get the isothermal bulk modulus at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          KT: Pa
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            KT_sol = self._solid.get_KT_rhot(rho_arr, T_arr)
+            KT_liq = self._liquid.get_KT_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * KT_sol + w * KT_liq).reshape(rho_arr.shape)
+    
+        V = self.V_molar(rho_arr)
+        return self.KT_molar(V, T_arr).reshape(rho_arr.shape)
+    
+    def get_alpha_rhot(self, rho, T):
+        """
+        Get the thermal expansivity at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          alpha: 1/K
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            a_sol = self._solid.get_alpha_rhot(rho_arr, T_arr)
+            a_liq = self._liquid.get_alpha_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * a_sol + w * a_liq).reshape(rho_arr.shape)
+        return self.alpha(rho_arr, T_arr).reshape(rho_arr.shape)
+    
+    def get_cv_rhot(self, rho, T):
+        """
+        Get the specific heat at constant volume at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          cv: erg/g/K
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            cv_sol = self._solid.get_cv_rhot(rho_arr, T_arr)
+            cv_liq = self._liquid.get_cv_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * cv_sol + w * cv_liq).reshape(rho_arr.shape)
+    
+        V = self.V_molar(rho_arr)
+        return (self.Cv_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * self.S_conv_cgs
+    
+    def get_cp_rhot(self, rho, T):
+        """
+        Get the specific heat at constant pressure at a given density and temperature.
+        rho: kg/m^3
+        T: K
+        Returns:
+          cp: erg/g/K
+        """
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        if self.phase == "auto":
+            w, _, _, _, _ = self._auto_blend_weight_and_pressure(rho_arr, T_arr)
+            cp_sol = self._solid.get_cp_rhot(rho_arr, T_arr)
+            cp_liq = self._liquid.get_cp_rhot(rho_arr, T_arr)
+            return ((1.0 - w) * cp_sol + w * cp_liq).reshape(rho_arr.shape)
+    
+        cv = self.get_cv_rhot(rho_arr, T_arr)
+        a  = self.get_alpha_rhot(rho_arr, T_arr)
+        KT = self.get_KT_rhot(rho_arr, T_arr)
+        cp = cv + (a*a) * T_arr * KT / rho_arr
+        return cp.reshape(rho_arr.shape) * self.S_conv_cgs
+
+
+    # -------------------------
+    # P(rho,T) -> rho(P,T) inversion in SI (P in Pa, rho in kg/m^3)
+    # -------------------------
+    def get_rho_pt_inv(
+        self,
+        P,
+        T,
+        rho0=None,
+        *,
+        rho_bracket=(1000, 100000.0),
+        tol=1e-8,
+        maxiter=50,
+        newton_first=True,
+        dPdrho_eps_rel=1e-6,
+    ):
+        """
+        Invert P(rho,T) -> rho(P,T) by root finding.
+
+        Units:
+          P: Pa
+          T: K
+          rho: kg/m^3
+
+        Strategy:
+          1) Newton (optional) with numerical dP/drho
+          2) Brent bracketing fallback on rho_bracket
+        """
+
+        P_arr, T_arr = self._as_arrays(P, T)
+        out = np.empty_like(P_arr, dtype=float)
+
+        if rho0 is not None:
+            rho0_arr, _ = self._as_arrays(rho0, T_arr)
+        else:
+            rho0_arr = None
+
+        a_br, b_br = float(rho_bracket[0]), float(rho_bracket[1])
+
+        def dP_drho_num(r, t):
+            r = float(r)
+            h = dPdrho_eps_rel * max(abs(r), 1.0)
+            p_hi = float(self.get_p_rhot(r + h, t))
+            p_lo = float(self.get_p_rhot(r - h, t))
+            return (p_hi - p_lo) / (2.0 * h)
+
+        for idx in np.ndindex(P_arr.shape):
+            p_tgt = float(P_arr[idx])
+            t = float(T_arr[idx])
+
+            def f(r):
+                return float(self.get_p_rhot(r, t) - p_tgt)
+
+            def fp(r):
+                return float(dP_drho_num(r, t))
+
+            r_guess = float(rho0_arr[idx]) if rho0_arr is not None else 0.5 * (a_br + b_br)
+
+            solved = False
+            if newton_first:
+                try:
+                    r_new = newton(f, r_guess, fprime=fp, tol=tol, maxiter=maxiter)
+                    out[idx] = float(r_new)
+                    solved = True
+                except Exception:
+                    solved = False
+
+            if not solved:
+                fa = f(a_br)
+                fb = f(b_br)
+                if np.isnan(fa) or np.isnan(fb) or fa * fb > 0.0:
+                    raise ValueError(
+                        f"brentq: target P={p_tgt:g} Pa at T={t:g} K not bracketed on "
+                        f"[{a_br:g}, {b_br:g}] kg/m^3. f(a)={fa:g}, f(b)={fb:g}."
+                    )
+                out[idx] = float(brentq(f, a_br, b_br, xtol=tol, maxiter=maxiter))
+
+        return out.reshape(P_arr.shape)
+
+    def get_s_pt_inv(self,
+        P,
+        T,
+        rho0=None,
+        *,
+        rho_bracket=(1000, 100000.0),
+        tol=1e-8,
+        maxiter=50,
+        newton_first=True,
+        dPdrho_eps_rel=1e-6,
+    ):
+        """
+        Obtains S(P,T) via rho(P,T) inversion.
+        P: Pa
+        T: K
+        rho0: kg/m^3
+        rho_bracket: tuple of floats (min, max)
+        tol: float
+        maxiter: int
+        newton_first: bool
+        dPdrho_eps_rel: float
+        Returns:
+          S: erg/g/K
+        """
+        args = (P,
+            T,
+            rho0,
+            rho_bracket,
+            tol,
+            maxiter,
+            newton_first,
+            dPdrho_eps_rel)
+        
+        rho = self.get_rho_pt_inv(*args)
+
+        return self.get_s_rhot(rho, T)
