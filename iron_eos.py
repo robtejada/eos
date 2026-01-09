@@ -54,17 +54,23 @@ class Fe_EOS_analytic:
         phase_hysteresis_K=0.0,
         melt_smooth_width_K=200.0,
         auto_max_iter=3,
-        # NEW:
         solid_lowP="bcc",
         solid_switch_P_GPa=13.0,
         solid_switch_width_GPa=2.0,
+        # NEW: tensile-failure pressure cap
+        enforce_P_nonneg=False,
+        P_nonneg_smooth_Pa=1e5,   # ~0.01 GPa smoothing band near P=0
     ):
+
 
         phase = phase.lower()
         solid_phase = solid_phase.lower()
         melt_curve = melt_curve.lower()
 
         self.melt_curve = melt_curve
+        self.enforce_P_nonneg = bool(enforce_P_nonneg)
+        self.P_nonneg_smooth_Pa = float(P_nonneg_smooth_Pa)
+
 
         if phase == "auto":
             if solid_phase not in ("bcc", "fcc", "hcp"):
@@ -150,6 +156,40 @@ class Fe_EOS_analytic:
         B = np.array(b, ndmin=1, dtype=float)
         A, B = np.broadcast_arrays(A, B)
         return A, B
+    @staticmethod
+    def _smoothstep5(u):
+        """
+        Quintic smoothstep: 0->1 with zero 1st/2nd derivatives at endpoints.
+        u should be in [0,1].
+        """
+        return u*u*u*(u*(u*6.0 - 15.0) + 10.0)
+
+    def _enforce_nonnegative_pressure(self, P):
+        """
+        Enforce P >= 0 with a smooth transition near P=0.
+
+        Behavior:
+        - P_raw <= 0        -> 0 exactly
+        - 0 < P_raw < dP    -> smoothly ramps up (C2 smooth)
+        - P_raw >= dP       -> P_raw (unchanged)
+
+        dP = self.P_nonneg_smooth_Pa
+        """
+        P = np.asarray(P, dtype=float)
+        if not self.enforce_P_nonneg:
+            return P
+
+        dP = float(self.P_nonneg_smooth_Pa)
+        if dP <= 0.0:
+            return np.maximum(P, 0.0)
+
+        Ppos = np.maximum(P, 0.0)
+        u = np.clip(Ppos / dP, 0.0, 1.0)
+        s = self._smoothstep5(u)
+
+        # For tiny positive pressures, damp toward 0 smoothly; above dP leave unchanged.
+        return np.where(Ppos < dP, Ppos * s, Ppos)
+
 
     @staticmethod
     def _log1mexp_neg(y):
@@ -421,7 +461,9 @@ class Fe_EOS_analytic:
 
         V = self.V_molar(rho)
         Tref = self.Tref
-        return self.P_cold(V) + (self.P_th(V, T) - self.P_th(V, Tref)) + (self.P_e(V, T) - self.P_e(V, Tref))
+        P_raw = self.P_cold(V) + (self.P_th(V, T) - self.P_th(V, Tref)) + (self.P_e(V, T) - self.P_e(V, Tref))
+        return self._enforce_nonnegative_pressure(P_raw)
+
 
     def S_molar(self, V, T):
         S = self.S_th(V, T) + self.S_e(V, T)
@@ -543,6 +585,11 @@ class Fe_EOS_analytic:
         P_hi  = self._solid_hi.P(rho_arr, T_arr)
         P_liq = self._liquid.P(rho_arr, T_arr)
 
+        P_lo  = self._enforce_nonnegative_pressure(P_lo)
+        P_hi  = self._enforce_nonnegative_pressure(P_hi)
+        P_liq = self._enforce_nonnegative_pressure(P_liq)
+
+
         dT_melt = self.melt_smooth_width_K
         Ptr = self.solid_switch_P
         dP  = self.solid_switch_width_P
@@ -634,10 +681,8 @@ class Fe_EOS_analytic:
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
             w_melt, w_hi, P_blend, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
-            return P_blend.reshape(rho_arr.shape)
-        return self.P(rho_arr, T_arr).reshape(rho_arr.shape)
-
-
+            return self._enforce_nonnegative_pressure(P_blend).reshape(rho_arr.shape)
+        return self._enforce_nonnegative_pressure(self.P(rho_arr, T_arr)).reshape(rho_arr.shape)
 
     def get_u_rhot(self, rho, T):
         rho_arr, T_arr = self._as_arrays(rho, T)
@@ -1011,7 +1056,7 @@ class Fe_EOS(Fe_EOS_analytic):
         if rgi_kwargs is None:
             rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
 
-        data = np.load('eos/dorogokupets_iron_eos/iron_eos_PT.npz')
+        data = np.load('eos/dorogokupets_iron_eos/iron_eos_PT_liquid.npz')
 
         self.pvals_pt = np.asarray(data['pvals_pt'], dtype=float)  # Pa
         self.tvals_pt = np.asarray(data['tvals_pt'], dtype=float)  # K
