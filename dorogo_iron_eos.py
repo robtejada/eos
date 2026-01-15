@@ -1,16 +1,24 @@
+from __future__ import annotations
+
 import numpy as np
-from scipy.optimize import newton, brentq
+
+from dataclasses import dataclass
+from typing import Literal, Tuple, Union, Optional
+
+ArrayLike = Union[float, np.ndarray]
+
+from scipy.optimize import newton, brentq, brenth, least_squares
 from scipy.interpolate import RegularGridInterpolator as RGI
 from astropy.constants import k_B
 from astropy.constants import u as amu
 from astropy import units as u
 
-erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu) # erg/K/g to kb/baryon
-dyn_to_Pa = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
-dyn_to_GPa = (u.dyn/u.cm**2).to('GPa') # dyn/cm² to GPa conversion
-U_conv_cgs = (1.0 * u.J/u.kg).to(u.erg/u.g).value          # 1 J/kg -> erg/g
-S_conv_cgs = (1.0 * u.J/u.kg/u.K).to(u.erg/u.g/u.K).value  # 1 J/kg/K -> erg/g/K
-
+# --- scalar conversion factors (plain floats) ---
+ERG_GK_TO_KBBAR = float((u.erg/u.Kelvin/u.gram).to(k_B/amu))  # (erg/g/K) -> (kB/baryon)
+DYNCM2_TO_PA    = float((u.dyn/u.cm**2).to('Pa'))
+DYNCM2_TO_GPA   = float((u.dyn/u.cm**2).to('GPa'))
+U_CONV_CGS      = float((u.J/u.kg).to('erg/g'))       # J/kg -> erg/g
+S_CONV_CGS      = float((u.J/u.kg/u.K).to('erg/(g * K)'))  # J/kg/K -> erg/g/K
 class Fe_EOS_analytic:
     """
     Dorogokupets et al. (2017) thermodynamic model for Fe phases.
@@ -44,6 +52,12 @@ class Fe_EOS_analytic:
     R = 8.31446261815324  # J/mol/K
     M_Fe = 55.845e-3      # kg/mol
     n = 1.0               # atoms per formula unit
+
+    erg_to_kbbar: float = ERG_GK_TO_KBBAR
+    dyn_to_Pa: float = DYNCM2_TO_PA
+    dyn_to_GPa: float = DYNCM2_TO_GPA
+    L: float = 1.2e6 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of Fe-Si alloy in erg/g (Anderson & Duba 1997)
+    kb: float = k_B.to('erg/K') # ergs/K
 
     def __init__(
         self,
@@ -146,6 +160,8 @@ class Fe_EOS_analytic:
 
         self.eta = 1.5 * (self.K0p - 1.0)
         self.p_mag = 0.4 if phase == "bcc" else 0.28
+
+        self.p = params
 
     # -------------------------
     # Utilities
@@ -697,7 +713,7 @@ class Fe_EOS_analytic:
             return ((1.0 - w_melt) * u_sol + w_melt * u_liq).reshape(rho_arr.shape)
 
         V = self.V_molar(rho_arr)
-        return (self.U_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * U_conv_cgs
+        return (self.U_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * U_CONV_CGS
     
     def get_s_rhot(self, rho, T):
         """
@@ -719,7 +735,7 @@ class Fe_EOS_analytic:
             return ((1.0 - w_melt) * s_sol + w_melt * s_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
-        return (self.S_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_conv_cgs
+        return (self.S_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_CONV_CGS
     
     def get_f_rhot(self, rho, T):
         """
@@ -741,7 +757,7 @@ class Fe_EOS_analytic:
             return ((1.0 - w_melt) * f_sol + w_melt * f_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
-        return (self.F_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * U_conv_cgs
+        return (self.F_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * U_CONV_CGS
 
 
     def get_KT_rhot(self, rho, T):
@@ -806,32 +822,26 @@ class Fe_EOS_analytic:
             return ((1.0 - w_melt) * cv_sol + w_melt * cv_liq).reshape(rho_arr.shape)
     
         V = self.V_molar(rho_arr)
-        return (self.Cv_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_conv_cgs
+        return (self.Cv_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_CONV_CGS
     
     def get_cp_rhot(self, rho, T):
-        """
-        Get the specific heat at constant pressure at a given density and temperature.
-        rho: kg/m^3
-        T: K
-        Returns:
-          cp: erg/g/K
-        """
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
             w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
-
             cp_lo  = self._solid_lo.get_cp_rhot(rho_arr, T_arr)
             cp_hi  = self._solid_hi.get_cp_rhot(rho_arr, T_arr)
             cp_liq = self._liquid.get_cp_rhot(rho_arr, T_arr)
-
             cp_sol = (1.0 - w_hi) * cp_lo + w_hi * cp_hi
             return ((1.0 - w_melt) * cp_sol + w_melt * cp_liq).reshape(rho_arr.shape)
-    
-        cv = self.get_cv_rhot(rho_arr, T_arr)
-        a  = self.get_alpha_rhot(rho_arr, T_arr)
-        KT = self.get_KT_rhot(rho_arr, T_arr)
-        cp = cv + (a*a) * T_arr * KT / rho_arr
-        return cp.reshape(rho_arr.shape) * S_conv_cgs
+
+        cv_cgs = self.get_cv_rhot(rho_arr, T_arr)         # erg/g/K
+        a      = self.get_alpha_rhot(rho_arr, T_arr)      # 1/K
+        KT     = self.get_KT_rhot(rho_arr, T_arr)         # Pa
+        # convert the pressure term (SI) -> cgs and add to cv (already cgs)
+        cp_term_cgs = (a*a) * T_arr * KT / rho_arr * S_CONV_CGS  # erg/g/K
+        cp_cgs = cv_cgs + cp_term_cgs
+        return cp_cgs.reshape(rho_arr.shape)
+
 
 
     # -------------------------
@@ -839,195 +849,538 @@ class Fe_EOS_analytic:
     # -------------------------
     def get_rho_pt_inv(
         self,
-        P,
-        T,
-        rho0=None,
-        *,
-        rho_bracket=(1000, 100000.0),
-        tol=1e-8,
-        maxiter=50,
-        newton_first=True,
-        dPdrho_eps_rel=1e-6,
-    ):
+        P: ArrayLike,
+        T_K: ArrayLike,
+        rho_bracket_kgm3: Optional[Tuple[float, float]] = None,
+        max_iter: int = 200,
+        rtol: float = 1e-10,
+        rho_guess0: Optional[float] = None,
+        use_lsq_first: bool = True,
+        lsq_max_nfev: int = 60,
+        bracket_expand_steps: int = 30,
+        bracket_expand_factor: float = 1.6,
+        on_fail: str = "nan",  # "nan" or "raise"
+    ) -> np.ndarray:
         """
-        Invert P(rho,T) -> rho(P,T) by root finding.
+        Invert P(rho,T)=P_target for rho at given (P,T).
 
-        Units:
-          P: Pa
-          T: K
-          rho: kg/m^3
-
-        Strategy:
-          1) Newton (optional) with numerical dP/drho
-          2) Brent bracketing fallback on rho_bracket
-        """
-
-        P_arr, T_arr = self._as_arrays(P, T)
-        out = np.empty_like(P_arr, dtype=float)
-
-        if rho0 is not None:
-            rho0_arr, _ = self._as_arrays(rho0, T_arr)
-        else:
-            rho0_arr = None
-
-        a_br, b_br = float(rho_bracket[0]), float(rho_bracket[1])
-
-        def dP_drho_num(r, t):
-            r = float(r)
-            h = dPdrho_eps_rel * max(abs(r), 1.0)
-            p_hi = float(self.get_p_rhot(r + h, t))
-            p_lo = float(self.get_p_rhot(r - h, t))
-            return (p_hi - p_lo) / (2.0 * h)
-
-        for idx in np.ndindex(P_arr.shape):
-            p_tgt = float(P_arr[idx])
-            t = float(T_arr[idx])
-
-            def f(r):
-                return float(self.get_p_rhot(r, t)/p_tgt - 1)
-
-            def fp(r):
-                return float(dP_drho_num(r, t))
-
-            r_guess = float(rho0_arr[idx]) if rho0_arr is not None else 0.5 * (a_br + b_br)
-
-            solved = False
-            if newton_first:
-                try:
-                    r_new = newton(f, r_guess, fprime=fp, tol=tol, maxiter=maxiter)
-                    out[idx] = float(r_new)
-                    solved = True
-                except Exception:
-                    solved = False
-
-            if not solved:
-                fa = f(a_br)
-                fb = f(b_br)
-                if np.isnan(fa) or np.isnan(fb) or fa * fb > 0.0:
-                    raise ValueError(
-                        f"brentq: target P={p_tgt:g} Pa at T={t:g} K not bracketed on "
-                        f"[{a_br:g}, {b_br:g}] kg/m^3. f(a)={fa:g}, f(b)={fb:g}."
-                    )
-                out[idx] = float(brentq(f, a_br, b_br, xtol=tol, maxiter=maxiter))
-
-        return out.reshape(P_arr.shape)
-
-    def get_s_pt_inv(self,
-        P,
-        T,
-        rho0=None,
-        *,
-        rho_bracket=(1000, 100000.0),
-        tol=1e-8,
-        maxiter=50,
-        newton_first=True,
-        dPdrho_eps_rel=1e-6,
-    ):
-        """
-        Obtains S(P,T) via rho(P,T) inversion.
+        Units
+        -----
         P: Pa
         T: K
-        rho0: kg/m^3
-        rho_bracket: tuple of floats (min, max)
-        tol: float
-        maxiter: int
-        newton_first: bool
-        dPdrho_eps_rel: float
-        Returns:
-          S: erg/g/K
+        rho: kg/m^3
         """
-        
+        P_in = np.asarray(P, dtype=float)
+        T_in = np.asarray(T_K, dtype=float)
+
+        if np.any(T_in <= 0):
+            raise ValueError("Temperature must be > 0 K")
+
+        shape = np.broadcast(P_in, T_in).shape
+        P_b = np.broadcast_to(P_in, shape)
+        T_b = np.broadcast_to(T_in, shape)
+
+        out = np.full(shape, np.nan, dtype=float)
+
+        # Default bracket (tune if you want, but keep positive + wide)
+        if rho_bracket_kgm3 is None:
+            rho_min, rho_max = 1.0e3, 4.0e4
+        else:
+            rho_min, rho_max = map(float, rho_bracket_kgm3)
+
+        if rho_min <= 0 or rho_max <= 0 or rho_min >= rho_max:
+            raise ValueError("rho_bracket_kgm3 must be positive and increasing (rho_min < rho_max).")
+
+        log_rho_lo, log_rho_hi = np.log(rho_min), np.log(rho_max)
+
+        # Seed density: reference V0 if available (explicit phases), else midpoint
+        if hasattr(self, "V0"):
+            rho_V0 = float(self.M_Fe / self.V0)  # kg/m^3 (since V0 is m^3/mol)
+        else:
+            rho_V0 = np.sqrt(rho_min * rho_max)
+
+        rho_seed_first = float(rho_guess0) if rho_guess0 is not None else rho_V0
+        rho_seed_first = min(max(rho_seed_first, rho_min), rho_max)
+
+        def P_of_rho_scalar(rho: float, Ti: float) -> float:
+            val = self.get_p_rhot(rho, Ti)
+            return float(np.asarray(val))
+
+        rho_prev = None
+
+        for idx in np.ndindex(shape):
+            Pt = float(P_b[idx])
+            Ti = float(T_b[idx])
+
+            if (not np.isfinite(Pt)) or (not np.isfinite(Ti)) or Ti <= 0:
+                continue
+
+            rho_guess = rho_seed_first if (rho_prev is None or not np.isfinite(rho_prev)) else float(rho_prev)
+            rho_guess = min(max(rho_guess, rho_min), rho_max)
+
+            P_scale = max(abs(Pt), 1.0)
+
+            def resid(logrho_vec):
+                rho = float(np.exp(logrho_vec[0]))
+                Pm = P_of_rho_scalar(rho, Ti)
+                if not np.isfinite(Pm):
+                    return np.array([1e30], dtype=float)
+                return np.array([(Pm - Pt) / P_scale], dtype=float)
+
+            rho_sol = np.nan
+
+            # (1) bounded least-squares in log(rho)
+            if use_lsq_first:
+                x0 = np.array([np.log(rho_guess)], dtype=float)
+                try:
+                    sol = least_squares(
+                        resid,
+                        x0,
+                        bounds=([log_rho_lo], [log_rho_hi]),
+                        xtol=rtol, ftol=rtol, gtol=rtol,
+                        max_nfev=lsq_max_nfev,
+                        method="trf",
+                    )
+                    if sol.success and np.isfinite(sol.x[0]):
+                        rho_try = float(np.exp(sol.x[0]))
+                        r = resid(np.array([np.log(rho_try)]))[0]
+                        if np.isfinite(r) and abs(r) <= 1e-10:
+                            rho_sol = rho_try
+                except Exception:
+                    pass
+
+            # (2) fallback to brentq with local bracket expansion
+            if not np.isfinite(rho_sol):
+                def f(rho):
+                    Pm = P_of_rho_scalar(rho, Ti)
+                    if not np.isfinite(Pm):
+                        return np.nan
+                    return Pm - Pt
+
+                left = right = rho_guess
+                f_left = f_right = f(rho_guess)
+
+                if not np.isfinite(f_left):
+                    rho_guess = np.sqrt(rho_min * rho_max)
+                    left = right = rho_guess
+                    f_left = f_right = f(rho_guess)
+
+                if np.isfinite(f_left) and f_left == 0.0:
+                    rho_sol = rho_guess
+                else:
+                    bracketed = False
+                    for _ in range(bracket_expand_steps):
+                        left = max(rho_min, left / bracket_expand_factor)
+                        right = min(rho_max, right * bracket_expand_factor)
+                        f_left = f(left)
+                        f_right = f(right)
+                        if np.isfinite(f_left) and np.isfinite(f_right) and (f_left == 0.0 or f_right == 0.0 or f_left * f_right < 0.0):
+                            bracketed = True
+                            if f_left == 0.0:
+                                rho_sol = left
+                            elif f_right == 0.0:
+                                rho_sol = right
+                            else:
+                                try:
+                                    rho_sol = brentq(f, left, right, xtol=rtol, maxiter=max_iter)
+                                except Exception:
+                                    rho_sol = np.nan
+                            break
+
+                    if not bracketed:
+                        fA, fB = f(rho_min), f(rho_max)
+                        if np.isfinite(fA) and np.isfinite(fB) and (fA == 0.0 or fB == 0.0 or fA * fB < 0.0):
+                            try:
+                                rho_sol = brentq(f, rho_min, rho_max, xtol=rtol, maxiter=max_iter)
+                            except Exception:
+                                rho_sol = np.nan
+
+            if np.isfinite(rho_sol):
+                out[idx] = rho_sol
+                rho_prev = rho_sol
+            else:
+                if on_fail == "raise":
+                    raise RuntimeError(
+                        f"Failed rho(P,T) inversion: P={Pt:.3e} Pa, T={Ti:.3f} K within "
+                        f"[{rho_min}, {rho_max}] kg/m^3"
+                    )
+
+        return float(out) if out.size == 1 else out
+
+
+
+    def get_s_pt_inv(self, P, T):
         rho = self.get_rho_pt_inv(P, T)
+        return self.get_s_rhot(rho, T)  # cgs: erg/g/K
 
-        return self.get_s_rhot(rho, T)
 
-    def get_T_sp_inv(self, _s, _P, bracket = (0, 200000), xtol=1e-8, maxiter=500):
+    def _as_float(self, x):
+        # Handles python float, numpy scalar, 0-d array cleanly
+        return float(np.asarray(x))
+
+    def get_T_srho_inv(
+        self,
+        _s,
+        _rho,
+        bracket=(1.0, 200000.0),
+        xtol=1e-10,
+        maxiter=200,
+        s_units="kbbar",
+        T_guess0=None,
+        use_lsq_first=True,
+        lsq_max_nfev=80,
+        bracket_expand_steps=30,
+        bracket_expand_factor=1.6,
+    ):
         """
-        Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
+        Invert s(rho,T) -> T
 
-        Parameters
-        ----------
-        _s : float or array_like
-            Entropy value(s) in kB/baryon.
-        _P : float or array_like
-            Pressure value(s) in Pa.
-        xtol : float, optional
-            Tolerance on the temperature root (passed to brentq).
-        maxiter : int, optional
-            Maximum number of iterations for brentq.
-
-        Returns
-        -------
-        T_sol : float or ndarray
-            Temperature(s) in K.  If any root‐finding fails, the corresponding
-            entry is set to np.nan.
+        _s:
+        - if s_units="cgs":   erg/g/K
+        - if s_units="kbbar": kB/baryon
+        _rho: kg/m^3
         """
-        s_arr = np.atleast_1d(_s)
-        P_arr = np.atleast_1d(_P)
+        s_arr = np.asarray(_s, dtype=float)
+        rho_arr = np.asarray(_rho, dtype=float)
+        s_arr, rho_arr = np.broadcast_arrays(s_arr, rho_arr)
+        shape = s_arr.shape
+
+        Tmin, Tmax = map(float, bracket)
+        if Tmin <= 0:
+            raise ValueError("bracket[0] must be > 0 K.")
+
+        # Convert target entropy to cgs (erg/g/K) because get_s_rhot returns cgs
+        if str(s_units).lower() == "kbbar":
+            s_target_cgs = s_arr / float(self.erg_to_kbbar)
+        else:
+            s_target_cgs = s_arr
+
+        T_out = np.full(shape, np.nan, dtype=float)
+
+        def S_cgs(rho_val, T_val) -> float:
+            return float(np.asarray(self.get_s_rhot(rho_val, T_val)))
+
+        logT_lo, logT_hi = np.log(Tmin), np.log(Tmax)
+
+        # seed temperature: prefer explicit-phase Tref if present
+        if T_guess0 is None:
+            T_seed_first = float(getattr(self, "Tref", 7000.0))
+        else:
+            T_seed_first = float(T_guess0)
+        T_seed_first = min(max(T_seed_first, Tmin), Tmax)
+
+        T_prev = None
+
+        for idx in np.ndindex(shape):
+            rho = float(rho_arr[idx])
+            s_t = float(s_target_cgs[idx])
+
+            if (not np.isfinite(rho)) or rho <= 0 or (not np.isfinite(s_t)):
+                continue
+
+            T_guess = T_seed_first if (T_prev is None or not np.isfinite(T_prev)) else float(T_prev)
+            T_guess = min(max(T_guess, Tmin), Tmax)
+
+            S_scale = max(abs(s_t), 1.0)
+
+            def resid(logT_vec):
+                T = float(np.exp(logT_vec[0]))
+                Sm = S_cgs(rho, T)
+                if not np.isfinite(Sm):
+                    return np.array([1e30], dtype=float)
+                return np.array([(Sm - s_t) / S_scale], dtype=float)
+
+            T_sol = np.nan
+
+            if use_lsq_first:
+                x0 = np.array([np.log(T_guess)], dtype=float)
+                try:
+                    sol = least_squares(
+                        resid,
+                        x0,
+                        bounds=([logT_lo], [logT_hi]),
+                        xtol=xtol, ftol=xtol, gtol=xtol,
+                        max_nfev=lsq_max_nfev,
+                        method="trf",
+                    )
+                    if sol.success and np.isfinite(sol.x[0]):
+                        T_try = float(np.exp(sol.x[0]))
+                        r = resid(np.array([np.log(T_try)]))[0]
+                        if np.isfinite(r) and abs(r) < 1e-8:
+                            T_sol = T_try
+                except Exception:
+                    pass
+
+            if not np.isfinite(T_sol):
+                def f(T):
+                    Sm = S_cgs(rho, T)
+                    if not np.isfinite(Sm):
+                        return np.nan
+                    return Sm - s_t
+
+                left = right = T_guess
+                f_left = f_right = f(T_guess)
+
+                if not np.isfinite(f_left):
+                    T_guess = np.sqrt(Tmin * Tmax)
+                    left = right = T_guess
+                    f_left = f_right = f(T_guess)
+
+                if np.isfinite(f_left) and f_left == 0.0:
+                    T_sol = T_guess
+                else:
+                    for _ in range(bracket_expand_steps):
+                        left = max(Tmin, left / bracket_expand_factor)
+                        right = min(Tmax, right * bracket_expand_factor)
+                        f_left = f(left)
+                        f_right = f(right)
+                        if np.isfinite(f_left) and np.isfinite(f_right) and (f_left == 0.0 or f_right == 0.0 or f_left * f_right < 0.0):
+                            if f_left == 0.0:
+                                T_sol = left
+                            elif f_right == 0.0:
+                                T_sol = right
+                            else:
+                                try:
+                                    T_sol = brentq(f, left, right, xtol=xtol, maxiter=maxiter)
+                                except Exception:
+                                    T_sol = np.nan
+                            break
+
+                    if not np.isfinite(T_sol):
+                        fA, fB = f(Tmin), f(Tmax)
+                        if np.isfinite(fA) and np.isfinite(fB) and (fA == 0.0 or fB == 0.0 or fA * fB < 0.0):
+                            try:
+                                T_sol = brentq(f, Tmin, Tmax, xtol=xtol, maxiter=maxiter)
+                            except Exception:
+                                T_sol = np.nan
+
+            if np.isfinite(T_sol):
+                T_out[idx] = T_sol
+                T_prev = T_sol
+
+        return float(T_out) if T_out.size == 1 else T_out
+
+    def get_T_sp_inv(self, _s, _P, bracket=(1.0, 20000.0), xtol=1e-8, maxiter=500, s_units="kbbar"):
+        """
+        Invert s(P,T) -> T, where s(P,T) is computed via rho(P,T) inversion.
+
+        _P in Pa
+        _s in erg/g/K (default) or kB/baryon if s_units="kbbar"
+        """
+        s_arr = np.atleast_1d(_s).astype(float)
+        P_arr = np.atleast_1d(_P).astype(float)
         s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
 
-        def _find_T(s_val, P_val):
-            # The function whose root in T we seek:
-            def err(T_val):
-                return self.get_s_pt_inv(P_val, T_val) * erg_to_kbbar / s_val - 1
+        if s_units.lower() == "kbbar":
+            s_target_cgs = s_arr / self.erg_to_kbbar
+        else:
+            s_target_cgs = s_arr
 
-            try:
-                return brentq(err, bracket[0], bracket[1], xtol=xtol, maxiter=maxiter)
-            except ValueError:
-                # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
+        Tmin, Tmax = float(bracket[0]), float(bracket[1])
+        if Tmin <= 0:
+            raise ValueError("bracket[0] must be > 0 K.")
+
+        def _find_T(s_cgs, P_val):
+            if P_val <= 0 or not np.isfinite(P_val) or not np.isfinite(s_cgs):
                 return np.nan
 
-        # vectorize over the pair (s_val, P_val)
-        T_roots = np.vectorize(_find_T)(s_arr, P_arr)
+            def err(T):
+                # get_s_pt_inv returns cgs entropy already (erg/g/K)
+                return self._as_float(self.get_s_pt_inv(P_val, T)) - s_cgs
 
-        # return scalar if inputs were scalars
-        if T_roots.size == 1:
-            return float(T_roots)
-        return T_roots
+            try:
+                f_lo = err(Tmin)
+                f_hi = err(Tmax)
+                if not (np.isfinite(f_lo) and np.isfinite(f_hi)):
+                    return np.nan
+                if f_lo == 0.0:
+                    return Tmin
+                if f_hi == 0.0:
+                    return Tmax
+                if f_lo * f_hi > 0:
+                    return np.nan
 
-    def get_T_srho_inv(self, _s, _rho, bracket = (0, 200000), xtol=1e-8, maxiter=500):
+                return brenth(err, Tmin, Tmax, xtol=xtol, maxiter=maxiter)
+            except (ValueError, FloatingPointError, RuntimeError):
+                # RuntimeError can come from get_rho_pt_inv failing to bracket rho
+                return np.nan
+
+        T_roots = np.vectorize(_find_T)(s_target_cgs, P_arr)
+        return float(T_roots) if T_roots.size == 1 else T_roots
+
+    def get_rhot_sp_2d_inv(
+        self,
+        s_target,
+        P_target,
+        *,
+        s_units="kbbar",                 # "cgs" (erg/g/K) or "kbbar" (kB/baryon)
+        guess="auto",                  # "auto" or (rho_guess, T_guess)
+        T_guess0=None,                 # used only if guess="auto"
+        bounds_rho=(1e3, 1e6),         # kg/m^3
+        bounds_T=(1.0, 2e5),           # K (must be > 0)
+        xtol=1e-10,
+        ftol=1e-10,
+        gtol=1e-10,
+        max_nfev=200,
+        fail_value=np.nan,
+        return_diagnostics=False,
+    ):
         """
-        Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
+        Solve the coupled system:
+            P(rho, T) = P_target   (Pa)
+            S(rho, T) = s_target   (cgs by default: erg/g/K)
 
-        Parameters
-        ----------
-        _s : float or array_like
-            Entropy value(s) in kB/baryon.
-        _P : float or array_like
-            Pressure value(s) in Pa.
-        xtol : float, optional
-            Tolerance on the temperature root (passed to brentq).
-        maxiter : int, optional
-            Maximum number of iterations for brentq.
+        Warm-start behavior for array inputs:
+        - The first element uses `guess` (or "auto")
+        - Each subsequent element uses the previous converged (rho, T) as the initial guess
 
         Returns
         -------
-        T_sol : float or ndarray
-            Temperature(s) in K.  If any root‐finding fails, the corresponding
-            entry is set to np.nan.
+        rho_sol, T_sol  (arrays with broadcasted shape)
+        optionally diagnostics dict if return_diagnostics=True
         """
-        s_arr = np.atleast_1d(_s)
-        rho_arr = np.atleast_1d(_rho)
-        s_arr, rho_arr = np.broadcast_arrays(s_arr, rho_arr)
 
-        def _find_T(s_val, rho_val):
-            # The function whose root in T we seek:
-            def err(T_val):
-                return self.get_s_rhot(rho_val, T_val) * erg_to_kbbar / s_val - 1
+        # Broadcast inputs
+        s_arr = np.asarray(s_target, dtype=float)
+        P_arr = np.asarray(P_target, dtype=float)
+        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+        shape = s_arr.shape
+
+        # Convert target entropy to cgs (erg/g/K) because get_s_rhot returns cgs
+        if str(s_units).lower() == "kbbar":
+            s_cgs = s_arr / self.erg_to_kbbar
+        else:
+            s_cgs = s_arr
+
+        rho_out = np.full(shape, fail_value, dtype=float)
+        T_out   = np.full(shape, fail_value, dtype=float)
+
+        # Optional diagnostics
+        info = {
+            "success": np.zeros(shape, dtype=bool),
+            "cost": np.full(shape, np.nan),
+            "nfev": np.full(shape, np.nan),
+            "resid_P_frac": np.full(shape, np.nan),
+            "resid_S_frac": np.full(shape, np.nan),
+            "message": np.empty(shape, dtype=object),
+        } if return_diagnostics else None
+
+        # Bounds in log-space
+        rho_lo, rho_hi = map(float, bounds_rho)
+        T_lo,   T_hi   = map(float, bounds_T)
+        if rho_lo <= 0 or T_lo <= 0:
+            raise ValueError("bounds_rho and bounds_T must be > 0 on the low end.")
+
+        lb = np.array([np.log(rho_lo), np.log(T_lo)], dtype=float)
+        ub = np.array([np.log(rho_hi), np.log(T_hi)], dtype=float)
+
+        # Initial guess seed for the first element
+        if guess == "auto":
+            # Choose a temperature to seed rho(P,T) inversion
+            Tseed = float(getattr(self, "Tref", 7000.0) if T_guess0 is None else T_guess0)
+
+            # If Tseed violates bounds, clamp it
+            Tseed = min(max(Tseed, T_lo), T_hi)
+            # We’ll compute rho seed per-element (because P differs)
+            rho_seed = None
+            T_seed   = Tseed
+        else:
+            rho_seed, T_seed = map(float, guess)
+            rho_seed = min(max(rho_seed, rho_lo), rho_hi)
+            T_seed   = min(max(T_seed,   T_lo),   T_hi)
+
+        # Continuation guess that updates as we solve
+        rho_guess_cur = rho_seed
+        T_guess_cur   = T_seed
+
+        # Iterate in given order (warm-start for “subsequent attempts”)
+        for idx in np.ndindex(shape):
+            Pt = float(P_arr[idx])
+            St = float(s_cgs[idx])
+
+            if not (np.isfinite(Pt) and np.isfinite(St)) or Pt <= 0:
+                if return_diagnostics:
+                    info["message"][idx] = "Invalid target (non-finite or P<=0)."
+                continue
+
+            # Auto-seed rho using your existing rho(P,T) inversion at the current T guess
+            if guess == "auto" and rho_guess_cur is None:
+                try:
+                    rho_guess_cur = float(self.get_rho_pt_inv(Pt, T_guess_cur))
+                except Exception:
+                    # Fall back to mid-range density if rho(P,Tguess) fails
+                    rho_guess_cur = 0.5 * (rho_lo + rho_hi)
+
+            # Clamp guesses into bounds
+            rho_guess_cur = min(max(float(rho_guess_cur), rho_lo), rho_hi)
+            T_guess_cur   = min(max(float(T_guess_cur),   T_lo),   T_hi)
+
+            x0 = np.array([np.log(rho_guess_cur), np.log(T_guess_cur)], dtype=float)
+
+            # Scaling to make the two equations comparable
+            P_scale = max(abs(Pt), 1.0e9)      # Pa
+            S_scale = max(abs(St), 1.0)        # erg/g/K
+
+            def residuals(x):
+                # log-variables => always positive
+                rho = float(np.exp(x[0]))
+                T   = float(np.exp(x[1]))
+
+                # Evaluate model
+                Pm = float(self.get_p_rhot(rho, T))      # Pa
+                Sm = float(self.get_s_rhot(rho, T))      # erg/g/K (cgs)
+
+                # Guard against NaNs/Infs from the EOS
+                if not (np.isfinite(Pm) and np.isfinite(Sm)):
+                    return np.array([1e30, 1e30], dtype=float)
+
+                return np.array([(Pm - Pt) / P_scale, (Sm - St) / S_scale], dtype=float)
 
             try:
-                return brentq(err, bracket[0], bracket[1], xtol=xtol, maxiter=maxiter)
-            except ValueError:
-                # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
-                return np.nan
+                sol = least_squares(
+                    residuals,
+                    x0,
+                    bounds=(lb, ub),
+                    xtol=xtol,
+                    ftol=ftol,
+                    gtol=gtol,
+                    max_nfev=max_nfev,
+                    method="trf",
+                )
 
-        # vectorize over the pair (s_val, P_val)
-        T_roots = np.vectorize(_find_T)(s_arr, rho_arr)
+                if sol.success and np.all(np.isfinite(sol.x)):
+                    rho_sol = float(np.exp(sol.x[0]))
+                    T_sol   = float(np.exp(sol.x[1]))
 
-        # return scalar if inputs were scalars
-        if T_roots.size == 1:
-            return float(T_roots)
-        return T_roots
+                    rho_out[idx] = rho_sol
+                    T_out[idx]   = T_sol
+
+                    # Update continuation guess (key feature you asked for)
+                    rho_guess_cur = rho_sol
+                    T_guess_cur   = T_sol
+
+                    if return_diagnostics:
+                        info["success"][idx] = True
+                        info["cost"][idx] = sol.cost
+                        info["nfev"][idx] = sol.nfev
+
+                        # Report fractional residuals at the solution
+                        r = residuals(sol.x)
+                        info["resid_P_frac"][idx] = abs(r[0])
+                        info["resid_S_frac"][idx] = abs(r[1])
+                        info["message"][idx] = sol.message
+                else:
+                    if return_diagnostics:
+                        info["message"][idx] = getattr(sol, "message", "least_squares failed")
+                    # Do NOT update guess on failure; keep last good guess
+            except Exception as e:
+                if return_diagnostics:
+                    info["message"][idx] = f"Exception: {e}"
+                # Do NOT update guess on exception
+
+        if return_diagnostics:
+            return rho_out, T_out, info
+        return rho_out, T_out
 
 class Fe_EOS(Fe_EOS_analytic):
     """

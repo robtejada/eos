@@ -43,6 +43,9 @@ from typing import Literal, Tuple, Union, Optional
 import numpy as np
 from scipy.optimize import brenth, least_squares
 from scipy.interpolate import RegularGridInterpolator as RGI
+import astropy.units as u
+from astropy.constants import k_B
+from astropy.constants import u as amu
 
 
 ArrayLike = Union[float, np.ndarray]
@@ -90,7 +93,10 @@ class Fe_EOS_Ichikawa2014_Liquid:
     R_J_per_molK: float = 8.31446261815324
     N_A: float = 6.02214076e23
     M_molar_kg_per_mol: float = 55.845e-3  # Fe
-    erg_to_kbbar: float = 1.202723550011625e-08
+    erg_to_kbbar: float = (u.erg/u.Kelvin/u.gram).to(k_B/amu)
+    dyn_to_Pa: float = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
+    L: float = 1.2e6 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of Fe-Si alloy in erg/g (Anderson & Duba 1997)
+    kb: float = k_B.to('erg/K') # ergs/K
 
     def __init__(
         self,
@@ -385,7 +391,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         s_jkgK = S_molar / self.M_molar_kg_per_mol
         return self._jkg_to_ergg(s_jkgK)
 
-    def get_cv_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+    def get_CV_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
         V = self._V_molar_from_rho(rho_kgm3)
         Cv_molar = self._cv_molar_jmolK(V, T_K)
         cv_jkgK = Cv_molar / self.M_molar_kg_per_mol
@@ -404,7 +410,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         V = self._V_molar_from_rho(rho_kgm3)
         return self._gamma(V)
 
-    def get_cp_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+    def get_CP_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
         """
         Use C_P/C_V = 1 + α γ T  (paper text).
         """
@@ -1225,7 +1231,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         vals = self.get_u_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_cp_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+    def get_CP_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         """
         u(P,T) in erg/g.
         If tab=False, inverts for rho then evaluates analytic u(rho,T).
@@ -1233,14 +1239,14 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         scalar, P_arr, T_arr = self._broadcast(P, T)
 
         if tab:
-            vals = self._interp_PT(self.cp_rgi_pt, P_arr, T_arr)
+            vals = self._interp(self.cp_rgi_pt, P_arr, T_arr)
             return float(vals) if scalar else vals
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
         vals = self.get_cp_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_cv_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+    def get_CV_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         """
         u(P,T) in erg/g.
         If tab=False, inverts for rho then evaluates analytic u(rho,T).
@@ -1248,11 +1254,11 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         scalar, P_arr, T_arr = self._broadcast(P, T)
 
         if tab:
-            vals = self._interp_PT(self.cv_rgi_pt, P_arr, T_arr)
+            vals = self._interp(self.cv_rgi_pt, P_arr, T_arr)
             return float(vals) if scalar else vals
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
-        vals = self.get_cv_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
+        vals = self.get_CV_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
     def get_alpha_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
@@ -1263,7 +1269,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         scalar, P_arr, T_arr = self._broadcast(P, T)
 
         if tab:
-            vals = self._interp_PT(self.alpha_rgi_pt, P_arr, T_arr)
+            vals = self._interp(self.alpha_rgi_pt, P_arr, T_arr)
             return float(vals) if scalar else vals
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
@@ -1317,7 +1323,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         vals = self.get_u_rhot(rho, T)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_cp_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_CP_sp(self, S, P, tab=True, **inv_kwargs):
         """
         cp(S,P) in erg/g/K.
         If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
@@ -1329,10 +1335,10 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
             return float(vals) if scalar else vals
 
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
-        vals = self.get_cp_rhot(rho, T)  # erg/g/K (your Fe_EOS convention)
+        vals = self.get_CP_rhot(rho, T)  # erg/g/K (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_cv_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_CV_sp(self, S, P, tab=True, **inv_kwargs):
         """
         cv(S,P) in erg/g/K.
         If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
@@ -1344,7 +1350,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
             return float(vals) if scalar else vals
 
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
-        vals = self.get_cv_rhot(rho, T)  # erg/g/K (your Fe_EOS convention)
+        vals = self.get_CV_rhot(rho, T)  # erg/g/K (your Fe_EOS convention)
         return float(vals) if scalar else vals
     
     def get_alpha_sp(self, S, P, tab=True, **inv_kwargs):
@@ -1454,3 +1460,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
         vals = self.get_alpha_rhot(rho_arr, T)  # 1/K (your Fe_EOS convention)
         return float(vals) if scalar else vals
+
+    def get_T_melt(self, P_GPa):
+        Tm_fe = 1900 * (P_GPa / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
+        return Tm_fe
