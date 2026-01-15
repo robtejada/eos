@@ -383,7 +383,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         V = self._V_molar_from_rho(rho_kgm3)
         U_molar = self._u_molar_jmol(V, T_K) + self._U_offset_molar  # NEW
         u_jkg = U_molar / self.M_molar_kg_per_mol + 1.5e7
-        return self._jkg_to_ergg(u_jkg)
+        return self._jkg_to_ergg(u_jkg) 
 
     def get_s_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
         V = self._V_molar_from_rho(rho_kgm3)
@@ -438,6 +438,10 @@ class Fe_EOS_Ichikawa2014_Liquid:
 
         KS_pa = KT * (1.0 + alpha * gamma * T)
         return KS_pa
+    
+    # -------------------------
+    # Inversion rho(P,T)
+    # -------------------------
 
     def get_rho_pt_inv(
         self,
@@ -629,6 +633,9 @@ class Fe_EOS_Ichikawa2014_Liquid:
 
         return float(out) if out.size == 1 else out
 
+    # -------------------------
+    # Inversion S(P,T)
+    # -------------------------
 
     def get_s_pt_inv(self,
         P,
@@ -655,6 +662,10 @@ class Fe_EOS_Ichikawa2014_Liquid:
     def _as_float(self, x):
         # Handles python float, numpy scalar, 0-d array cleanly
         return float(np.asarray(x))
+
+    # -------------------------
+    # Inversion T(S,rho)
+    # -------------------------
 
     def get_T_srho_inv(
         self,
@@ -845,7 +856,9 @@ class Fe_EOS_Ichikawa2014_Liquid:
 
         return float(T_out) if T_out.size == 1 else T_out
 
-
+    # -------------------------
+    # Inversion T(S,P)
+    # -------------------------
 
     def get_T_sp_inv(self, _s, _P, bracket=(1.0, 20000.0), xtol=1e-8, maxiter=500, s_units="kbbar"):
         """
@@ -895,6 +908,9 @@ class Fe_EOS_Ichikawa2014_Liquid:
         T_roots = np.vectorize(_find_T)(s_target_cgs, P_arr)
         return float(T_roots) if T_roots.size == 1 else T_roots
 
+    # ----------------------------
+    # 2-D Inversion Rho, T -> S, P
+    # ----------------------------
     def get_rhot_sp_2d_inv(
         self,
         s_target,
