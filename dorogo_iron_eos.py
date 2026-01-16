@@ -802,7 +802,7 @@ class Fe_EOS_analytic:
             return ((1.0 - w_melt) * alpha_sol + w_melt * alpha_liq).reshape(rho_arr.shape)
         return self.alpha(rho_arr, T_arr).reshape(rho_arr.shape)
     
-    def get_cv_rhot(self, rho, T):
+    def get_CV_rhot(self, rho, T):
         """
         Get the specific heat at constant volume at a given density and temperature.
         rho: kg/m^3
@@ -814,9 +814,9 @@ class Fe_EOS_analytic:
         if self.phase == "auto":
             w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
 
-            cv_lo  = self._solid_lo.get_cv_rhot(rho_arr, T_arr)
-            cv_hi  = self._solid_hi.get_cv_rhot(rho_arr, T_arr)
-            cv_liq = self._liquid.get_cv_rhot(rho_arr, T_arr)
+            cv_lo  = self._solid_lo.get_CV_rhot(rho_arr, T_arr)
+            cv_hi  = self._solid_hi.get_CV_rhot(rho_arr, T_arr)
+            cv_liq = self._liquid.get_CV_rhot(rho_arr, T_arr)
 
             cv_sol = (1.0 - w_hi) * cv_lo + w_hi * cv_hi
             return ((1.0 - w_melt) * cv_sol + w_melt * cv_liq).reshape(rho_arr.shape)
@@ -824,17 +824,17 @@ class Fe_EOS_analytic:
         V = self.V_molar(rho_arr)
         return (self.Cv_molar(V, T_arr) / self.M_Fe).reshape(rho_arr.shape) * S_CONV_CGS
     
-    def get_cp_rhot(self, rho, T):
+    def get_CP_rhot(self, rho, T):
         rho_arr, T_arr = self._as_arrays(rho, T)
         if self.phase == "auto":
             w_melt, w_hi, *_ = self._auto_blend_weights_and_pressure(rho_arr, T_arr)
-            cp_lo  = self._solid_lo.get_cp_rhot(rho_arr, T_arr)
-            cp_hi  = self._solid_hi.get_cp_rhot(rho_arr, T_arr)
-            cp_liq = self._liquid.get_cp_rhot(rho_arr, T_arr)
+            cp_lo  = self._solid_lo.get_CP_rhot(rho_arr, T_arr)
+            cp_hi  = self._solid_hi.get_CP_rhot(rho_arr, T_arr)
+            cp_liq = self._liquid.get_CP_rhot(rho_arr, T_arr)
             cp_sol = (1.0 - w_hi) * cp_lo + w_hi * cp_hi
             return ((1.0 - w_melt) * cp_sol + w_melt * cp_liq).reshape(rho_arr.shape)
 
-        cv_cgs = self.get_cv_rhot(rho_arr, T_arr)         # erg/g/K
+        cv_cgs = self.get_CV_rhot(rho_arr, T_arr)         # erg/g/K
         a      = self.get_alpha_rhot(rho_arr, T_arr)      # 1/K
         KT     = self.get_KT_rhot(rho_arr, T_arr)         # Pa
         # convert the pressure term (SI) -> cgs and add to cv (already cgs)
@@ -1409,31 +1409,86 @@ class Fe_EOS(Fe_EOS_analytic):
         if rgi_kwargs is None:
             rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
 
-        data = np.load('eos/dorogokupets_iron_eos/iron_eos_PT_liquid.npz')
+        # P, T tables
 
-        self.pvals_pt = np.asarray(data['pvals_pt'], dtype=float)  # Pa
-        self.tvals_pt = np.asarray(data['tvals_pt'], dtype=float)  # K
+        data_pt = np.load(f'eos/dorogokupets_iron_eos/iron_eos_PT_{self.phase}.npz') # phase dependent
 
-        self.rho_grid_pt = np.asarray(data['rho_grid_pt'], dtype=float) # kg/m^3
-        self.s_grid_pt = np.asarray(data['s_grid_pt'], dtype=float)  # erg/g/K
-        self.u_grid_pt = np.asarray(data['u_grid_pt'], dtype=float)  # erg/g
+        self.pvals_pt = np.asarray(data_pt['pvals_pt'], dtype=float)  # Pa
+        self.tvals_pt = np.asarray(data_pt['tvals_pt'], dtype=float)  # K
+
+        self.rho_grid_pt = np.asarray(data_pt['rho_grid_pt'], dtype=float) # kg/m^3
+        self.s_grid_pt = np.asarray(data_pt['s_grid_pt'], dtype=float)  # erg/g/K
+        self.u_grid_pt = np.asarray(data_pt['u_grid_pt'], dtype=float)  # erg/g
+
+        self.cp_grid_pt = np.asarray(data_pt['cp_grid_pt'], dtype=float)  # erg/g/K
+        self.cv_grid_pt = np.asarray(data_pt['cv_grid_pt'], dtype=float)  # erg/g/K
+        self.alpha_grid_pt = np.asarray(data_pt['alpha_grid_pt'], dtype=float)  # 1/K
+
+        # S, P tables
+
+        data_sp = np.load(f'eos/dorogokupets_iron_eos/iron_eos_SP_{self.phase}.npz')
+
+        self.svals_sp = np.asarray(data_sp['svals_sp'], dtype=float)  # kb/baryon
+        self.pvals_sp = np.asarray(data_sp['pvals_sp'], dtype=float)  # Pa
+
+        self.rho_grid_sp = np.asarray(data_sp['rho_grid_sp'], dtype=float) # kg/m^3
+        self.t_grid_sp = np.asarray(data_sp['t_grid_sp'], dtype=float)  # K
+        self.u_grid_sp = np.asarray(data_sp['u_grid_sp'], dtype=float)  # erg/g
+        self.cp_grid_sp = np.asarray(data_sp['cp_grid_sp'], dtype=float)  # erg/g/K
+        self.cv_grid_sp = np.asarray(data_sp['cv_grid_sp'], dtype=float)  # erg/g/K
+        self.alpha_grid_sp = np.asarray(data_sp['alpha_grid_sp'], dtype=float)  # 1/K
+
+        # S, Rho tables
+
+        data_srho = np.load(f'eos/dorogokupets_iron_eos/iron_eos_SRho_{self.phase}.npz')
+
+        self.svals_srho = np.asarray(data_srho['svals_srho'], dtype=float)  # kb/baryon
+        self.rho_vals_srho = np.asarray(data_srho['rhovals_srho'], dtype=float)  # kg/m^3
+
+        self.t_grid_srho = np.asarray(data_srho['t_grid_srho'], dtype=float)  # K
+        self.p_grid_srho = np.asarray(data_srho['p_grid_srho'], dtype=float)  # Pa
+        self.u_grid_srho = np.asarray(data_srho['u_grid_srho'], dtype=float)  # erg/g
+        self.cp_grid_srho = np.asarray(data_srho['cp_grid_srho'], dtype=float)  # erg/g/K
+        self.cv_grid_srho = np.asarray(data_srho['cv_grid_srho'], dtype=float)  # erg/g/K
+        self.alpha_grid_srho = np.asarray(data_srho['alpha_grid_srho'], dtype=float)  # 1/K
 
         # Interpolators: input points are (P, T)
         self.rho_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.rho_grid_pt, **rgi_kwargs)
         self.s_rgi_pt   = RGI((self.pvals_pt, self.tvals_pt), self.s_grid_pt, **rgi_kwargs)
         self.u_rgi_pt   = RGI((self.pvals_pt, self.tvals_pt), self.u_grid_pt, **rgi_kwargs)
+        self.cp_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.cp_grid_pt, **rgi_kwargs)
+        self.cv_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.cv_grid_pt, **rgi_kwargs)
+        self.alpha_rgi_pt = RGI((self.pvals_pt, self.tvals_pt), self.alpha_grid_pt, **rgi_kwargs)
+
+        # Interpolators: input points are (S, P)
+        self.rho_rgi_sp = RGI((self.svals_sp, self.pvals_sp), self.rho_grid_sp, **rgi_kwargs)
+        self.t_rgi_sp = RGI((self.svals_sp, self.pvals_sp), self.t_grid_sp, **rgi_kwargs)
+        self.u_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.u_grid_sp, **rgi_kwargs)
+        self.cp_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.cp_grid_sp, **rgi_kwargs)
+        self.cv_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.cv_grid_sp, **rgi_kwargs)
+        self.alpha_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.alpha_grid_sp, **rgi_kwargs)
+
+        # Interpolators: input points are (S, Rho)
+        self.t_rgi_srho = RGI((self.svals_srho, self.rho_vals_srho), self.t_grid_srho, **rgi_kwargs)
+        self.p_rgi_srho = RGI((self.svals_srho, self.rho_vals_srho), self.p_grid_srho, **rgi_kwargs)
+        self.u_rgi_srho   = RGI((self.svals_srho, self.rho_vals_srho), self.u_grid_srho, **rgi_kwargs)
+        self.cp_rgi_srho   = RGI((self.svals_srho, self.rho_vals_srho), self.cp_grid_srho, **rgi_kwargs)
+        self.cv_rgi_srho   = RGI((self.svals_srho, self.rho_vals_srho), self.cv_grid_srho, **rgi_kwargs)
+        self.alpha_rgi_srho   = RGI((self.svals_srho, self.rho_vals_srho), self.alpha_grid_srho, **rgi_kwargs)
 
     @staticmethod
-    def _broadcast_PT(P, T):
-        scalar = np.isscalar(P) and np.isscalar(T)
+    def _broadcast(P, Q):
+        "Generalized for coordinates P and Q. Could be P, T; S, P; etc."
+        scalar = np.isscalar(P) and np.isscalar(Q)
         P_arr = np.array(P, ndmin=1, dtype=float)
-        T_arr = np.array(T, ndmin=1, dtype=float)
-        if P_arr.shape != T_arr.shape:
-            P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
-        return scalar, P_arr, T_arr
+        Q_arr = np.array(Q, ndmin=1, dtype=float)
+        if P_arr.shape != Q_arr.shape:
+            P_arr, Q_arr = np.broadcast_arrays(P_arr, Q_arr)
+        return scalar, P_arr, Q_arr
 
-    def _interp_PT(self, rgi, P_arr, T_arr):
-        pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
+    def _interp(self, rgi, P_arr, Q_arr):
+        "Generalized for coordinates P and Q. Could be P, T; S, P; etc."
+        pts = np.stack((P_arr.ravel(), Q_arr.ravel()), axis=-1)
         return rgi(pts).reshape(P_arr.shape)
 
     # -------------------------
@@ -1444,16 +1499,16 @@ class Fe_EOS(Fe_EOS_analytic):
         rho(P,T) in kg/m^3.
         If tab=False, uses Fe_EOS.get_rho_pt_inv.
         """
-        scalar, P_arr, T_arr = self._broadcast_PT(P, T)
+        scalar, P_arr, T_arr = self._broadcast(P, T)
 
         if tab:
-            vals = self._interp_PT(self.rho_rgi_pt, P_arr, T_arr)
+            vals = self._interp(self.rho_rgi_pt, P_arr, T_arr)
             return float(vals) if scalar else vals
 
         # If you have tables, using them as an initial guess can speed up inversion
         if rho0 is None:
             try:
-                rho0 = self._interp_PT(self.rho_rgi_pt, P_arr, T_arr)
+                rho0 = self._interp(self.rho_rgi_pt, P_arr, T_arr)
             except Exception:
                 rho0 = None
 
@@ -1465,10 +1520,10 @@ class Fe_EOS(Fe_EOS_analytic):
         s(P,T) in erg/g/K.
         If tab=False, inverts for rho then evaluates analytic s(rho,T).
         """
-        scalar, P_arr, T_arr = self._broadcast_PT(P, T)
+        scalar, P_arr, T_arr = self._broadcast(P, T)
 
         if tab:
-            vals = self._interp_PT(self.s_rgi_pt, P_arr, T_arr)
+            vals = self._interp(self.s_rgi_pt, P_arr, T_arr)
             return float(vals) if scalar else vals
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
@@ -1480,56 +1535,246 @@ class Fe_EOS(Fe_EOS_analytic):
         u(P,T) in erg/g.
         If tab=False, inverts for rho then evaluates analytic u(rho,T).
         """
-        scalar, P_arr, T_arr = self._broadcast_PT(P, T)
+        scalar, P_arr, T_arr = self._broadcast(P, T)
 
         if tab:
-            vals = self._interp_PT(self.u_rgi_pt, P_arr, T_arr)
+            vals = self._interp(self.u_rgi_pt, P_arr, T_arr)
             return float(vals) if scalar else vals
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
         vals = self.get_u_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_T_sp_inv(self, _s, _P, *, bracket = (0, 200000), xtol=1e-8, maxiter=500):
+    def get_CP_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         """
-        Invert s(P, T) → T, i.e. find T such that get_s_pt(P, T) == s.
-
-        Parameters
-        ----------
-        _s : float or array_like
-            Entropy value(s) in kB/baryon.
-        _P : float or array_like
-            Pressure value(s) in Pa.
-        xtol : float, optional
-            Tolerance on the temperature root (passed to brentq).
-        maxiter : int, optional
-            Maximum number of iterations for brentq.
-
-        Returns
-        -------
-        T_sol : float or ndarray
-            Temperature(s) in K.  If any root‐finding fails, the corresponding
-            entry is set to np.nan.
+        u(P,T) in erg/g.
+        If tab=False, inverts for rho then evaluates analytic u(rho,T).
         """
-        s_arr = np.atleast_1d(_s)
-        P_arr = np.atleast_1d(_P)
-        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+        scalar, P_arr, T_arr = self._broadcast(P, T)
 
-        def _find_T(s_val, P_val):
-            # The function whose root in T we seek:
-            def err(T_val):
-                return self.get_s_pt(P_val, T_val) * erg_to_kbbar / s_val - 1
+        if tab:
+            vals = self._interp(self.cp_rgi_pt, P_arr, T_arr)
+            return float(vals) if scalar else vals
 
-            try:
-                return brentq(err, bracket[0], bracket[1], xtol=xtol, maxiter=maxiter)
-            except ValueError:
-                # e.g. f(T_min)*f(T_max) ≥ 0 or NaN → no bracket
-                return np.nan
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
+        vals = self.get_CP_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
 
-        # vectorize over the pair (s_val, P_val)
-        T_roots = np.vectorize(_find_T)(s_arr, P_arr)
+    def get_CV_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        """
+        u(P,T) in erg/g.
+        If tab=False, inverts for rho then evaluates analytic u(rho,T).
+        """
+        scalar, P_arr, T_arr = self._broadcast(P, T)
 
-        # return scalar if inputs were scalars
-        if T_roots.size == 1:
-            return float(T_roots)
-        return T_roots
+        if tab:
+            vals = self._interp(self.cv_rgi_pt, P_arr, T_arr)
+            return float(vals) if scalar else vals
+
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
+        vals = self.get_CV_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_alpha_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        """
+        u(P,T) in erg/g.
+        If tab=False, inverts for rho then evaluates analytic u(rho,T).
+        """
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+
+        if tab:
+            vals = self._interp(self.alpha_rgi_pt, P_arr, T_arr)
+            return float(vals) if scalar else vals
+
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
+        vals = self.get_alpha_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    # -------------------------
+    # SP table API (override)
+    # -------------------------
+
+    def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        rho(S,P) in kg/m^3.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.rho_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        return float(rho) if scalar else rho
+
+    def get_T_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        T(S,P) in K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.t_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        return float(T) if scalar else T
+    
+    def get_u_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        u(S,P) in erg/g.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.u_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_u_rhot(rho, T)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_CP_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        cp(S,P) in erg/g/K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.cp_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_CP_rhot(rho, T)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_CV_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        cv(S,P) in erg/g/K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.cv_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_CV_rhot(rho, T)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+    
+    def get_alpha_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        alpha(S,P) in 1/K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.alpha_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_alpha_rhot(rho, T)  # 1/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    # -------------------------
+    # SRho table API (override)
+    # -------------------------
+
+    def get_T_srho(self, S, rho, tab=True, **inv_kwargs):
+        """
+        T(S,rho) in K.
+        If tab=False, uses Fe_EOS.get_rho_srho_inv.
+        """
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+
+        if tab:
+            vals = self._interp(self.t_rgi_srho, S_arr, rho_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        return float(T) if scalar else T
+    
+    def get_p_srho(self, S, rho, tab=True, **inv_kwargs):
+        """
+        p(S,rho) in Pa.
+        If tab=False, uses Fe_EOS.get_rho_srho_inv.
+        """
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+
+        if tab:
+            vals = self._interp(self.p_rgi_srho, S_arr, rho_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        p = self.get_p_rhot(rho_arr, T)  # Pa
+        return float(p) if scalar else p
+
+    def get_u_srho(self, S, rho, tab=True, **inv_kwargs):
+        """
+        u(S,rho) in erg/g.
+        If tab=False, uses Fe_EOS.get_rho_srho_inv then analytic getter.
+        """
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+
+        if tab:
+            vals = self._interp(self.u_rgi_srho, S_arr, rho_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_u_rhot(rho_arr, T)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_cp_srho(self, S, rho, tab=True, **inv_kwargs):
+        """
+        cp(S,rho) in erg/g/K.
+        If tab=False, uses Fe_EOS.get_rho_srho_inv then analytic getter.
+        """
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+
+        if tab:
+            vals = self._interp(self.cp_rgi_srho, S_arr, rho_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_cp_rhot(rho_arr, T)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_cv_srho(self, S, rho, tab=True, **inv_kwargs):
+        """
+        cv(S,rho) in erg/g/K.
+        If tab=False, uses Fe_EOS.get_rho_srho_inv then analytic getter.
+        """
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+
+        if tab:
+            vals = self._interp(self.cv_rgi_srho, S_arr, rho_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_cv_rhot(rho_arr, T)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_alpha_srho(self, S, rho, tab=True, **inv_kwargs):
+        """
+        alpha(S,rho) in 1/K.
+        If tab=False, uses Fe_EOS.get_rho_srho_inv then analytic getter.
+        """
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+
+        if tab:
+            vals = self._interp(self.alpha_rgi_srho, S_arr, rho_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_alpha_rhot(rho_arr, T)  # 1/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_T_melt(self, P_GPa):
+        Tm_fe = 1900 * (P_GPa / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
+        return Tm_fe

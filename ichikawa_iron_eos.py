@@ -81,8 +81,8 @@ class Fe_EOS_Ichikawa2014_Liquid:
       - get_p_rhot(rho, T)
       - get_u_rhot(rho, T)      specific internal energy (relative; u(V0,T0)=0)
       - get_s_rhot(rho, T)      specific entropy (relative; s(V0,T0)=0)
-      - get_cv_rhot(rho, T)
-      - get_cp_rhot(rho, T)
+      - get_CV_rhot(rho, T)
+      - get_CP_rhot(rho, T)
       - get_alpha_rhot(rho, T)
       - get_kt_rhot(rho, T)
       - get_ks_rhot(rho, T)
@@ -1259,7 +1259,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
             return float(vals) if scalar else vals
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False, rho0=rho0, **inv_kwargs)
-        vals = self.get_cp_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
+        vals = self.get_CP_rhot(rho, T_arr)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
     def get_CV_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
@@ -1432,7 +1432,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         vals = self.get_u_rhot(rho_arr, T)  # erg/g (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_cp_srho(self, S, rho, tab=True, **inv_kwargs):
+    def get_CP_srho(self, S, rho, tab=True, **inv_kwargs):
         """
         cp(S,rho) in erg/g/K.
         If tab=False, uses Fe_EOS.get_rho_srho_inv then analytic getter.
@@ -1444,10 +1444,10 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
             return float(vals) if scalar else vals
 
         T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
-        vals = self.get_cp_rhot(rho_arr, T)  # erg/g/K (your Fe_EOS convention)
+        vals = self.get_CP_rhot(rho_arr, T)  # erg/g/K (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_cv_srho(self, S, rho, tab=True, **inv_kwargs):
+    def get_CV_srho(self, S, rho, tab=True, **inv_kwargs):
         """
         cv(S,rho) in erg/g/K.
         If tab=False, uses Fe_EOS.get_rho_srho_inv then analytic getter.
@@ -1459,7 +1459,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
             return float(vals) if scalar else vals
 
         T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
-        vals = self.get_cv_rhot(rho_arr, T)  # erg/g/K (your Fe_EOS convention)
+        vals = self.get_CV_rhot(rho_arr, T)  # erg/g/K (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
     def get_alpha_srho(self, S, rho, tab=True, **inv_kwargs):
