@@ -47,8 +47,18 @@ import numpy as np
 
 from eos import ichikawa_iron_eos, dorogo_iron_eos
 
+from astropy.constants import k_B
+from astropy.constants import u as amu
+from astropy import units as u
 
-class IRON_COMBINED_EOS:
+# --- scalar conversion factors (plain floats) ---
+ERG_GK_TO_KBBAR = float((u.erg/u.Kelvin/u.gram).to(k_B/amu))  # (erg/g/K) -> (kB/baryon)
+DYNCM2_TO_PA    = float((u.dyn/u.cm**2).to('Pa'))
+DYNCM2_TO_GPA   = float((u.dyn/u.cm**2).to('GPa'))
+U_CONV_CGS      = float((u.J/u.kg).to('erg/g'))       # J/kg -> erg/g
+S_CONV_CGS      = float((u.J/u.kg/u.K).to('erg/(g * K)'))  # J/kg/K -> erg/g/K
+
+class Fe_COMBINED_EOS:
     """
     Wrapper that smoothly blends solid and liquid EOS at T_melt(P).
 
@@ -66,7 +76,13 @@ class IRON_COMBINED_EOS:
         3. Blend all SP quantities with that weight.
     """
 
-    def __init__(self, frac_width: float = 0.05, dT: float = 500.0):
+    erg_to_kbbar: float = ERG_GK_TO_KBBAR
+    dyn_to_Pa: float = DYNCM2_TO_PA
+    dyn_to_GPa: float = DYNCM2_TO_GPA
+    L: float = 1.2e6 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of Fe-Si alloy in erg/g (Anderson & Duba 1997)
+    kb: float = k_B.to('erg/K') # ergs/K
+
+    def __init__(self, frac_width: float = 0.05, dT: float = 50.0):
         """
         frac_width sets the smoothing half-width as a fraction of T_melt.
         dT = frac_width * T_melt.
@@ -126,7 +142,7 @@ class IRON_COMBINED_EOS:
         Clamp dT to at least 1 K to avoid zero-width at low P.
         """
         Tm = self.get_T_melt(P_arr)
-        dT = np.maximum(self.frac_width * Tm, 1.0)
+        dT = self.dT
         arg = (T_arr - Tm) / dT
         w = 0.5 * (1.0 + np.tanh(arg))
         return np.clip(w, 0.0, 1.0)
@@ -155,7 +171,7 @@ class IRON_COMBINED_EOS:
 
     # ---------- PT interface ----------
 
-    def get_rho_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_rho_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         rho_s = self.solid.get_rho_pt(P_arr, T_arr, tab=solid_tab)
@@ -164,7 +180,7 @@ class IRON_COMBINED_EOS:
         rho_mix = (1.0 - w) * rho_s + w * rho_l
         return rho_mix.reshape(P_arr.shape)
 
-    def get_s_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_s_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         s_s = self.solid.get_s_pt(P_arr, T_arr, tab=solid_tab)
@@ -173,7 +189,7 @@ class IRON_COMBINED_EOS:
         s_mix = (1.0 - w) * s_s + w * s_l
         return s_mix.reshape(P_arr.shape)
 
-    def get_u_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_u_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         u_s = self.solid.get_u_pt(P_arr, T_arr, tab=solid_tab)
@@ -182,7 +198,7 @@ class IRON_COMBINED_EOS:
         u_mix = (1.0 - w) * u_s + w * u_l
         return u_mix.reshape(P_arr.shape)
 
-    def get_alpha_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_alpha_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         a_s = self.solid.get_alpha_pt(P_arr, T_arr, tab=solid_tab)
@@ -191,7 +207,7 @@ class IRON_COMBINED_EOS:
         a_mix = (1.0 - w) * a_s + w * a_l
         return a_mix.reshape(P_arr.shape)
 
-    def get_cp_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_cp_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         cp_s = self.solid.get_CP_pt(P_arr, T_arr, tab=solid_tab)
@@ -200,10 +216,10 @@ class IRON_COMBINED_EOS:
         cp_mix = (1.0 - w) * cp_s + w * cp_l
         return cp_mix.reshape(P_arr.shape)
 
-    def get_CP_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_CP_pt(self, P, T, solid_tab=True, liquid_tab=True):
         return self.get_cp_pt(P, T, solid_tab=solid_tab, liquid_tab=liquid_tab)
 
-    def get_cv_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_cv_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         cv_s = self.solid.get_CV_pt(P_arr, T_arr, tab=solid_tab)
@@ -213,12 +229,12 @@ class IRON_COMBINED_EOS:
         cv_mix = (1.0 - w) * cv_s + w * cv_l
         return cv_mix.reshape(P_arr.shape)
 
-    def get_CV_pt(self, P, T, solid_tab=False, liquid_tab=True):
+    def get_CV_pt(self, P, T, solid_tab=True, liquid_tab=True):
         return self.get_cv_pt(P, T, solid_tab=solid_tab, liquid_tab=liquid_tab)
 
     # ---------- SP interface ----------
 
-    def _get_phase_weights_SP(self, S, P, solid_tab=False, liquid_tab=True):
+    def _get_phase_weights_SP(self, S, P, solid_tab=True, liquid_tab=True):
         """
         Internal step for SP queries.
 
@@ -237,7 +253,7 @@ class IRON_COMBINED_EOS:
 
         return w.reshape(P_arr.shape), rho_s.reshape(P_arr.shape), rho_l.reshape(P_arr.shape), T_s.reshape(P_arr.shape), T_l.reshape(P_arr.shape)
 
-    def get_t_sp(self, S, P, solid_tab=False, liquid_tab=True):
+    def get_t_sp(self, S, P, solid_tab=True, liquid_tab=True):
         S_arr, P_arr = self._as_arrays(S, P)
 
         w, _, _, T_s, T_l = self._get_phase_weights_SP(S_arr, P_arr, 
@@ -245,10 +261,10 @@ class IRON_COMBINED_EOS:
         T_mix = (1.0 - w) * T_s + w * T_l
         return T_mix.reshape(P_arr.shape)
 
-    def get_T_sp(self, S, P, solid_tab=False, liquid_tab=True):
+    def get_T_sp(self, S, P, solid_tab=True, liquid_tab=True):
         return self.get_t_sp(S, P, solid_tab=solid_tab, liquid_tab=liquid_tab)
 
-    def get_rho_sp(self, S, P, solid_tab=False, liquid_tab=True):
+    def get_rho_sp(self, S, P, solid_tab=True, liquid_tab=True):
         S_arr, P_arr = self._as_arrays(S, P)
 
         w, rho_s, rho_l, _, _ = self._get_phase_weights_SP(S_arr, P_arr, 
@@ -257,7 +273,7 @@ class IRON_COMBINED_EOS:
         rho_mix = 1/( (1.0 - w)/rho_s + w/rho_l )
         return rho_mix.reshape(P_arr.shape)
 
-    def get_u_sp(self, S, P, solid_tab=False, liquid_tab=True):
+    def get_u_sp(self, S, P, solid_tab=True, liquid_tab=True):
         S_arr, P_arr = self._as_arrays(S, P)
 
         w, rho_s, rho_l, T_s, T_l = self._get_phase_weights_SP(S_arr, P_arr, 
