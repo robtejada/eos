@@ -1477,6 +1477,12 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         vals = self.get_alpha_rhot(rho_arr, T)  # 1/K (your Fe_EOS convention)
         return float(vals) if scalar else vals
 
-    def get_T_melt(self, P_GPa):
-        Tm_fe = 1900 * (P_GPa / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
-        return Tm_fe
+    def get_T_melt(self, P):
+        """
+        Zhang et al. (2015) melt curve used in ichikawa_iron_eos.
+        P in Pa. Return T_melt(P) in K.
+        """
+        P_arr = self._as_array_single(P)
+        P_GPa = P_arr * 1e-9
+        Tm = self.liquid.get_T_melt(P_GPa)
+        return Tm.reshape(P_arr.shape)
