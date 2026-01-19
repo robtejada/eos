@@ -45,7 +45,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from eos import ichikawa_iron_eos, dorogo_iron_eos
+from eos import dorogo_iron_eos
+from scipy.optimize import brenth, least_squares, root_scalar
+from scipy.interpolate import RegularGridInterpolator as RGI
 
 from astropy.constants import k_B
 from astropy.constants import u as amu
@@ -92,6 +94,30 @@ class Fe_COMBINED_EOS:
         self.liquid = dorogo_iron_eos.Fe_EOS(phase="liquid")
         self.frac_width = float(frac_width)
         self.dT = float(dT)
+
+        #### Load SP data ####
+
+        self.data_sp = np.load(f'eos/dorogokupets_iron_eos/iron_eos_SP_comb.npz')
+
+        self.svals_sp = np.asarray(self.data_sp['svals_sp'], dtype=float)  # kb/baryon
+        self.pvals_sp = np.asarray(self.data_sp['pvals_sp'], dtype=float)  # Pa
+
+        self.rho_grid_sp = np.asarray(self.data_sp['rho_grid_sp'], dtype=float) # kg/m^3
+        self.t_grid_sp = np.asarray(self.data_sp['t_grid_sp'], dtype=float)  # K
+        self.u_grid_sp = np.asarray(self.data_sp['u_grid_sp'], dtype=float)  # erg/g
+        self.cp_grid_sp = np.asarray(self.data_sp['cp_grid_sp'], dtype=float)  # erg/g/K
+        self.cv_grid_sp = np.asarray(self.data_sp['cv_grid_sp'], dtype=float)  # erg/g/K
+        self.alpha_grid_sp = np.asarray(self.data_sp['alpha_grid_sp'], dtype=float)  # 1/K
+
+        # Interpolators: input points are (S, P)
+        rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
+        self.rho_rgi_sp = RGI((self.svals_sp, self.pvals_sp), self.rho_grid_sp, **rgi_kwargs)
+        self.t_rgi_sp = RGI((self.svals_sp, self.pvals_sp), self.t_grid_sp, **rgi_kwargs)
+        self.u_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.u_grid_sp, **rgi_kwargs)
+        self.cp_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.cp_grid_sp, **rgi_kwargs)
+        self.cv_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.cv_grid_sp, **rgi_kwargs)
+        self.alpha_rgi_sp   = RGI((self.svals_sp, self.pvals_sp), self.alpha_grid_sp, **rgi_kwargs)
+
     # ---------- helpers ----------
 
     @staticmethod
@@ -104,6 +130,21 @@ class Fe_COMBINED_EOS:
     @staticmethod
     def _as_array_single(x):
         return np.array(x, ndmin=1, dtype=float)
+    
+    @staticmethod
+    def _broadcast(P, Q):
+        "Generalized for coordinates P and Q. Could be P, T; S, P; etc."
+        scalar = np.isscalar(P) and np.isscalar(Q)
+        P_arr = np.array(P, ndmin=1, dtype=float)
+        Q_arr = np.array(Q, ndmin=1, dtype=float)
+        if P_arr.shape != Q_arr.shape:
+            P_arr, Q_arr = np.broadcast_arrays(P_arr, Q_arr)
+        return scalar, P_arr, Q_arr
+
+    def _interp(self, rgi, P_arr, Q_arr):
+        "Generalized for coordinates P and Q. Could be P, T; S, P; etc."
+        pts = np.stack((P_arr.ravel(), Q_arr.ravel()), axis=-1)
+        return rgi(pts).reshape(P_arr.shape)
 
     def get_T_melt(self, P):
         """
@@ -111,8 +152,7 @@ class Fe_COMBINED_EOS:
         P in Pa. Return T_melt(P) in K.
         """
         P_arr = self._as_array_single(P)
-        P_GPa = P_arr * 1e-9
-        Tm = self.liquid.get_T_melt(P_GPa)
+        Tm = self.liquid.get_T_melt(P_arr)
         return Tm.reshape(P_arr.shape)
 
     def get_S_liq_at_melt(self, P):
@@ -177,7 +217,7 @@ class Fe_COMBINED_EOS:
         rho_s = self.solid.get_rho_pt(P_arr, T_arr, tab=solid_tab)
         rho_l = self.liquid.get_rho_pt(P_arr, T_arr, tab=liquid_tab)
         w = self._blend_weight_PT(P_arr, T_arr)
-        rho_mix = (1.0 - w) * rho_s + w * rho_l
+        rho_mix = 1.0 / ((1.0 - w)/rho_s + w / rho_l)
         return rho_mix.reshape(P_arr.shape)
 
     def get_s_pt(self, P, T, solid_tab=True, liquid_tab=True):
@@ -231,56 +271,350 @@ class Fe_COMBINED_EOS:
 
     def get_CV_pt(self, P, T, solid_tab=True, liquid_tab=True):
         return self.get_cv_pt(P, T, solid_tab=solid_tab, liquid_tab=liquid_tab)
-
+    
     # ---------- SP interface ----------
 
-    def _get_phase_weights_SP(self, S, P, solid_tab=True, liquid_tab=True):
+    def get_T_sp_inv(
+        self,
+        S_target,
+        P_target,
+        *,
+        s_units="kbbar",              # "cgs" or "kbbar"
+        T_guess=None,                 # optional scalar/array initial guess for FIRST element
+        bounds_T=(1.0, 2e5),          # K
+        # fast continuation controls
+        secant_maxiter=30,            # few iters is usually enough when warm-started
+        secant_rtol=1e-10,
+        dy0=1e-3,                     # initial secant separation in ln(T)
+        # fallback bracketing controls (rarely used after first element)
+        bracket_factor=1.3,           # initial bracket window around guess
+        expand_steps=12,
+        expand_factor=2.0,
+        brent_rtol=1e-10,
+        brent_xtol=1e-6,              # MUST be > 0 (your SciPy requires this)
+        brent_maxiter=200,
+        solid_tab=True,
+        liquid_tab=True,
+        return_diagnostics=False,
+        fail_value=np.nan,
+    ):
         """
-        Internal step for SP queries.
+        Warm-start inversion for T(S,P) using previous element's solution as guess.
 
-        1. Compute T_s(P,S) and T_l(P,S).
-        2. Take T_avg = 0.5*(T_s + T_l).
-        3. Compute w_liq from P and T_avg.
+        Strategy per element (in broadcast order):
+        1) Try fast secant on y=ln T initialized from previous successful solution.
+        2) If secant fails, fall back to bracket expansion + brenth (on y=ln T).
         """
-        S_arr, P_arr = self._as_arrays(S, P)
 
-        rho_s, T_s = self.solid.get_rhot_sp_2d_inv(S_arr, P_arr) # solid direct inversion
-        rho_l, T_l = self.liquid.get_rho_sp(S_arr, P_arr, tab=liquid_tab), self.liquid.get_T_sp(S_arr, P_arr, tab=liquid_tab)
+        # ---- broadcast inputs ----
+        S_arr = np.asarray(S_target, dtype=float)
+        P_arr = np.asarray(P_target, dtype=float)
+        S_arr, P_arr = np.broadcast_arrays(S_arr, P_arr)
+        shape = S_arr.shape
 
-        T_avg = 0.5 * (T_s + T_l)
-        w = self._blend_weight_given_T(P_arr, T_avg)
+        # ---- convert entropy targets to cgs if needed ----
+        if str(s_units).lower() == "kbbar":
+            S_cgs = S_arr / float(self.erg_to_kbbar)  # kbbar -> cgs
+        else:
+            S_cgs = S_arr
 
+        # ---- bounds in y = ln T ----
+        T_lo, T_hi = map(float, bounds_T)
+        if T_lo <= 0 or T_hi <= T_lo:
+            raise ValueError("bounds_T must satisfy 0 < T_lo < T_hi")
+        y_min = np.log(T_lo)
+        y_max = np.log(T_hi)
 
-        return w.reshape(P_arr.shape), rho_s.reshape(P_arr.shape), rho_l.reshape(P_arr.shape), T_s.reshape(P_arr.shape), T_l.reshape(P_arr.shape)
+        T_out = np.full(shape, fail_value, dtype=float)
 
-    def get_t_sp(self, S, P, solid_tab=True, liquid_tab=True):
-        S_arr, P_arr = self._as_arrays(S, P)
+        diag = None
+        if return_diagnostics:
+            diag = {
+                "success": np.zeros(shape, dtype=bool),
+                "method": np.empty(shape, dtype=object),
+                "message": np.empty(shape, dtype=object),
+                "n_expand": np.zeros(shape, dtype=int),
+                "nfev": np.zeros(shape, dtype=int),
+                "iterations": np.zeros(shape, dtype=int),
+            }
 
-        w, _, _, T_s, T_l = self._get_phase_weights_SP(S_arr, P_arr, 
-                                                 solid_tab=solid_tab, liquid_tab=liquid_tab)
-        T_mix = (1.0 - w) * T_s + w * T_l
-        return T_mix.reshape(P_arr.shape)
+        # ---- safe scalar entropy residual in y-space ----
+        def g_of_y(P, y, Sgoal):
+            # clamp to bounds to avoid exp overflow / negative T
+            y = float(np.clip(y, y_min, y_max))
+            T = float(np.exp(y))
+            Sm = self.get_s_pt(P, T, solid_tab=solid_tab, liquid_tab=liquid_tab)
+            Sm = float(np.asarray(Sm).reshape(-1)[0])
+            if not np.isfinite(Sm):
+                return np.nan
+            return Sm - Sgoal
 
-    def get_T_sp(self, S, P, solid_tab=True, liquid_tab=True):
-        return self.get_t_sp(S, P, solid_tab=solid_tab, liquid_tab=liquid_tab)
+        # ---- helper: try to get a finite residual near a guess ----
+        def nudge_to_finite(P, Sgoal, y_guess):
+            y = float(np.clip(y_guess, y_min, y_max))
+            val = g_of_y(P, y, Sgoal)
+            if np.isfinite(val):
+                return y, val
 
-    def get_rho_sp(self, S, P, solid_tab=True, liquid_tab=True):
-        S_arr, P_arr = self._as_arrays(S, P)
+            # nudge around multiplicatively in T (additively in y)
+            for step in (0.2, -0.2, 0.5, -0.5, 1.0, -1.0):
+                y_try = float(np.clip(y + step, y_min, y_max))
+                v_try = g_of_y(P, y_try, Sgoal)
+                if np.isfinite(v_try):
+                    return y_try, v_try
 
-        w, rho_s, rho_l, _, _ = self._get_phase_weights_SP(S_arr, P_arr, 
-                                             solid_tab=solid_tab, liquid_tab=liquid_tab)
-        
-        rho_mix = 1/( (1.0 - w)/rho_s + w/rho_l )
-        return rho_mix.reshape(P_arr.shape)
+            return y, np.nan
 
-    def get_u_sp(self, S, P, solid_tab=True, liquid_tab=True):
-        S_arr, P_arr = self._as_arrays(S, P)
+        # ---- initial guess for the FIRST element ----
+        if T_guess is None:
+            T_guess_arr = np.full(shape, 6000.0, dtype=float)
+        else:
+            T_guess_arr = np.asarray(T_guess, dtype=float)
+            T_guess_arr, _ = np.broadcast_arrays(T_guess_arr, S_cgs)
 
-        w, rho_s, rho_l, T_s, T_l = self._get_phase_weights_SP(S_arr, P_arr, 
-                                             solid_tab=solid_tab, liquid_tab=liquid_tab)
+        # continuation state (updated after each success)
+        T_prev = None  # last successful temperature
 
-        u_s = self.solid.get_u_rhot(rho_s, T_s)
-        u_l = self.liquid.get_u_rhot(rho_l, T_l)
+        for idx in np.ndindex(shape):
+            P = float(P_arr[idx])
+            Sgoal = float(S_cgs[idx])
 
-        u_mix = (1.0 - w) * u_s + w * u_l
-        return u_mix.reshape(P_arr.shape)
+            if not (np.isfinite(P) and np.isfinite(Sgoal)) or P <= 0:
+                if return_diagnostics:
+                    diag["message"][idx] = "Invalid target (non-finite or P<=0)."
+                    diag["method"][idx] = "none"
+                continue
+
+            # warm-start guess:
+            if T_prev is None or not np.isfinite(T_prev):
+                Tg = float(T_guess_arr[idx])
+            else:
+                Tg = float(T_prev)
+
+            Tg = float(np.clip(Tg, T_lo, T_hi))
+            y0 = float(np.log(Tg))
+
+            # ensure g(y0) is finite (otherwise secant is doomed)
+            y0, g0 = nudge_to_finite(P, Sgoal, y0)
+
+            # -------------------------
+            # 1) Fast secant on y=lnT
+            # -------------------------
+            secant_ok = False
+            nfev = 0
+            iters = 0
+
+            if np.isfinite(g0):
+                # second point for secant
+                y1 = float(np.clip(y0 + dy0, y_min, y_max))
+                y1, g1 = nudge_to_finite(P, Sgoal, y1)
+
+                if np.isfinite(g1):
+                    try:
+                        sol = root_scalar(
+                            lambda yy: g_of_y(P, yy, Sgoal),
+                            method="secant",
+                            x0=y0,
+                            x1=y1,
+                            rtol=secant_rtol,
+                            maxiter=int(secant_maxiter),
+                        )
+                        nfev = getattr(sol, "function_calls", 0) or 0
+                        iters = getattr(sol, "iterations", 0) or 0
+
+                        if sol.converged and np.isfinite(sol.root):
+                            y_sol = float(np.clip(sol.root, y_min, y_max))
+                            T_sol = float(np.exp(y_sol))
+                            # verify
+                            if np.isfinite(g_of_y(P, y_sol, Sgoal)):
+                                T_out[idx] = T_sol
+                                T_prev = T_sol
+                                secant_ok = True
+                                if return_diagnostics:
+                                    diag["success"][idx] = True
+                                    diag["method"][idx] = "secant(logT)"
+                                    diag["message"][idx] = "OK"
+                                    diag["nfev"][idx] = nfev
+                                    diag["iterations"][idx] = iters
+                    except Exception as e:
+                        secant_ok = False
+                        if return_diagnostics:
+                            diag["method"][idx] = "secant(logT)"
+                            diag["message"][idx] = f"Secant exception: {e}"
+
+            if secant_ok:
+                continue
+
+            # ---------------------------------------
+            # 2) Fallback: bracket + brenth in logT
+            # ---------------------------------------
+            # Build a bracket around y0
+            w = np.log(float(bracket_factor))
+            y_lo = float(np.clip(y0 - w, y_min, y_max))
+            y_hi = float(np.clip(y0 + w, y_min, y_max))
+
+            f_lo = g_of_y(P, y_lo, Sgoal)
+            f_hi = g_of_y(P, y_hi, Sgoal)
+
+            n_expand = 0
+            while (
+                (not np.isfinite(f_lo) or not np.isfinite(f_hi) or f_lo * f_hi > 0.0)
+                and n_expand < int(expand_steps)
+            ):
+                n_expand += 1
+                w *= float(expand_factor)
+                y_lo = float(np.clip(y0 - w, y_min, y_max))
+                y_hi = float(np.clip(y0 + w, y_min, y_max))
+                f_lo = g_of_y(P, y_lo, Sgoal)
+                f_hi = g_of_y(P, y_hi, Sgoal)
+
+            if return_diagnostics:
+                diag["n_expand"][idx] = n_expand
+
+            if (not np.isfinite(f_lo) or not np.isfinite(f_hi) or f_lo * f_hi > 0.0):
+                if return_diagnostics:
+                    diag["success"][idx] = False
+                    diag["method"][idx] = "brenth(logT)"
+                    diag["message"][idx] = (
+                        "Failed to bracket root in logT. "
+                        f"f_lo={f_lo}, f_hi={f_hi}, y_lo={y_lo}, y_hi={y_hi}"
+                    )
+                continue
+
+            try:
+                y_root = brenth(
+                    lambda yy: g_of_y(P, yy, Sgoal),
+                    y_lo, y_hi,
+                    xtol=float(brent_xtol),     # MUST be > 0
+                    rtol=float(brent_rtol),
+                    maxiter=int(brent_maxiter),
+                    disp=False,
+                )
+                y_root = float(np.clip(y_root, y_min, y_max))
+                T_root = float(np.exp(y_root))
+
+                T_out[idx] = T_root
+                T_prev = T_root  # warm-start seed for next element
+
+                if return_diagnostics:
+                    diag["success"][idx] = True
+                    diag["method"][idx] = "brenth(logT)"
+                    diag["message"][idx] = "OK"
+            except Exception as e:
+                if return_diagnostics:
+                    diag["success"][idx] = False
+                    diag["method"][idx] = "brenth(logT)"
+                    diag["message"][idx] = f"Brenth exception: {e}"
+
+        if return_diagnostics:
+            return T_out, diag
+        return T_out
+
+    def get_rhot_sp_inv(
+        self,
+        S_target,
+        P_target,
+        *,
+        s_units="kbbar",
+        **kwargs,
+    ):
+        """
+        Convenience wrapper:
+        1) invert T from S(P,T)
+        2) compute rho(P,T) with the mixed rho rule you specified
+        """
+        T = self.get_T_sp_inv(S_target, P_target, s_units=s_units, **kwargs)
+        rho = self.get_rho_pt(P_target, T, solid_tab=kwargs.get("solid_tab", True), liquid_tab=kwargs.get("liquid_tab", True))
+        return rho, T
+
+    # -------------------------
+    # SP table API (override)
+    # -------------------------
+
+    def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        rho(S,P) in kg/m^3.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.rho_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        rho, T = self.get_rhot_sp_inv(S_arr, P_arr, **inv_kwargs)
+        return float(rho) if scalar else rho
+
+    def get_T_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        T(S,P) in K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.t_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_sp_inv(S_arr, P_arr, **inv_kwargs)
+        return float(T) if scalar else T
+    
+    def get_u_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        u(S,P) in erg/g.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.u_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_sp_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_u_pt(P_arr, T)  # erg/g (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_CP_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        cp(S,P) in erg/g/K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.cp_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_sp_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_CP_pt(P_arr, T)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+
+    def get_CV_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        cv(S,P) in erg/g/K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.cv_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_sp_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_CV_pt(P_arr, T)  # erg/g/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
+    
+    def get_alpha_sp(self, S, P, tab=True, **inv_kwargs):
+        """
+        alpha(S,P) in 1/K.
+        If tab=False, uses Fe_EOS.get_rho_sp_inv then analytic getter.
+        """
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+
+        if tab:
+            vals = self._interp(self.alpha_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
+
+        T = self.get_T_sp_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_alpha_pt(P_arr, T)  # 1/K (your Fe_EOS convention)
+        return float(vals) if scalar else vals
