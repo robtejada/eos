@@ -172,6 +172,11 @@ class Fe_EOS_analytic:
         B = np.array(b, ndmin=1, dtype=float)
         A, B = np.broadcast_arrays(A, B)
         return A, B
+    
+    @staticmethod
+    def _as_array_single(x):
+        return np.array(x, ndmin=1, dtype=float)
+    
     @staticmethod
     def _smoothstep5(u):
         """
@@ -191,7 +196,7 @@ class Fe_EOS_analytic:
 
         dP = self.P_nonneg_smooth_Pa
         """
-        P = np.asarray(P, dtype=float)
+        P = self._as_array_single(P)
         if not self.enforce_P_nonneg:
             return P
 
@@ -1782,5 +1787,5 @@ class Fe_EOS(Fe_EOS_analytic):
         """
         P_arr = self._as_array_single(P)
         P_GPa = P_arr * 1e-9
-        Tm = self.liquid.get_T_melt(P_GPa)
+        Tm = 1900 * (P_GPa / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
         return Tm.reshape(P_arr.shape)

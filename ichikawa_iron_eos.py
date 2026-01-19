@@ -144,6 +144,10 @@ class Fe_EOS_Ichikawa2014_Liquid:
     @staticmethod
     def _jkg_to_ergg(x_jkg: ArrayLike) -> np.ndarray:
         return np.asarray(x_jkg, dtype=float) * 1e4  # 1 J/kg = 1e4 erg/g
+    
+    @staticmethod
+    def _as_array_single(x):
+        return np.array(x, ndmin=1, dtype=float)
 
     # -------------------------
     # V, rho utilities
@@ -1484,5 +1488,5 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         """
         P_arr = self._as_array_single(P)
         P_GPa = P_arr * 1e-9
-        Tm = self.liquid.get_T_melt(P_GPa)
+        Tm = 1900 * (P_GPa / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
         return Tm.reshape(P_arr.shape)
