@@ -145,6 +145,34 @@ class Fe_COMBINED_EOS:
         "Generalized for coordinates P and Q. Could be P, T; S, P; etc."
         pts = np.stack((P_arr.ravel(), Q_arr.ravel()), axis=-1)
         return rgi(pts).reshape(P_arr.shape)
+    
+    def _solid_entropy_offset_at_melt(self, P_arr, solid_tab=True, liquid_tab=True):
+        """
+        Compute an offset (>=0) to subtract from solid entropy so that at Tm(P):
+            S_liq - S_sol = L / Tm
+        If the EOS already satisfies this, offset = 0.
+        """
+        Tm = self.get_T_melt(P_arr)
+        Tm_safe = np.maximum(Tm, 1.0)  # avoid divide-by-zero silliness
+
+        s_sol_m = self.solid.get_s_pt(P_arr, Tm, tab=solid_tab)
+        s_liq_m = self.liquid.get_s_pt(P_arr, Tm, tab=liquid_tab)
+
+        dS_target = self.L / Tm_safe  # erg/g/K
+
+        # We want: s_sol_corr = s_liq_m - dS_target
+        # If s_sol_m is higher than that, subtract the excess.
+        offset = s_sol_m - (s_liq_m - dS_target)
+
+        # Only keep positive, finite corrections
+        offset = np.where(np.isfinite(offset) & (offset > 0.0), offset, 0.0)
+        return offset
+
+    @staticmethod
+    def _entropy_eps(s_ref):
+        # tiny separation to enforce strict inequality without affecting anything macroscopic
+        return 1e-12 * np.maximum(1.0, np.abs(s_ref))
+
 
     def get_T_melt(self, P):
         """
@@ -220,14 +248,39 @@ class Fe_COMBINED_EOS:
         rho_mix = 1.0 / ((1.0 - w)/rho_s + w / rho_l)
         return rho_mix.reshape(P_arr.shape)
 
+    # def get_s_pt(self, P, T, solid_tab=True, liquid_tab=True):
+    #     P_arr, T_arr = self._as_arrays(P, T)
+
+    #     s_s = self.solid.get_s_pt(P_arr, T_arr, tab=solid_tab)
+    #     s_l = self.liquid.get_s_pt(P_arr, T_arr, tab=liquid_tab)
+    #     w = self._blend_weight_PT(P_arr, T_arr)
+    #     # deltaS = s_s - s_l # need to account for entropy mixing here?
+    #     # s_s[deltaS > 0] += s_s
+    #     s_mix = (1.0 - w) * s_s + w * s_l
+    #     return s_mix.reshape(P_arr.shape)
+
     def get_s_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
-        s_s = self.solid.get_s_pt(P_arr, T_arr, tab=solid_tab)
-        s_l = self.liquid.get_s_pt(P_arr, T_arr, tab=liquid_tab)
+        s_s_raw = self.solid.get_s_pt(P_arr, T_arr, tab=solid_tab)
+        s_l     = self.liquid.get_s_pt(P_arr, T_arr, tab=liquid_tab)
+
+        # --- Step 1: pressure-dependent reference fix at the melt curve ---
+        offset = self._solid_entropy_offset_at_melt(P_arr, solid_tab=solid_tab, liquid_tab=liquid_tab)
+        s_s = s_s_raw - offset
+
+        # --- Step 2: hard clamp: solids must not exceed liquids at same (P,T) ---
+        # If deltaS_raw > 0, subtract it (plus a tiny epsilon) so s_s <= s_l.
+        eps = self._entropy_eps(s_l)
+        deltaS = s_s - s_l
+        corr = np.where(np.isfinite(deltaS) & (deltaS > -eps), deltaS + eps, 0.0)
+        s_s = s_s - corr
+
+        # --- Blend ---
         w = self._blend_weight_PT(P_arr, T_arr)
         s_mix = (1.0 - w) * s_s + w * s_l
         return s_mix.reshape(P_arr.shape)
+
 
     def get_u_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
@@ -297,6 +350,10 @@ class Fe_COMBINED_EOS:
         liquid_tab=True,
         return_diagnostics=False,
         fail_value=np.nan,
+        fill_nans=True,              # fill interior NaN holes + edge extrap
+        fill_axis=-1,                # axis along which P varies (for 1D, irrelevant)
+        extrapolate_edges=True,      # extrapolate missing low/high-P edges
+
     ):
         """
         Warm-start inversion for T(S,P) using previous element's solution as guess.
@@ -324,6 +381,64 @@ class Fe_COMBINED_EOS:
             raise ValueError("bounds_T must satisfy 0 < T_lo < T_hi")
         y_min = np.log(T_lo)
         y_max = np.log(T_hi)
+
+        def _fill_1d_loglog(Pv, Tv):
+            """
+            Fill NaNs in a 1D T(P) curve.
+            - Interpolate lnT vs lnP across interior gaps.
+            - Extrapolate linearly in lnT vs lnP at edges (optional).
+            """
+            Pv = np.asarray(Pv, dtype=float)
+            Tv = np.asarray(Tv, dtype=float)
+
+            good = np.isfinite(Pv) & (Pv > 0) & np.isfinite(Tv) & (Tv > 0)
+            if good.all():
+                return Tv
+
+            # If nothing converged, return a harmless constant (geometric mid of bounds)
+            if np.count_nonzero(good) == 0:
+                return np.full_like(Tv, np.sqrt(T_lo * T_hi), dtype=float)
+
+            x = np.log(Pv)
+            order = np.argsort(x)
+            xo = x[order]
+            To = Tv[order]
+
+            goodo = np.isfinite(To) & (To > 0) & np.isfinite(xo)
+            if np.count_nonzero(goodo) == 0:
+                return np.full_like(Tv, np.sqrt(T_lo * T_hi), dtype=float)
+
+            xg = xo[goodo]
+            yg = np.log(np.clip(To[goodo], T_lo, T_hi))
+
+            # baseline: interior interpolation + constant edge fill
+            ynew = np.interp(xo, xg, yg)
+
+            # edge extrapolation in log-log (optional)
+            if extrapolate_edges and xg.size >= 2:
+                # left slope from first two good points
+                mL = (yg[1] - yg[0]) / (xg[1] - xg[0])
+                left = xo < xg[0]
+                ynew[left] = yg[0] + mL * (xo[left] - xg[0])
+
+                # right slope from last two good points
+                mR = (yg[-1] - yg[-2]) / (xg[-1] - xg[-2])
+                right = xo > xg[-1]
+                ynew[right] = yg[-1] + mR * (xo[right] - xg[-1])
+
+            ynew = np.clip(ynew, y_min, y_max)
+            Tfilled_o = np.exp(ynew)
+
+            # restore original ordering
+            inv = np.empty_like(order)
+            inv[order] = np.arange(order.size)
+            Tfilled = Tfilled_o[inv]
+
+            # keep original finite values exactly
+            out = Tv.copy()
+            bad = ~good
+            out[bad] = Tfilled[bad]
+            return np.clip(out, T_lo, T_hi)
 
         T_out = np.full(shape, fail_value, dtype=float)
 
@@ -472,12 +587,33 @@ class Fe_COMBINED_EOS:
                 diag["n_expand"][idx] = n_expand
 
             if (not np.isfinite(f_lo) or not np.isfinite(f_hi) or f_lo * f_hi > 0.0):
+                # ---- No bracket: likely Sgoal outside achievable S(P,T) within bounds_T,
+                # or EOS weirdness. For interpolation scaffolding, clamp to the closer bound. ----
+                yb_lo, fb_lo = nudge_to_finite(P, Sgoal, y_min)
+                yb_hi, fb_hi = nudge_to_finite(P, Sgoal, y_max)
+
+                if np.isfinite(fb_lo) and np.isfinite(fb_hi):
+                    # choose the endpoint that minimizes |residual|
+                    y_best = yb_lo if abs(fb_lo) <= abs(fb_hi) else yb_hi
+                    T_best = float(np.exp(float(np.clip(y_best, y_min, y_max))))
+
+                    T_out[idx] = T_best
+                    T_prev = T_best  # keep warm-start alive
+
+                    if return_diagnostics:
+                        diag["success"][idx] = True
+                        diag["method"][idx] = "clamp(bounds_T)"
+                        diag["message"][idx] = (
+                            "No bracket; clamped to nearest bound in residual."
+                        )
+                    continue
+
+                # If even bounds give NaNs, leave fail_value and move on
                 if return_diagnostics:
                     diag["success"][idx] = False
                     diag["method"][idx] = "brenth(logT)"
                     diag["message"][idx] = (
-                        "Failed to bracket root in logT. "
-                        f"f_lo={f_lo}, f_hi={f_hi}, y_lo={y_lo}, y_hi={y_hi}"
+                        "Failed to bracket root and could not evaluate bounds finitely."
                     )
                 continue
 
@@ -505,6 +641,17 @@ class Fe_COMBINED_EOS:
                     diag["success"][idx] = False
                     diag["method"][idx] = "brenth(logT)"
                     diag["message"][idx] = f"Brenth exception: {e}"
+
+        # ---- Post-fill any remaining NaNs (holes or missing edges) along P axis ----
+        if fill_nans:
+            # move fill_axis to the last axis
+            Tout = np.moveaxis(T_out, fill_axis, -1)
+            Parr = np.moveaxis(P_arr, fill_axis, -1)
+
+            for sl in np.ndindex(Tout.shape[:-1]):
+                Tout[sl] = _fill_1d_loglog(Parr[sl], Tout[sl])
+
+            T_out = np.moveaxis(Tout, -1, fill_axis)
 
         if return_diagnostics:
             return T_out, diag
