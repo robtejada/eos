@@ -161,4 +161,4 @@ def get_rho_sp_tab(s_MJ, p_GPa, tab=True):
     if tab:
         return get_rho_pt_tab(p_GPa, get_t_sp_tab(s_MJ, p_GPa))
     else:
-        return get_rho_pt(p_GPa, logt, get_t_sp(s_MJ, p_GPa))
+        return get_rho_pt(p_GPa, get_t_sp(s_MJ, p_GPa))

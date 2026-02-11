@@ -42,7 +42,4 @@ assets/valleta_2022_neptune_formation_massgrid.csv
 assets/valleta_2022_uranus_formation_massgrid.csv
 misc/Z1Z2_P_T_table_watermisc_lowpressure.npz
 rock_eos/*
-mgsio3_comb_eos.py
-mgsio3_liquid_eos.py
-mgsio3_liquid_eos_formix.py
-mgsio3_ppv2_old.py
+!rock_eos/mg2sio4_aneos_RHOT.npz

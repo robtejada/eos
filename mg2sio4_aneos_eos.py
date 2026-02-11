@@ -42,8 +42,10 @@ class MG2SIO4_ANEOS_EOS:
     def __init__(
         self,
         *,
-        rhot_arrays_path: str = "eos/aneos/forsterite_eos_arrays.npy",
-        rhot_grids_path: str = "eos/aneos/forsterite_eos_grids.npy",
+        # rhot_arrays_path: str = "eos/aneos/forsterite_eos_arrays.npy",
+        # rhot_grids_path: str = "eos/aneos/forsterite_eos_grids.npy",
+
+        rhot_table_path: str = "eos/rock_eos/mg2sio4_aneos_RHOT.npz",
         # ------------------------------------------------------------------
         # TODO (user): replace these placeholders with regenerated PT/SP grids
         # after inverting/saving updated forsterite ANEOS tables.
@@ -60,19 +62,26 @@ class MG2SIO4_ANEOS_EOS:
         self.dyn_to_GPa = (u.dyn / u.cm**2).to("GPa")
 
         # Always-available rho-T ANEOS backend
-        self.logrhovals, self.logtvals = np.load(rhot_arrays_path, allow_pickle=True)
-        self.logrhovals = np.asarray(self.logrhovals, dtype=float)
-        self.logtvals = np.asarray(self.logtvals, dtype=float)
 
-        s_grid_MJkgK, p_grid_GPa, u_grid_MJkg = np.load(rhot_grids_path, allow_pickle=True)
+        self.rhot_data = np.load(rhot_table_path)
+
+        self.rhovals, self.tvals = self.rhot_data["rhovals"], self.rhot_data["tvals"]
+        self.rhovals = np.asarray(self.rhovals, dtype=float)
+        self.tvals = np.asarray(self.tvals, dtype=float)
+
+        s_grid_MJkgK, p_grid_GPa, u_grid_MJkg = self.rhot_data["s_grid"], self.rhot_data["p_grid"], self.rhot_data["u_grid"]
+        cv_grid_MJkgK = self.rhot_data["cv_grid"]
         self.s_grid_MJkgK = np.asarray(s_grid_MJkgK, dtype=float)
         self.p_grid_GPa = np.asarray(p_grid_GPa, dtype=float)
         self.u_grid_MJkg = np.asarray(u_grid_MJkg, dtype=float)
+        self.cv_grid_MJkgK = np.asarray(cv_grid_MJkgK, dtype=float)
 
         rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
-        self._p_rgi_rhot = RGI((self.logtvals, self.logrhovals), self.p_grid_GPa, **rgi_kwargs)
-        self._s_rgi_rhot = RGI((self.logtvals, self.logrhovals), self.s_grid_MJkgK, **rgi_kwargs)
-        self._u_rgi_rhot = RGI((self.logtvals, self.logrhovals), self.u_grid_MJkg, **rgi_kwargs)
+        self._p_rgi_rhot = RGI((self.tvals, self.rhovals), self.p_grid_GPa, **rgi_kwargs)
+        self._s_rgi_rhot = RGI((self.tvals, self.rhovals), self.s_grid_MJkgK, **rgi_kwargs)
+        self._u_rgi_rhot = RGI((self.tvals, self.rhovals), self.u_grid_MJkg, **rgi_kwargs)
+        self._cv_rgi_rhot = RGI((self.tvals, self.rhovals), self.cv_grid_MJkgK, **rgi_kwargs)
+        # to be continued here
 
         # Optional P-T and S-P tables (placeholders by default).
         self._has_pt_table = False
