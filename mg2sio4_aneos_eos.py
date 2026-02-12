@@ -27,14 +27,6 @@ from astropy import units as u
 
 ArrayLike = Union[float, int, np.ndarray]
 
-mp = amu.to('g') # grams
-kb = k_B.to('erg/K') # ergs/K
-erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu)
-MJ_to_kbbar = (u.MJ/u.Kelvin/u.kg).to(k_B/amu)
-dyn_to_bar = (u.dyne/(u.cm)**2).to('bar')
-erg_to_MJ = (u.erg/u.Kelvin/u.gram).to(u.MJ/u.Kelvin/u.kg)
-MJ_to_erg = (u.MJ/u.kg/u.K).to('erg/(K * g)')
-
 @dataclass
 class Domain:
     rho_min: float
@@ -72,6 +64,7 @@ class MG2SIO4_ANEOS_EOS:
         sp_table_path: str = "eos/rock_eos/mg2sio4_aneos_SP.npz",
         melt_transition_width_K: float = 50.0,
     ):
+        self.L = 7.322e5 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of the mantle
         # Unit conversions
         self.erg_to_kbbar = float((u.erg / u.Kelvin / u.gram).to(k_B / amu))
         self.MJkg_to_ergg = float((1.0 * u.MJ / u.kg).to(u.erg / u.g).value)
@@ -699,7 +692,7 @@ class MG2SIO4_ANEOS_EOS:
         cv = self.get_cv_rhot(rho, T_arr)
         return float(cv) if np.isscalar(P) and np.isscalar(T) else cv
 
-    def get_alpha_x(self, P, T, rho, x, eps_rel=1e-3, dx_floor=1e-6, x_floor=1e-4):
+    def get_alpha_x(self, P, T, rho, eps_rel=1e-3, dx_floor=1e-6, x_floor=1e-4):
         """
         Numerical constant-pressure derivative:
             alpha_x = -(1/rho) * (d rho / d x)|_P
@@ -707,7 +700,6 @@ class MG2SIO4_ANEOS_EOS:
             (d rho / d x)|_P ~= [rho(P,T+dT)-rho(P,T-dT)] / [x(P,T+dT)-x(P,T-dT)].
         """
         scalar, P_arr, T_arr = self._broadcast(P, T)
-        _ = x  # kept for API compatibility
 
         T_arr = np.asarray(T_arr, dtype=float)
         dT = np.maximum(np.abs(T_arr) * float(eps_rel), 1e-3)
