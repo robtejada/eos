@@ -19,14 +19,21 @@ import os
 import warnings
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator as RGI
-from scipy.optimize import newton, brentq, least_squares
-from typing import Dict, Optional, Tuple, Union
+from scipy.optimize import newton, brentq, least_squares, root_scalar
 
 from astropy.constants import k_B
 from astropy.constants import u as amu
 from astropy import units as u
 
 ArrayLike = Union[float, int, np.ndarray]
+
+mp = amu.to('g') # grams
+kb = k_B.to('erg/K') # ergs/K
+erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu)
+MJ_to_kbbar = (u.MJ/u.Kelvin/u.kg).to(k_B/amu)
+dyn_to_bar = (u.dyne/(u.cm)**2).to('bar')
+erg_to_MJ = (u.erg/u.Kelvin/u.gram).to(u.MJ/u.Kelvin/u.kg)
+MJ_to_erg = (u.MJ/u.kg/u.K).to('erg/(K * g)')
 
 @dataclass
 class Domain:
@@ -68,31 +75,61 @@ class MG2SIO4_ANEOS_EOS:
         self.erg_to_kbbar = float((u.erg / u.Kelvin / u.gram).to(k_B / amu))
         self.MJkg_to_ergg = float((1.0 * u.MJ / u.kg).to(u.erg / u.g).value)
         self.MJkgK_to_erggK = float((1.0 * u.MJ / u.kg / u.K).to(u.erg / u.g / u.K).value)
+        self.ergg_to_MJkg = 1.0 / self.MJkg_to_ergg
+        self.erggK_to_MJkgK = 1.0 / self.MJkgK_to_erggK
 
         self.dyn_to_Pa = (u.dyn / u.cm**2).to("Pa")
         self.dyn_to_GPa = (u.dyn / u.cm**2).to("GPa")
+        self.GPa_to_dyncm2 = u.GPa.to("dyn/cm^2")
 
         # Always-available rho-T ANEOS backend
 
         self.rhot_data = np.load(rhot_table_path)
 
         self.rhovals, self.tvals = self.rhot_data["rhovals"], self.rhot_data["tvals"]
-        self.rhovals = np.asarray(self.rhovals, dtype=float)
-        self.tvals = np.asarray(self.tvals, dtype=float)
+        self.rhovals = np.asarray(self.rhovals, dtype=float) # g/cc
+        self.tvals = np.asarray(self.tvals, dtype=float) # K
+        self.logrhovals = np.log10(np.clip(self.rhovals, 1e-300, None))
+        self.logtvals = np.log10(np.clip(self.tvals, 1e-300, None))
+        self.domain = Domain(
+            rho_min=float(np.min(self.rhovals)),
+            rho_max=float(np.max(self.rhovals)),
+            T_min=float(np.min(self.tvals)),
+            T_max=float(np.max(self.tvals)),
+        )
 
         s_grid_MJkgK, p_grid_GPa, u_grid_MJkg = self.rhot_data["s_grid"], self.rhot_data["p_grid"], self.rhot_data["u_grid"]
         cv_grid_MJkgK = self.rhot_data["cv_grid"]
-        self.s_grid_MJkgK = np.asarray(s_grid_MJkgK, dtype=float)
-        self.p_grid_GPa = np.asarray(p_grid_GPa, dtype=float)
-        self.u_grid_MJkg = np.asarray(u_grid_MJkg, dtype=float)
-        self.cv_grid_MJkgK = np.asarray(cv_grid_MJkgK, dtype=float)
+        self.s_grid_MJkgK = self._match_grid_shape(
+            np.asarray(s_grid_MJkgK, dtype=float),
+            nx=self.tvals.size,
+            ny=self.rhovals.size,
+            name="s_grid",
+        )
+        self.p_grid_GPa = self._match_grid_shape(
+            np.asarray(p_grid_GPa, dtype=float),
+            nx=self.tvals.size,
+            ny=self.rhovals.size,
+            name="p_grid",
+        )
+        self.u_grid_MJkg = self._match_grid_shape(
+            np.asarray(u_grid_MJkg, dtype=float),
+            nx=self.tvals.size,
+            ny=self.rhovals.size,
+            name="u_grid",
+        )
+        self.cv_grid_MJkgK = self._match_grid_shape(
+            np.asarray(cv_grid_MJkgK, dtype=float),
+            nx=self.tvals.size,
+            ny=self.rhovals.size,
+            name="cv_grid",
+        )
 
         rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
         self._p_rgi_rhot = RGI((self.tvals, self.rhovals), self.p_grid_GPa, **rgi_kwargs)
         self._s_rgi_rhot = RGI((self.tvals, self.rhovals), self.s_grid_MJkgK, **rgi_kwargs)
         self._u_rgi_rhot = RGI((self.tvals, self.rhovals), self.u_grid_MJkg, **rgi_kwargs)
         self._cv_rgi_rhot = RGI((self.tvals, self.rhovals), self.cv_grid_MJkgK, **rgi_kwargs)
-        # to be continued here
 
         # Optional P-T and S-P tables (placeholders by default).
         self._has_pt_table = False
@@ -127,6 +164,14 @@ class MG2SIO4_ANEOS_EOS:
         return A, B
 
     @staticmethod
+    def _match_grid_shape(arr: np.ndarray, *, nx: int, ny: int, name: str) -> np.ndarray:
+        if arr.shape == (nx, ny):
+            return arr
+        if arr.shape == (ny, nx):
+            return arr.T
+        raise ValueError(f"{name} has shape {arr.shape}, expected {(nx, ny)} or {(ny, nx)}.")
+
+    @staticmethod
     def _as_array_single(x):
         return np.array(x, ndmin=1, dtype=float)
 
@@ -147,15 +192,47 @@ class MG2SIO4_ANEOS_EOS:
         pts = np.stack((P_arr.ravel(), Q_arr.ravel()), axis=-1)
         return rgi(pts).reshape(P_arr.shape)
 
+    def _entropy_to_cgs(self, s_in, *, s_units: str = "kbbar"):
+        su = str(s_units).lower()
+        s_arr = np.asarray(s_in, dtype=float)
+        if su in ("kbbar", "kb/baryon", "kbperbaryon"):
+            return s_arr / self.erg_to_kbbar
+        if su in ("cgs", "erg/g/k", "erg/g/kelvin"):
+            return s_arr
+        if su in ("native", "mjkgk", "mj/kg/k"):
+            return s_arr * self.MJkgK_to_erggK
+        raise ValueError("s_units must be one of {'kbbar','cgs','native'}")
+
+    def _entropy_cgs_to_sp_table(self, s_cgs):
+        return np.asarray(s_cgs, dtype=float) * self.erggK_to_MJkgK
+
+    def _entropy_to_sp_table(self, s_in, *, s_units: str = "kbbar"):
+        return self._entropy_cgs_to_sp_table(self._entropy_to_cgs(s_in, s_units=s_units))
+
     # ---------- optional PT/SP loaders ----------
 
     def _load_pt_table(self, path: str):
         data = np.load(path)
         self.P_vals_pt = np.asarray(data["P_grid"], dtype=float)
         self.T_vals_pt = np.asarray(data["T_grid"], dtype=float)
-        self.rho_vals_pt = np.asarray(data["rho_grid"], dtype=float)
-        self.u_vals_pt = np.asarray(data["u_grid"], dtype=float)
-        self.s_vals_pt = np.asarray(data["s_grid"], dtype=float)
+        self.rho_vals_pt = self._match_grid_shape(
+            np.asarray(data["rho_grid"], dtype=float),
+            nx=self.P_vals_pt.size,
+            ny=self.T_vals_pt.size,
+            name="rho_grid",
+        )
+        self.u_vals_pt = self._match_grid_shape(
+            np.asarray(data["u_grid"], dtype=float),
+            nx=self.P_vals_pt.size,
+            ny=self.T_vals_pt.size,
+            name="u_grid",
+        )
+        self.s_vals_pt = self._match_grid_shape(
+            np.asarray(data["s_grid"], dtype=float),
+            nx=self.P_vals_pt.size,
+            ny=self.T_vals_pt.size,
+            name="s_grid",
+        )
 
         rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
         self._rho_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.rho_vals_pt, **rgi_kwargs)
@@ -167,11 +244,29 @@ class MG2SIO4_ANEOS_EOS:
         self._cp_rgi_pt = None
         self._cv_rgi_pt = None
         if "alpha_grid" in data.files:
-            self._alpha_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), np.asarray(data["alpha_grid"], dtype=float), **rgi_kwargs)
+            alpha_grid = self._match_grid_shape(
+                np.asarray(data["alpha_grid"], dtype=float),
+                nx=self.P_vals_pt.size,
+                ny=self.T_vals_pt.size,
+                name="alpha_grid",
+            )
+            self._alpha_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), alpha_grid, **rgi_kwargs)
         if "cp_grid" in data.files:
-            self._cp_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), np.asarray(data["cp_grid"], dtype=float), **rgi_kwargs)
+            cp_grid = self._match_grid_shape(
+                np.asarray(data["cp_grid"], dtype=float),
+                nx=self.P_vals_pt.size,
+                ny=self.T_vals_pt.size,
+                name="cp_grid",
+            )
+            self._cp_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), cp_grid, **rgi_kwargs)
         if "cv_grid" in data.files:
-            self._cv_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), np.asarray(data["cv_grid"], dtype=float), **rgi_kwargs)
+            cv_grid = self._match_grid_shape(
+                np.asarray(data["cv_grid"], dtype=float),
+                nx=self.P_vals_pt.size,
+                ny=self.T_vals_pt.size,
+                name="cv_grid",
+            )
+            self._cv_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), cv_grid, **rgi_kwargs)
 
         self._has_pt_table = True
 
@@ -179,9 +274,24 @@ class MG2SIO4_ANEOS_EOS:
         data = np.load(path)
         self.S_vals_sp = np.asarray(data["S_grid"], dtype=float)
         self.P_vals_sp = np.asarray(data["P_grid"], dtype=float)
-        self.T_vals_sp = np.asarray(data["T_grid"], dtype=float)
-        self.rho_vals_sp = np.asarray(data["rho_grid"], dtype=float)
-        self.u_vals_sp = np.asarray(data["u_grid"], dtype=float)
+        self.T_vals_sp = self._match_grid_shape(
+            np.asarray(data["T_grid"], dtype=float),
+            nx=self.S_vals_sp.size,
+            ny=self.P_vals_sp.size,
+            name="T_grid",
+        )
+        self.rho_vals_sp = self._match_grid_shape(
+            np.asarray(data["rho_grid"], dtype=float),
+            nx=self.S_vals_sp.size,
+            ny=self.P_vals_sp.size,
+            name="rho_grid",
+        )
+        self.u_vals_sp = self._match_grid_shape(
+            np.asarray(data["u_grid"], dtype=float),
+            nx=self.S_vals_sp.size,
+            ny=self.P_vals_sp.size,
+            name="u_grid",
+        )
 
         rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
         self._t_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), self.T_vals_sp, **rgi_kwargs)
@@ -192,36 +302,170 @@ class MG2SIO4_ANEOS_EOS:
         self._cv_rgi_sp = None
         self._alpha_rgi_sp = None
         if "cp_grid" in data.files:
-            self._cp_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), np.asarray(data["cp_grid"], dtype=float), **rgi_kwargs)
+            cp_grid = self._match_grid_shape(
+                np.asarray(data["cp_grid"], dtype=float),
+                nx=self.S_vals_sp.size,
+                ny=self.P_vals_sp.size,
+                name="cp_grid",
+            )
+            self._cp_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), cp_grid, **rgi_kwargs)
         if "cv_grid" in data.files:
-            self._cv_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), np.asarray(data["cv_grid"], dtype=float), **rgi_kwargs)
+            cv_grid = self._match_grid_shape(
+                np.asarray(data["cv_grid"], dtype=float),
+                nx=self.S_vals_sp.size,
+                ny=self.P_vals_sp.size,
+                name="cv_grid",
+            )
+            self._cv_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), cv_grid, **rgi_kwargs)
         if "alpha_grid" in data.files:
-            self._alpha_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), np.asarray(data["alpha_grid"], dtype=float), **rgi_kwargs)
+            alpha_grid = self._match_grid_shape(
+                np.asarray(data["alpha_grid"], dtype=float),
+                nx=self.S_vals_sp.size,
+                ny=self.P_vals_sp.size,
+                name="alpha_grid",
+            )
+            self._alpha_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), alpha_grid, **rgi_kwargs)
 
         self._has_sp_table = True
 
     # ---------- rho-T native getters ----------
 
-    def get_p_rhot_tab(self, logrho, logt):
-        if np.isscalar(logrho) and np.isscalar(logt):
-            return float(self._p_rgi_rhot(np.array([[logt, logrho]], dtype=float)))
-        logt_arr, logrho_arr = self._as_arrays(logt, logrho)
-        pts = np.column_stack((logt_arr.ravel(), logrho_arr.ravel()))
-        return self._p_rgi_rhot(pts).reshape(logt_arr.shape)
+    def get_p_rhot_tab(self, rho, T):
+        scalar, rho_arr, T_arr = self._broadcast(rho, T)
+        vals = self._p_rgi_rhot(np.column_stack((T_arr.ravel(), rho_arr.ravel()))).reshape(rho_arr.shape)
+        return float(vals) if scalar else vals
 
-    def get_s_rhot_tab(self, logrho, logt):
-        if np.isscalar(logrho) and np.isscalar(logt):
-            return float(self._s_rgi_rhot(np.array([[logt, logrho]], dtype=float)))
-        logt_arr, logrho_arr = self._as_arrays(logt, logrho)
-        pts = np.column_stack((logt_arr.ravel(), logrho_arr.ravel()))
-        return self._s_rgi_rhot(pts).reshape(logt_arr.shape)
+    def get_s_rhot_tab(self, rho, T):
+        scalar, rho_arr, T_arr = self._broadcast(rho, T)
+        vals = self._s_rgi_rhot(np.column_stack((T_arr.ravel(), rho_arr.ravel()))).reshape(rho_arr.shape)
+        return float(vals) if scalar else vals
 
-    def get_u_rhot_tab(self, logrho, logt):
-        if np.isscalar(logrho) and np.isscalar(logt):
-            return float(self._u_rgi_rhot(np.array([[logt, logrho]], dtype=float)))
-        logt_arr, logrho_arr = self._as_arrays(logt, logrho)
-        pts = np.column_stack((logt_arr.ravel(), logrho_arr.ravel()))
-        return self._u_rgi_rhot(pts).reshape(logt_arr.shape)
+    def get_u_rhot_tab(self, rho, T):
+        scalar, rho_arr, T_arr = self._broadcast(rho, T)
+        vals = self._u_rgi_rhot(np.column_stack((T_arr.ravel(), rho_arr.ravel()))).reshape(rho_arr.shape)
+        return float(vals) if scalar else vals
+    
+    def get_cv_rhot_tab(self, rho, T):
+        scalar, rho_arr, T_arr = self._broadcast(rho, T)
+        vals = self._cv_rgi_rhot(np.column_stack((T_arr.ravel(), rho_arr.ravel()))).reshape(rho_arr.shape)
+        return float(vals) if scalar else vals
+
+    def get_p_rhot(self, rho, T):
+        return self.get_p_rhot_tab(rho, T)
+
+    def get_s_rhot(self, rho, T):
+        vals = np.asarray(self.get_s_rhot_tab(rho, T), dtype=float) * self.MJkgK_to_erggK
+        return float(vals) if np.isscalar(rho) and np.isscalar(T) else vals
+
+    def get_u_rhot(self, rho, T):
+        vals = np.asarray(self.get_u_rhot_tab(rho, T), dtype=float) * self.MJkg_to_ergg
+        return float(vals) if np.isscalar(rho) and np.isscalar(T) else vals
+
+    def get_cv_rhot(self, rho, T):
+        vals = np.asarray(self.get_cv_rhot_tab(rho, T), dtype=float) * self.MJkgK_to_erggK
+        return float(vals) if np.isscalar(rho) and np.isscalar(T) else vals
+
+    # ---------- optional PT/SP table getters (native table units) ----------
+
+    def get_rho_pt_tab(self, P, T):
+        if not self._has_pt_table:
+            raise RuntimeError("PT table is not loaded.")
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals = self._rho_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+        return float(vals) if scalar else vals
+
+    def get_s_pt_tab(self, P, T):
+        if not self._has_pt_table:
+            raise RuntimeError("PT table is not loaded.")
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals = self._s_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+        return float(vals) if scalar else vals
+
+    def get_u_pt_tab(self, P, T):
+        if not self._has_pt_table:
+            raise RuntimeError("PT table is not loaded.")
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals = self._u_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+        return float(vals) if scalar else vals
+
+    def get_t_sp_tab(self, S_tab, P):
+        if not self._has_sp_table:
+            raise RuntimeError("SP table is not loaded.")
+        scalar, S_arr, P_arr = self._broadcast(S_tab, P)
+        vals = self._t_rgi_sp(np.column_stack((S_arr.ravel(), P_arr.ravel()))).reshape(S_arr.shape)
+        return float(vals) if scalar else vals
+
+    def get_rho_sp_tab(self, S_tab, P):
+        if not self._has_sp_table:
+            raise RuntimeError("SP table is not loaded.")
+        scalar, S_arr, P_arr = self._broadcast(S_tab, P)
+        vals = self._rho_rgi_sp(np.column_stack((S_arr.ravel(), P_arr.ravel()))).reshape(S_arr.shape)
+        return float(vals) if scalar else vals
+
+    def get_u_sp_tab(self, S_tab, P):
+        if not self._has_sp_table:
+            raise RuntimeError("SP table is not loaded.")
+        scalar, S_arr, P_arr = self._broadcast(S_tab, P)
+        vals = self._u_rgi_sp(np.column_stack((S_arr.ravel(), P_arr.ravel()))).reshape(S_arr.shape)
+        return float(vals) if scalar else vals
+
+    # ---------- RHOT-derived thermodynamic derivatives ----------
+
+    def _dP_dT_rhot_num(self, rho, T, eps_rel=1e-3):
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        T_hi = T_arr * (1.0 + eps_rel)
+        T_lo = np.maximum(T_arr * (1.0 - eps_rel), 1.0)
+        p_hi = self.get_p_rhot_tab(rho_arr, T_hi)
+        p_lo = self.get_p_rhot_tab(rho_arr, T_lo)
+        return (p_hi - p_lo) / (T_hi - T_lo)
+
+    def _dP_drho_rhot_num(self, rho, T, eps_rel=1e-3):
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        rho_hi = rho_arr * (1.0 + eps_rel)
+        rho_lo = np.maximum(rho_arr * (1.0 - eps_rel), 1e-99)
+        p_hi = self.get_p_rhot_tab(rho_hi, T_arr)
+        p_lo = self.get_p_rhot_tab(rho_lo, T_arr)
+        return (p_hi - p_lo) / (rho_hi - rho_lo)
+
+    def get_alpha_rhot(self, rho, T, eps_rel=1e-3):
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        dP_dT = self._dP_dT_rhot_num(rho_arr, T_arr, eps_rel=eps_rel)
+        dP_drho = self._dP_drho_rhot_num(rho_arr, T_arr, eps_rel=eps_rel)
+        alpha = dP_dT / np.maximum(rho_arr * dP_drho, 1e-99)
+        return float(alpha) if np.isscalar(rho) and np.isscalar(T) else alpha
+
+    def get_cp_rhot(self, rho, T, eps_rel=1e-3, method="cv_relation"):
+        rho_arr, T_arr = self._as_arrays(rho, T)
+        method_l = str(method).lower()
+
+        if method_l == "cv_relation":
+            cv = self.get_cv_rhot(rho_arr, T_arr)
+            alpha = self.get_alpha_rhot(rho_arr, T_arr, eps_rel=eps_rel)
+            dP_drho_gpa = self._dP_drho_rhot_num(rho_arr, T_arr, eps_rel=eps_rel)
+            dP_drho_cgs = dP_drho_gpa * self.GPa_to_dyncm2
+            cp = cv + T_arr * alpha * alpha * dP_drho_cgs
+        elif method_l == "entropy":
+            T_hi = T_arr * (1.0 + eps_rel)
+            T_lo = np.maximum(T_arr * (1.0 - eps_rel), 1.0)
+            rho_hi = rho_arr * (1.0 + eps_rel)
+            rho_lo = np.maximum(rho_arr * (1.0 - eps_rel), 1e-99)
+
+            s_hi = self.get_s_rhot(rho_arr, T_hi)
+            s_lo = self.get_s_rhot(rho_arr, T_lo)
+            dS_dT_rho = (s_hi - s_lo) / (T_hi - T_lo)
+
+            s_rho_hi = self.get_s_rhot(rho_hi, T_arr)
+            s_rho_lo = self.get_s_rhot(rho_lo, T_arr)
+            dS_drho_T = (s_rho_hi - s_rho_lo) / (rho_hi - rho_lo)
+
+            dP_dT = self._dP_dT_rhot_num(rho_arr, T_arr, eps_rel=eps_rel)
+            dP_drho = self._dP_drho_rhot_num(rho_arr, T_arr, eps_rel=eps_rel)
+            dS_dT_P = dS_dT_rho - dS_drho_T * (dP_dT / np.maximum(dP_drho, 1e-99))
+            cp = T_arr * dS_dT_P
+        else:
+            raise ValueError("method must be one of {'cv_relation', 'entropy'}")
+
+        return float(cp) if np.isscalar(rho) and np.isscalar(T) else cp
 
     # ---------- no phase-transition-specific hooks (compatibility only) ----------
 
@@ -242,79 +486,125 @@ class MG2SIO4_ANEOS_EOS:
 
     # ---------- PT getters ----------
 
-    def _solve_logrho_pt_single(self, p_gpa, t_k, *, maxiter=100, rtol=1e-10):
-        if not (np.isfinite(p_gpa) and np.isfinite(t_k) and t_k > 0):
-            return np.nan
+    def _initial_rho_guess(self, P, T):
+        p = float(P)
+        t = float(T)
 
-        logt = np.log10(t_k)
-        lr_min = float(np.min(self.logrhovals))
-        lr_max = float(np.max(self.logrhovals))
-
-        # Initial guess from closest-T P(logrho) row
-        iT = int(np.argmin(np.abs(self.logtvals - logt)))
+        iT = int(np.argmin(np.abs(self.tvals - t)))
         p_row = np.asarray(self.p_grid_GPa[iT], dtype=float)
-        lr_row = np.asarray(self.logrhovals, dtype=float)
+        rho_row = np.asarray(self.rhovals, dtype=float)
 
-        if np.all(np.diff(p_row) >= 0):
-            lr_guess = np.interp(p_gpa, p_row, lr_row, left=lr_min, right=lr_max)
-        elif np.all(np.diff(p_row) <= 0):
-            lr_guess = np.interp(p_gpa, p_row[::-1], lr_row[::-1], left=lr_min, right=lr_max)
+        if np.all(np.diff(p_row) >= 0.0):
+            return float(np.interp(p, p_row, rho_row, left=rho_row[0], right=rho_row[-1]))
+        if np.all(np.diff(p_row) <= 0.0):
+            return float(np.interp(p, p_row[::-1], rho_row[::-1], left=rho_row[0], right=rho_row[-1]))
+
+        j = int(np.argmin(np.abs(p_row - p)))
+        return float(rho_row[j])
+
+    def _dP_drho_num(self, rho, T, eps_rel=1e-6):
+        r = float(rho)
+        t = float(T)
+        dr = max(abs(r) * float(eps_rel), 1e-12)
+        r_lo = max(r - dr, 1e-20)
+        r_hi = r + dr
+        if r_hi <= r_lo:
+            r_hi = r_lo * (1.0 + 1e-6)
+        p_hi = float(self.get_p_rhot(r_hi, t))
+        p_lo = float(self.get_p_rhot(r_lo, t))
+        return (p_hi - p_lo) / (r_hi - r_lo)
+
+    def get_rho_pt_inv(
+        self,
+        P: ArrayLike,
+        T: ArrayLike,
+        rho0: Optional[ArrayLike] = None,
+        *,
+        tol: float = 1e-8,
+        maxiter: int = 50,
+        newton_first: bool = True,
+        dPdrho_eps_rel: float = 1e-6,
+    ) -> np.ndarray:
+        """
+        Invert P(rho, T) -> rho(P, T) by root-finding f(rho)=P(rho,T)-P_target.
+        Strategy:
+          1) Try Newton's method with an optional starting guess rho0 (broadcasted to shape of P,T).
+             Derivative dP/drho is computed numerically via central difference.
+          2) If Newton fails, fall back to Brent's method (brentq) on a positive bracket.
+        """
+        P_arr, T_arr = self._as_arrays(P, T)
+        out = np.empty_like(P_arr, dtype=float)
+
+        if rho0 is not None:
+            rho0_arr, _ = self._as_arrays(rho0, T_arr)
         else:
-            j = int(np.argmin(np.abs(p_row - p_gpa)))
-            lr_guess = float(lr_row[j])
+            rho0_arr = None
 
-        def f(lr):
-            return float(self.get_p_rhot_tab(lr, logt) - p_gpa)
+        rho_min = max(1e-20, float(np.min(self.rhovals)))
+        rho_max = max(float(np.max(self.rhovals)) * 10.0, 1000.0)
 
-        # Try secant first
-        try:
-            x0 = float(np.clip(lr_guess, lr_min, lr_max))
-            x1 = float(np.clip(x0 + 1e-3, lr_min, lr_max))
-            sol = root_scalar(f, method="secant", x0=x0, x1=x1, maxiter=maxiter, rtol=rtol)
-            if sol.converged and np.isfinite(sol.root):
-                return float(np.clip(sol.root, lr_min, lr_max))
-        except Exception:
-            pass
+        for idx in np.ndindex(P_arr.shape):
+            p = float(P_arr[idx])
+            t = float(T_arr[idx])
 
-        # Bracketed fallback
-        fa = f(lr_min)
-        fb = f(lr_max)
-        if np.isfinite(fa) and np.isfinite(fb) and fa * fb <= 0.0:
-            sol = root_scalar(f, method="brentq", bracket=(lr_min, lr_max), maxiter=maxiter, rtol=rtol)
-            if sol.converged and np.isfinite(sol.root):
-                return float(np.clip(sol.root, lr_min, lr_max))
+            def f(r):
+                return float(self.get_p_rhot(r, t) - p)
 
-        # Last-resort grid projection
-        f_row = np.abs(p_row - p_gpa)
-        j = int(np.argmin(f_row))
-        return float(lr_row[j])
+            def fprime(r):
+                return float(self._dP_drho_num(r, t, eps_rel=dPdrho_eps_rel))
 
-    def get_rho_pt(self, P, T, tab=True, **inv_kwargs):
+            r_guess = (
+                float(rho0_arr[idx])
+                if rho0_arr is not None
+                else float(self._initial_rho_guess(p, t))
+            )
+
+            solved = False
+            if newton_first:
+                try:
+                    r_newton = newton(f, r_guess, fprime=fprime, tol=tol, maxiter=maxiter)
+                    if np.isfinite(r_newton) and r_newton > 0.0:
+                        out[idx] = float(r_newton)
+                        solved = True
+                except Exception:
+                    solved = False
+
+            if not solved:
+                a = rho_min
+                b = rho_max
+                fa = f(a)
+                fb = f(b)
+                if np.isnan(fa) or np.isnan(fb) or fa * fb > 0.0:
+                    raise ValueError(
+                        f"brentq: target P={p:g} at T={t:g} K not bracketed on "
+                        f"[rho_min={a:g}, rho_max={b:g}]. "
+                        f"f(rho_min)={fa:g}, f(rho_max)={fb:g}."
+                    )
+                r_brent = brentq(f, a, b, xtol=tol, maxiter=maxiter)
+                out[idx] = float(r_brent)
+
+        return out.reshape(P_arr.shape)
+
+    def get_rho_pt(self, P, T, tab=True, **kwargs):
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table:
-            rho = self._rho_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
-            return float(rho) if np.isscalar(P) and np.isscalar(T) else rho
+            rho = self.get_rho_pt_tab(P_arr, T_arr)
+        else:
+            rho = self.get_rho_pt_inv(P_arr, T_arr, **kwargs)
 
-        rho = np.empty_like(P_arr, dtype=float)
-        it = np.ndindex(P_arr.shape)
-        for idx in it:
-            lr = self._solve_logrho_pt_single(float(P_arr[idx]), float(T_arr[idx]), **inv_kwargs)
-            rho[idx] = 10.0 ** lr
         return float(rho) if np.isscalar(P) and np.isscalar(T) else rho
 
     def get_s_pt(self, P, T, tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table:
-            s_MJkgK = self._s_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+            s_MJkgK = self.get_s_pt_tab(P_arr, T_arr)
             s_cgs = s_MJkgK * self.MJkgK_to_erggK
             return float(s_cgs) if np.isscalar(P) and np.isscalar(T) else s_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
-        logrho = np.log10(np.asarray(rho, dtype=float))
-        logt = np.log10(T_arr)
-        s_MJkgK = self.get_s_rhot_tab(logrho, logt)
+        s_MJkgK = self.get_s_rhot_tab(np.asarray(rho, dtype=float), T_arr)
         s_cgs = s_MJkgK * self.MJkgK_to_erggK
         return float(s_cgs) if np.isscalar(P) and np.isscalar(T) else s_cgs
 
@@ -322,14 +612,12 @@ class MG2SIO4_ANEOS_EOS:
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table:
-            u_MJkg = self._u_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+            u_MJkg = self.get_u_pt_tab(P_arr, T_arr)
             u_cgs = u_MJkg * self.MJkg_to_ergg
             return float(u_cgs) if np.isscalar(P) and np.isscalar(T) else u_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
-        logrho = np.log10(np.asarray(rho, dtype=float))
-        logt = np.log10(T_arr)
-        u_MJkg = self.get_u_rhot_tab(logrho, logt)
+        u_MJkg = self.get_u_rhot_tab(np.asarray(rho, dtype=float), T_arr)
         u_cgs = u_MJkg * self.MJkg_to_ergg
         return float(u_cgs) if np.isscalar(P) and np.isscalar(T) else u_cgs
 
@@ -342,13 +630,8 @@ class MG2SIO4_ANEOS_EOS:
             vals = self._alpha_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
             return float(vals) if np.isscalar(P) and np.isscalar(T) else vals
 
-        T_hi = T_arr * (1.0 + eps_rel)
-        T_lo = np.maximum(T_arr * (1.0 - eps_rel), 1.0)
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
-        rho_hi = self.get_rho_pt(P_arr, T_hi, tab=False)
-        rho_lo = self.get_rho_pt(P_arr, T_lo, tab=False)
-        drho_dT = (rho_hi - rho_lo) / (T_hi - T_lo)
-        alpha = -(drho_dT / np.maximum(rho, 1e-99))
+        alpha = self.get_alpha_rhot(rho, T_arr, eps_rel=eps_rel)
         return float(alpha) if np.isscalar(P) and np.isscalar(T) else alpha
 
     def get_cp_pt(self, P, T, tab=True, eps_rel=1e-3):
@@ -359,13 +642,8 @@ class MG2SIO4_ANEOS_EOS:
             cp_cgs = cp_MJkgK * self.MJkgK_to_erggK
             return float(cp_cgs) if np.isscalar(P) and np.isscalar(T) else cp_cgs
 
-        # Cp = T * (dS/dT)_P
-        T_hi = T_arr * (1.0 + eps_rel)
-        T_lo = np.maximum(T_arr * (1.0 - eps_rel), 1.0)
-        s_hi = self.get_s_pt(P_arr, T_hi, tab=False)
-        s_lo = self.get_s_pt(P_arr, T_lo, tab=False)
-        ds_dT = (s_hi - s_lo) / (T_hi - T_lo)
-        cp = T_arr * ds_dT
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False)
+        cp = self.get_cp_rhot(rho, T_arr, eps_rel=eps_rel)
         return float(cp) if np.isscalar(P) and np.isscalar(T) else cp
 
     def get_cv_pt(self, P, T, tab=True, eps_rel=1e-3):
@@ -376,14 +654,8 @@ class MG2SIO4_ANEOS_EOS:
             cv_cgs = cv_MJkgK * self.MJkgK_to_erggK
             return float(cv_cgs) if np.isscalar(P) and np.isscalar(T) else cv_cgs
 
-        # Cv = (dU/dT)_rho (computed at local rho(P,T))
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
-        logrho = np.log10(np.asarray(rho, dtype=float))
-        T_hi = T_arr * (1.0 + eps_rel)
-        T_lo = np.maximum(T_arr * (1.0 - eps_rel), 1.0)
-        u_hi = self.get_u_rhot_tab(logrho, np.log10(T_hi)) * self.MJkg_to_ergg
-        u_lo = self.get_u_rhot_tab(logrho, np.log10(T_lo)) * self.MJkg_to_ergg
-        cv = (u_hi - u_lo) / (T_hi - T_lo)
+        cv = self.get_cv_rhot(rho, T_arr)
         return float(cv) if np.isscalar(P) and np.isscalar(T) else cv
 
     def get_alpha_x(self, P, T, rho, x):
@@ -400,7 +672,7 @@ class MG2SIO4_ANEOS_EOS:
         *,
         s_units="kbbar",
         T_guess=None,
-        bounds_T=(1.0, 2e5),
+        bounds_T: Optional[Tuple[float, float]] = None,
         secant_maxiter=30,
         secant_rtol=1e-10,
         dy0=1e-3,
@@ -418,12 +690,13 @@ class MG2SIO4_ANEOS_EOS:
         S_arr, P_arr = np.broadcast_arrays(S_arr, P_arr)
         shape = S_arr.shape
 
-        if str(s_units).lower() == "kbbar":
-            S_goal = S_arr / float(self.erg_to_kbbar)
-        else:
-            S_goal = S_arr
+        S_goal = self._entropy_to_cgs(S_arr, s_units=s_units)
 
-        T_lo, T_hi = map(float, bounds_T)
+        if bounds_T is None:
+            T_lo = max(1e-12, float(self.domain.T_min))
+            T_hi = float(self.domain.T_max)
+        else:
+            T_lo, T_hi = map(float, bounds_T)
         if T_lo <= 0 or T_hi <= T_lo:
             raise ValueError("bounds_T must satisfy 0 < T_lo < T_hi")
         y_min = np.log(T_lo)
@@ -603,9 +876,9 @@ class MG2SIO4_ANEOS_EOS:
         s_target,
         P_target,
         *,
-        s_units: str = "kbbar",          # "kbbar" (kB/baryon), "cgs" (erg/g/K), or "SI" (J/mol/K)
+        s_units: str = "kbbar",          # "kbbar", "cgs", or "native" (MJ/kg/K)
         guess="auto",                    # "auto" or (rho_guess, T_guess) in (g/cm^3, K)
-        T_guess0: float = None,
+        T_guess0: Optional[float] = None,
         bounds_rho: Optional[Tuple[float, float]] = None,   # (g/cm^3, g/cm^3)
         bounds_T:   Optional[Tuple[float, float]] = None,   # (K, K)
         xtol: float = 1e-10,
@@ -616,7 +889,7 @@ class MG2SIO4_ANEOS_EOS:
         return_diagnostics: bool = False,
     ):
         """
-        Coupled 2-D inversion using the native (T, rho) basis:
+        Coupled 2-D inversion using the native RHOT basis:
             P(rho, T) = P_target   [GPa]
             S(rho, T) = s_target   [units set by s_units]
 
@@ -628,13 +901,13 @@ class MG2SIO4_ANEOS_EOS:
         ----------
         s_target, P_target : float or array-like
             Target entropy and pressure.
-        s_units : {"kbbar","cgs","SI"}
-            - "kbbar": k_B/baryon (your code's common external entropy unit)
+        s_units : {"kbbar","cgs","native"}
+            - "kbbar": k_B/baryon
             - "cgs"  : erg/g/K
-            - "SI"   : J/mol/K  (native units returned by get_s_rhot)
+            - "native": MJ/kg/K
         guess : "auto" or tuple
             If tuple, interpreted as (rho_guess[g/cm^3], T_guess[K]).
-            If "auto", try SP tables for a seed, then fallback to rho(P,Tseed).
+            If "auto", try SP tables for a seed (if present), then fallback to rho(P,Tseed).
         T_guess0 : float, optional
             Seed temperature used for fallback auto-guess if SP-table seed fails.
         bounds_rho, bounds_T : optional
@@ -654,21 +927,11 @@ class MG2SIO4_ANEOS_EOS:
         s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
         shape = s_arr.shape
 
-        # ---------------- convert entropy target -> SI (J/mol/K) ----------------
-        su = str(s_units).lower()
-        if su in ("kbbar", "kb/baryon", "kbperbaryon"):
-            # kbbar -> cgs (erg/g/K) via erg_to_kbbar, then -> SI (J/mol/K) via S_conv_cgs
-            s_SI = s_arr / (self.erg_to_kbbar * self.S_conv_cgs)
-        elif su in ("cgs", "erg/g/k", "erg/g/kelvin"):
-            s_SI = s_arr / self.S_conv_cgs
-        elif su in ("si", "j/mol/k", "jmolk"):
-            s_SI = s_arr
-        else:
-            raise ValueError("s_units must be one of {'kbbar','cgs','SI'}")
+        # ---------------- convert entropy target -> cgs (erg/g/K) ----------------
+        s_cgs = self._entropy_to_cgs(s_arr, s_units=s_units)
 
         # ---------------- default bounds ----------------
         if bounds_rho is None:
-            # stay near your native rho grid; give a little headroom for extrap
             rho_lo = max(1e-12, float(self.domain.rho_min) - 0.05 * abs(self.domain.rho_min))
             rho_hi = float(self.domain.rho_max) + 0.05 * abs(self.domain.rho_max)
             bounds_rho = (rho_lo, rho_hi)
@@ -707,7 +970,7 @@ class MG2SIO4_ANEOS_EOS:
             T_guess_cur   = None
 
             # fallback temperature seed
-            Tseed = float(0.5 * (T_lo + T_hi) if T_guess0 is None else T_guess0)
+            Tseed = float(np.sqrt(T_lo * T_hi) if T_guess0 is None else T_guess0)
             Tseed = min(max(Tseed, T_lo), T_hi)
 
         else:
@@ -719,7 +982,7 @@ class MG2SIO4_ANEOS_EOS:
         # ---------------- iterate with warm-start continuation ----------------
         for idx in np.ndindex(shape):
             Pt = float(P_arr[idx])
-            St = float(s_SI[idx])
+            St = float(s_cgs[idx])
 
             if not (np.isfinite(Pt) and np.isfinite(St)) or Pt <= 0:
                 if return_diagnostics:
@@ -732,21 +995,34 @@ class MG2SIO4_ANEOS_EOS:
 
                 # 1) Seed from SP tables if possible (does NOT evaluate residuals from SP tables;
                 #    it’s only used as an initial guess)
-                try:
-                    # get_t_sp_tab expects S in J/mol/K
-                    T_try = float(self.get_t_sp_tab(St, Pt))
-                    rho_try = float(self.get_rho_sp_tab(St, Pt))
-                    if np.isfinite(T_try) and np.isfinite(rho_try) and (T_try > 0) and (rho_try > 0):
-                        rho_guess_cur = rho_try
-                        T_guess_cur   = T_try
-                        seeded = True
-                except Exception:
-                    seeded = False
+                if self._has_sp_table:
+                    try:
+                        St_tab = float(self._entropy_cgs_to_sp_table(St))
+                        T_try = float(self.get_t_sp_tab(St_tab, Pt))
+                        rho_try = float(self.get_rho_sp_tab(St_tab, Pt))
+                        if np.isfinite(T_try) and np.isfinite(rho_try) and (T_try > 0) and (rho_try > 0):
+                            rho_guess_cur = rho_try
+                            T_guess_cur   = T_try
+                            seeded = True
+                    except Exception:
+                        seeded = False
 
                 # 2) Fallback: seed rho from P at a chosen Tseed, keep T=Tseed
                 if not seeded:
                     try:
-                        rho_guess_cur = float(self.get_rho_pt_inv(Pt, Tseed))
+                        T_try = float(self.get_t_sp_inv(St, Pt, s_units="cgs", bounds_T=(T_lo, T_hi)))
+                        rho_try = float(self.get_rho_pt(Pt, T_try, tab=False))
+                        if np.isfinite(T_try) and np.isfinite(rho_try) and (T_try > 0) and (rho_try > 0):
+                            rho_guess_cur = rho_try
+                            T_guess_cur = T_try
+                            seeded = True
+                    except Exception:
+                        seeded = False
+
+                # 3) Last fallback: seed rho from P at Tseed, keep T=Tseed
+                if not seeded:
+                    try:
+                        rho_guess_cur = float(self.get_rho_pt(Pt, Tseed, tab=False))
                     except Exception:
                         rho_guess_cur = 0.5 * (rho_lo + rho_hi)
                     T_guess_cur = Tseed
@@ -759,14 +1035,14 @@ class MG2SIO4_ANEOS_EOS:
 
             # Scaling to keep equations comparable
             P_scale = max(abs(Pt), 1e-12)   # GPa
-            S_scale = max(abs(St), 1e-12)   # J/mol/K
+            S_scale = max(abs(St), 1e-30)   # erg/g/K
 
             def residuals(x):
                 rho = float(np.exp(x[0]))
                 T   = float(np.exp(x[1]))
 
                 Pm = float(self.get_p_rhot(rho, T))   # GPa
-                Sm = float(self.get_s_rhot(rho, T))   # J/mol/K (native)
+                Sm = float(self.get_s_rhot(rho, T))   # erg/g/K
 
                 if not (np.isfinite(Pm) and np.isfinite(Sm)):
                     return np.array([1e30, 1e30], dtype=float)
@@ -788,23 +1064,26 @@ class MG2SIO4_ANEOS_EOS:
                 if sol.success and np.all(np.isfinite(sol.x)):
                     rho_sol = float(np.exp(sol.x[0]))
                     T_sol   = float(np.exp(sol.x[1]))
+                    r = residuals(sol.x)
+                    good_solution = bool(np.all(np.isfinite(r)) and np.max(np.abs(r)) < 1e-4)
 
-                    rho_out[idx] = rho_sol
-                    T_out[idx]   = T_sol
+                    if good_solution:
+                        rho_out[idx] = rho_sol
+                        T_out[idx]   = T_sol
 
-                    # Warm-start continuation: update guesses ONLY on success
-                    rho_guess_cur = rho_sol
-                    T_guess_cur   = T_sol
+                        # Warm-start continuation: update guesses ONLY on success
+                        rho_guess_cur = rho_sol
+                        T_guess_cur   = T_sol
 
-                    if return_diagnostics:
-                        info["success"][idx] = True
-                        info["cost"][idx] = sol.cost
-                        info["nfev"][idx] = sol.nfev
-
-                        r = residuals(sol.x)
-                        info["resid_P_frac"][idx] = abs(r[0])
-                        info["resid_S_frac"][idx] = abs(r[1])
-                        info["message"][idx] = sol.message
+                        if return_diagnostics:
+                            info["success"][idx] = True
+                            info["cost"][idx] = sol.cost
+                            info["nfev"][idx] = sol.nfev
+                            info["resid_P_frac"][idx] = abs(r[0])
+                            info["resid_S_frac"][idx] = abs(r[1])
+                            info["message"][idx] = sol.message
+                    elif return_diagnostics:
+                        info["message"][idx] = "least_squares converged to a high-residual point"
                 else:
                     if return_diagnostics:
                         info["message"][idx] = getattr(sol, "message", "least_squares failed")
@@ -814,79 +1093,111 @@ class MG2SIO4_ANEOS_EOS:
                     info["message"][idx] = f"Exception: {e}"
                 # keep last good guess
 
+            if not np.isfinite(rho_out[idx]) or not np.isfinite(T_out[idx]):
+                try:
+                    T_fb = float(self.get_t_sp_inv(St, Pt, s_units="cgs", bounds_T=(T_lo, T_hi)))
+                    rho_fb = float(self.get_rho_pt(Pt, T_fb, tab=False))
+                    if np.isfinite(T_fb) and np.isfinite(rho_fb) and (T_fb > 0) and (rho_fb > 0):
+                        rho_out[idx] = rho_fb
+                        T_out[idx] = T_fb
+                        rho_guess_cur = rho_fb
+                        T_guess_cur = T_fb
+                        if return_diagnostics:
+                            info["success"][idx] = True
+                            info["message"][idx] = "Fallback via 1-D SP/PT inversion"
+                except Exception:
+                    pass
+
         if return_diagnostics:
             return rho_out, T_out, info
         return rho_out, T_out
 
-    def get_rhot_sp_inv(self, S, P, **inv_kwargs):
+    def get_rhot_sp_inv(self, S, P, s_units="kbbar", **inv_kwargs):
+        if "s_units" not in inv_kwargs:
+            inv_kwargs["s_units"] = s_units
         T = self.get_t_sp_inv(S, P, **inv_kwargs)
         rho = self.get_rho_pt(P, T, tab=False)
         return rho, T
 
-    def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_rho_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table:
-            vals = self._interp(self._rho_rgi_sp, S_arr, P_arr)
+            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals = self._interp(self._rho_rgi_sp, S_tab, P_arr)
             return float(vals) if scalar else vals
 
-        rho, _ = self.get_rhot_sp_inv(S_arr, P_arr, **inv_kwargs)
+        rho, _ = self.get_rhot_sp_inv(S_arr, P_arr, s_units=s_units, **inv_kwargs)
         return float(rho) if scalar else rho
 
-    def get_t_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_t_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table:
-            vals = self._interp(self._t_rgi_sp, S_arr, P_arr)
+            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals = self._interp(self._t_rgi_sp, S_tab, P_arr)
             return float(vals) if scalar else vals
 
+        if "s_units" not in inv_kwargs:
+            inv_kwargs["s_units"] = s_units
         T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
         return float(T) if scalar else T
 
-    def get_u_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_u_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table:
-            vals_MJkg = self._interp(self._u_rgi_sp, S_arr, P_arr)
+            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals_MJkg = self._interp(self._u_rgi_sp, S_tab, P_arr)
             vals_cgs = vals_MJkg * self.MJkg_to_ergg
             return float(vals_cgs) if scalar else vals_cgs
 
+        if "s_units" not in inv_kwargs:
+            inv_kwargs["s_units"] = s_units
         T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_u_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
 
-    def get_cp_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_cp_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table and self._cp_rgi_sp is not None:
-            vals_MJkgK = self._interp(self._cp_rgi_sp, S_arr, P_arr)
+            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals_MJkgK = self._interp(self._cp_rgi_sp, S_tab, P_arr)
             vals_cgs = vals_MJkgK * self.MJkgK_to_erggK
             return float(vals_cgs) if scalar else vals_cgs
 
+        if "s_units" not in inv_kwargs:
+            inv_kwargs["s_units"] = s_units
         T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_cp_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
 
-    def get_cv_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_cv_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table and self._cv_rgi_sp is not None:
-            vals_MJkgK = self._interp(self._cv_rgi_sp, S_arr, P_arr)
+            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals_MJkgK = self._interp(self._cv_rgi_sp, S_tab, P_arr)
             vals_cgs = vals_MJkgK * self.MJkgK_to_erggK
             return float(vals_cgs) if scalar else vals_cgs
 
+        if "s_units" not in inv_kwargs:
+            inv_kwargs["s_units"] = s_units
         T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_cv_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
 
-    def get_alpha_sp(self, S, P, tab=True, **inv_kwargs):
+    def get_alpha_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table and self._alpha_rgi_sp is not None:
-            vals = self._interp(self._alpha_rgi_sp, S_arr, P_arr)
+            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals = self._interp(self._alpha_rgi_sp, S_tab, P_arr)
             return float(vals) if scalar else vals
 
+        if "s_units" not in inv_kwargs:
+            inv_kwargs["s_units"] = s_units
         T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_alpha_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
-
