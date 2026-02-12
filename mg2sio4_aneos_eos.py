@@ -132,8 +132,8 @@ class MG2SIO4_ANEOS_EOS:
         self._cv_rgi_rhot = RGI((self.tvals, self.rhovals), self.cv_grid_MJkgK, **rgi_kwargs)
 
         # Optional P-T and S-P tables (placeholders by default).
-        self._has_pt_table = False
-        self._has_sp_table = False
+        self._has_pt_table = True
+        self._has_sp_table = True
 
         self.pt_table_path = pt_table_path
         self.sp_table_path = sp_table_path
@@ -213,84 +213,98 @@ class MG2SIO4_ANEOS_EOS:
 
     def _load_pt_table(self, path: str):
         data = np.load(path)
-        self.P_vals_pt = np.asarray(data["P_grid"], dtype=float)
-        self.T_vals_pt = np.asarray(data["T_grid"], dtype=float)
+        self.P_vals_pt = np.asarray(data["pvals_pt"], dtype=float)
+        self.T_vals_pt = np.asarray(data["tvals_pt"], dtype=float)
         self.rho_vals_pt = self._match_grid_shape(
-            np.asarray(data["rho_grid"], dtype=float),
+            np.asarray(data["rho_grid_pt"], dtype=float),
             nx=self.P_vals_pt.size,
             ny=self.T_vals_pt.size,
-            name="rho_grid",
+            name="rho_grid_pt",
         )
         self.u_vals_pt = self._match_grid_shape(
-            np.asarray(data["u_grid"], dtype=float),
+            np.asarray(data["u_grid_pt"], dtype=float),
             nx=self.P_vals_pt.size,
             ny=self.T_vals_pt.size,
-            name="u_grid",
+            name="u_grid_pt",
         )
         self.s_vals_pt = self._match_grid_shape(
-            np.asarray(data["s_grid"], dtype=float),
+            np.asarray(data["s_grid_pt"], dtype=float),
             nx=self.P_vals_pt.size,
             ny=self.T_vals_pt.size,
-            name="s_grid",
+            name="s_grid_pt",
+        )
+
+        self.cv_vals_pt = self._match_grid_shape(
+            np.asarray(data["cv_grid_pt"], dtype=float),
+            nx=self.P_vals_pt.size,
+            ny=self.T_vals_pt.size,
+            name="cv_grid_pt",       
+        )
+
+        self.cp_vals_pt = self._match_grid_shape(
+            np.asarray(data["cp_grid_pt"], dtype=float),
+            nx=self.P_vals_pt.size,
+            ny=self.T_vals_pt.size,
+            name="cp_grid_pt",       
+        )
+
+        self.alpha_vals_pt = self._match_grid_shape(
+            np.asarray(data["alpha_grid_pt"], dtype=float),
+            nx=self.P_vals_pt.size,
+            ny=self.T_vals_pt.size,
+            name="alpha_grid_pt",       
         )
 
         rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
         self._rho_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.rho_vals_pt, **rgi_kwargs)
         self._u_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.u_vals_pt, **rgi_kwargs)
         self._s_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.s_vals_pt, **rgi_kwargs)
-
-        # Optional derivative tables (if present)
-        self._alpha_rgi_pt = None
-        self._cp_rgi_pt = None
-        self._cv_rgi_pt = None
-        if "alpha_grid" in data.files:
-            alpha_grid = self._match_grid_shape(
-                np.asarray(data["alpha_grid"], dtype=float),
-                nx=self.P_vals_pt.size,
-                ny=self.T_vals_pt.size,
-                name="alpha_grid",
-            )
-            self._alpha_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), alpha_grid, **rgi_kwargs)
-        if "cp_grid" in data.files:
-            cp_grid = self._match_grid_shape(
-                np.asarray(data["cp_grid"], dtype=float),
-                nx=self.P_vals_pt.size,
-                ny=self.T_vals_pt.size,
-                name="cp_grid",
-            )
-            self._cp_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), cp_grid, **rgi_kwargs)
-        if "cv_grid" in data.files:
-            cv_grid = self._match_grid_shape(
-                np.asarray(data["cv_grid"], dtype=float),
-                nx=self.P_vals_pt.size,
-                ny=self.T_vals_pt.size,
-                name="cv_grid",
-            )
-            self._cv_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), cv_grid, **rgi_kwargs)
-
-        self._has_pt_table = True
+        self._cv_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.cv_vals_pt, **rgi_kwargs)
+        self._cp_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.cp_vals_pt, **rgi_kwargs)
+        self._alpha_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.alpha_vals_pt, **rgi_kwargs)
 
     def _load_sp_table(self, path: str):
         data = np.load(path)
-        self.S_vals_sp = np.asarray(data["S_grid"], dtype=float)
-        self.P_vals_sp = np.asarray(data["P_grid"], dtype=float)
+        self.S_vals_sp = np.asarray(data["svals_sp"], dtype=float)
+        self.P_vals_sp = np.asarray(data["pvals_sp"], dtype=float)
         self.T_vals_sp = self._match_grid_shape(
-            np.asarray(data["T_grid"], dtype=float),
+            np.asarray(data["t_grid_sp"], dtype=float),
             nx=self.S_vals_sp.size,
             ny=self.P_vals_sp.size,
-            name="T_grid",
+            name="t_grid_sp",
         )
         self.rho_vals_sp = self._match_grid_shape(
-            np.asarray(data["rho_grid"], dtype=float),
+            np.asarray(data["rho_grid_sp"], dtype=float),
             nx=self.S_vals_sp.size,
             ny=self.P_vals_sp.size,
-            name="rho_grid",
+            name="rho_grid_sp",
         )
         self.u_vals_sp = self._match_grid_shape(
-            np.asarray(data["u_grid"], dtype=float),
+            np.asarray(data["u_grid_sp"], dtype=float),
             nx=self.S_vals_sp.size,
             ny=self.P_vals_sp.size,
-            name="u_grid",
+            name="u_grid_sp",
+        )
+
+        self.cv_vals_sp = self._match_grid_shape(
+            np.asarray(data["cv_grid_sp"], dtype=float),
+            nx=self.S_vals_sp.size,
+            ny=self.P_vals_sp.size,
+            name="cv_grid_sp",
+        )
+
+        self.cp_vals_sp = self._match_grid_shape(
+            np.asarray(data["cp_grid_sp"], dtype=float),
+            nx=self.S_vals_sp.size,
+            ny=self.P_vals_sp.size,
+            name="cp_grid_sp",
+        )
+
+        self.alpha_vals_sp = self._match_grid_shape(
+            np.asarray(data["alpha_grid_sp"], dtype=float),
+            nx=self.S_vals_sp.size,
+            ny=self.P_vals_sp.size,
+            name="alpha_grid_sp",
         )
 
         rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
@@ -301,28 +315,28 @@ class MG2SIO4_ANEOS_EOS:
         self._cp_rgi_sp = None
         self._cv_rgi_sp = None
         self._alpha_rgi_sp = None
-        if "cp_grid" in data.files:
+        if "cp_grid_sp" in data.files:
             cp_grid = self._match_grid_shape(
-                np.asarray(data["cp_grid"], dtype=float),
+                np.asarray(data["cp_grid_sp"], dtype=float),
                 nx=self.S_vals_sp.size,
                 ny=self.P_vals_sp.size,
-                name="cp_grid",
+                name="cp_grid_sp",
             )
             self._cp_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), cp_grid, **rgi_kwargs)
-        if "cv_grid" in data.files:
+        if "cv_grid_sp" in data.files:
             cv_grid = self._match_grid_shape(
-                np.asarray(data["cv_grid"], dtype=float),
+                np.asarray(data["cv_grid_sp"], dtype=float),
                 nx=self.S_vals_sp.size,
                 ny=self.P_vals_sp.size,
-                name="cv_grid",
+                name="cv_grid_sp",
             )
             self._cv_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), cv_grid, **rgi_kwargs)
-        if "alpha_grid" in data.files:
+        if "alpha_grid_sp" in data.files:
             alpha_grid = self._match_grid_shape(
-                np.asarray(data["alpha_grid"], dtype=float),
+                np.asarray(data["alpha_grid_sp"], dtype=float),
                 nx=self.S_vals_sp.size,
                 ny=self.P_vals_sp.size,
-                name="alpha_grid",
+                name="alpha_grid_sp",
             )
             self._alpha_rgi_sp = RGI((self.S_vals_sp, self.P_vals_sp), alpha_grid, **rgi_kwargs)
 
@@ -599,26 +613,26 @@ class MG2SIO4_ANEOS_EOS:
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table:
-            s_MJkgK = self.get_s_pt_tab(P_arr, T_arr)
-            s_cgs = s_MJkgK * self.MJkgK_to_erggK
-            return float(s_cgs) if np.isscalar(P) and np.isscalar(T) else s_cgs
+            s_cgs = self.get_s_pt_tab(P_arr, T_arr)
+            #s_cgs = s_MJkgK * self.MJkgK_to_erggK
+            #return float(s_cgs) if np.isscalar(P) and np.isscalar(T) else s_cgs
+            return s_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
-        s_MJkgK = self.get_s_rhot_tab(np.asarray(rho, dtype=float), T_arr)
-        s_cgs = s_MJkgK * self.MJkgK_to_erggK
+        #s_MJkgK = self.get_s_rhot_tab(np.asarray(rho, dtype=float), T_arr)
+        s_cgs = self.get_s_rhot(np.asarray(rho, dtype=float), T_arr)
         return float(s_cgs) if np.isscalar(P) and np.isscalar(T) else s_cgs
 
     def get_u_pt(self, P, T, tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table:
-            u_MJkg = self.get_u_pt_tab(P_arr, T_arr)
-            u_cgs = u_MJkg * self.MJkg_to_ergg
+            u_cgs = self.get_u_pt(P_arr, T_arr)
             return float(u_cgs) if np.isscalar(P) and np.isscalar(T) else u_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
-        u_MJkg = self.get_u_rhot_tab(np.asarray(rho, dtype=float), T_arr)
-        u_cgs = u_MJkg * self.MJkg_to_ergg
+        #u_MJkg = self.get_u_rhot_tab(np.asarray(rho, dtype=float), T_arr)
+        u_cgs = self.get_u_rhot(np.asarray(rho, dtype=float), T_arr)
         return float(u_cgs) if np.isscalar(P) and np.isscalar(T) else u_cgs
 
     # ---------- derived PT properties ----------
@@ -638,8 +652,8 @@ class MG2SIO4_ANEOS_EOS:
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table and self._cp_rgi_pt is not None:
-            cp_MJkgK = self._cp_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
-            cp_cgs = cp_MJkgK * self.MJkgK_to_erggK
+            #cp_MJkgK = self._cp_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+            cp_cgs = self._cp_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
             return float(cp_cgs) if np.isscalar(P) and np.isscalar(T) else cp_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
@@ -650,8 +664,8 @@ class MG2SIO4_ANEOS_EOS:
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table and self._cv_rgi_pt is not None:
-            cv_MJkgK = self._cv_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
-            cv_cgs = cv_MJkgK * self.MJkgK_to_erggK
+            #cv_MJkgK = self._cv_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
+            cv_cgs = self._cv_rgi_pt(np.column_stack((P_arr.ravel(), T_arr.ravel()))).reshape(P_arr.shape)
             return float(cv_cgs) if np.isscalar(P) and np.isscalar(T) else cv_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
@@ -1123,38 +1137,35 @@ class MG2SIO4_ANEOS_EOS:
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table:
-            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
-            vals = self._interp(self._rho_rgi_sp, S_tab, P_arr)
+            vals = self._interp(self._rho_rgi_sp, S_arr, P_arr)
             return float(vals) if scalar else vals
 
-        rho, _ = self.get_rhot_sp_inv(S_arr, P_arr, s_units=s_units, **inv_kwargs)
+        rho, _ = self.get_rhot_sp_2d_inv(S_arr, P_arr, s_units=s_units, **inv_kwargs)
         return float(rho) if scalar else rho
 
     def get_t_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table:
-            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
-            vals = self._interp(self._t_rgi_sp, S_tab, P_arr)
+            vals = self._interp(self._t_rgi_sp, S_arr, P_arr)
             return float(vals) if scalar else vals
 
         if "s_units" not in inv_kwargs:
             inv_kwargs["s_units"] = s_units
-        T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
+        _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         return float(T) if scalar else T
 
     def get_u_sp(self, S, P, tab=True, s_units="kbbar", **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table:
-            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
-            vals_MJkg = self._interp(self._u_rgi_sp, S_tab, P_arr)
+            vals_MJkg = self._interp(self._u_rgi_sp, S_arr, P_arr)
             vals_cgs = vals_MJkg * self.MJkg_to_ergg
             return float(vals_cgs) if scalar else vals_cgs
 
         if "s_units" not in inv_kwargs:
             inv_kwargs["s_units"] = s_units
-        T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
+        _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_u_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
 
@@ -1162,14 +1173,14 @@ class MG2SIO4_ANEOS_EOS:
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table and self._cp_rgi_sp is not None:
-            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
-            vals_MJkgK = self._interp(self._cp_rgi_sp, S_tab, P_arr)
+            #S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals_MJkgK = self._interp(self._cp_rgi_sp, S_arr, P_arr)
             vals_cgs = vals_MJkgK * self.MJkgK_to_erggK
             return float(vals_cgs) if scalar else vals_cgs
 
         if "s_units" not in inv_kwargs:
             inv_kwargs["s_units"] = s_units
-        T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
+        _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_cp_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
 
@@ -1177,14 +1188,14 @@ class MG2SIO4_ANEOS_EOS:
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table and self._cv_rgi_sp is not None:
-            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
-            vals_MJkgK = self._interp(self._cv_rgi_sp, S_tab, P_arr)
+            #S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals_MJkgK = self._interp(self._cv_rgi_sp, S_arr, P_arr)
             vals_cgs = vals_MJkgK * self.MJkgK_to_erggK
             return float(vals_cgs) if scalar else vals_cgs
 
         if "s_units" not in inv_kwargs:
             inv_kwargs["s_units"] = s_units
-        T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
+        _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_cv_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
 
@@ -1192,12 +1203,12 @@ class MG2SIO4_ANEOS_EOS:
         scalar, S_arr, P_arr = self._broadcast(S, P)
 
         if tab and self._has_sp_table and self._alpha_rgi_sp is not None:
-            S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
-            vals = self._interp(self._alpha_rgi_sp, S_tab, P_arr)
+            #S_tab = self._entropy_to_sp_table(S_arr, s_units=s_units)
+            vals = self._interp(self._alpha_rgi_sp, S_arr, P_arr)
             return float(vals) if scalar else vals
 
         if "s_units" not in inv_kwargs:
             inv_kwargs["s_units"] = s_units
-        T = self.get_t_sp_inv(S_arr, P_arr, **inv_kwargs)
+        _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_alpha_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
