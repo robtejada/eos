@@ -12,17 +12,28 @@ Current status:
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Union
 
 import os
 import warnings
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator as RGI
-from scipy.optimize import root_scalar
+from scipy.optimize import newton, brentq, least_squares
+from typing import Dict, Optional, Tuple, Union
 
 from astropy.constants import k_B
 from astropy.constants import u as amu
 from astropy import units as u
 
+ArrayLike = Union[float, int, np.ndarray]
+
+@dataclass
+class Domain:
+    rho_min: float
+    rho_max: float
+    T_min: float
+    T_max: float
 
 class MG2SIO4_ANEOS_EOS:
     """
@@ -586,6 +597,226 @@ class MG2SIO4_ANEOS_EOS:
         return Tout
 
     # ---------- SP getters ----------
+
+    def get_rhot_sp_2d_inv(
+        self,
+        s_target,
+        P_target,
+        *,
+        s_units: str = "kbbar",          # "kbbar" (kB/baryon), "cgs" (erg/g/K), or "SI" (J/mol/K)
+        guess="auto",                    # "auto" or (rho_guess, T_guess) in (g/cm^3, K)
+        T_guess0: float = None,
+        bounds_rho: Optional[Tuple[float, float]] = None,   # (g/cm^3, g/cm^3)
+        bounds_T:   Optional[Tuple[float, float]] = None,   # (K, K)
+        xtol: float = 1e-10,
+        ftol: float = 1e-10,
+        gtol: float = 1e-10,
+        max_nfev: int = 200,
+        fail_value=np.nan,
+        return_diagnostics: bool = False,
+    ):
+        """
+        Coupled 2-D inversion using the native (T, rho) basis:
+            P(rho, T) = P_target   [GPa]
+            S(rho, T) = s_target   [units set by s_units]
+
+        Warm-start behavior for array inputs:
+        - First element uses `guess` (or "auto")
+        - Each subsequent element uses the previous converged (rho, T) as the initial guess
+
+        Parameters
+        ----------
+        s_target, P_target : float or array-like
+            Target entropy and pressure.
+        s_units : {"kbbar","cgs","SI"}
+            - "kbbar": k_B/baryon (your code's common external entropy unit)
+            - "cgs"  : erg/g/K
+            - "SI"   : J/mol/K  (native units returned by get_s_rhot)
+        guess : "auto" or tuple
+            If tuple, interpreted as (rho_guess[g/cm^3], T_guess[K]).
+            If "auto", try SP tables for a seed, then fallback to rho(P,Tseed).
+        T_guess0 : float, optional
+            Seed temperature used for fallback auto-guess if SP-table seed fails.
+        bounds_rho, bounds_T : optional
+            Bounds for rho and T. Defaults to your table domains with a small cushion.
+
+        Returns
+        -------
+        rho_sol, T_sol : ndarray
+            Broadcasted to the shape of inputs.
+        diagnostics : dict (optional)
+            Only if return_diagnostics=True.
+        """
+
+        # ---------------- broadcast inputs ----------------
+        s_arr = np.asarray(s_target, dtype=float)
+        P_arr = np.asarray(P_target, dtype=float)
+        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+        shape = s_arr.shape
+
+        # ---------------- convert entropy target -> SI (J/mol/K) ----------------
+        su = str(s_units).lower()
+        if su in ("kbbar", "kb/baryon", "kbperbaryon"):
+            # kbbar -> cgs (erg/g/K) via erg_to_kbbar, then -> SI (J/mol/K) via S_conv_cgs
+            s_SI = s_arr / (self.erg_to_kbbar * self.S_conv_cgs)
+        elif su in ("cgs", "erg/g/k", "erg/g/kelvin"):
+            s_SI = s_arr / self.S_conv_cgs
+        elif su in ("si", "j/mol/k", "jmolk"):
+            s_SI = s_arr
+        else:
+            raise ValueError("s_units must be one of {'kbbar','cgs','SI'}")
+
+        # ---------------- default bounds ----------------
+        if bounds_rho is None:
+            # stay near your native rho grid; give a little headroom for extrap
+            rho_lo = max(1e-12, float(self.domain.rho_min) - 0.05 * abs(self.domain.rho_min))
+            rho_hi = float(self.domain.rho_max) + 0.05 * abs(self.domain.rho_max)
+            bounds_rho = (rho_lo, rho_hi)
+        if bounds_T is None:
+            T_lo = max(1e-12, float(self.domain.T_min) - 0.05 * abs(self.domain.T_min))
+            T_hi = float(self.domain.T_max) + 0.05 * abs(self.domain.T_max)
+            bounds_T = (T_lo, T_hi)
+
+        rho_lo, rho_hi = map(float, bounds_rho)
+        T_lo,   T_hi   = map(float, bounds_T)
+        if rho_lo <= 0 or T_lo <= 0:
+            raise ValueError("bounds_rho and bounds_T must be > 0 on the low end.")
+
+        # log-space bounds (ensures positivity)
+        lb = np.array([np.log(rho_lo), np.log(T_lo)], dtype=float)
+        ub = np.array([np.log(rho_hi), np.log(T_hi)], dtype=float)
+
+        rho_out = np.full(shape, fail_value, dtype=float)
+        T_out   = np.full(shape, fail_value, dtype=float)
+
+        info = None
+        if return_diagnostics:
+            info = {
+                "success": np.zeros(shape, dtype=bool),
+                "cost": np.full(shape, np.nan),
+                "nfev": np.full(shape, np.nan),
+                "resid_P_frac": np.full(shape, np.nan),
+                "resid_S_frac": np.full(shape, np.nan),
+                "message": np.empty(shape, dtype=object),
+            }
+
+        # ---------------- choose initial seed for the first element ----------------
+        if guess == "auto":
+            # First try to seed from your SP tables (fast + usually very close)
+            rho_guess_cur = None
+            T_guess_cur   = None
+
+            # fallback temperature seed
+            Tseed = float(0.5 * (T_lo + T_hi) if T_guess0 is None else T_guess0)
+            Tseed = min(max(Tseed, T_lo), T_hi)
+
+        else:
+            rho_seed, T_seed = map(float, guess)
+            rho_guess_cur = min(max(rho_seed, rho_lo), rho_hi)
+            T_guess_cur   = min(max(T_seed,   T_lo),   T_hi)
+            Tseed = None  # unused
+
+        # ---------------- iterate with warm-start continuation ----------------
+        for idx in np.ndindex(shape):
+            Pt = float(P_arr[idx])
+            St = float(s_SI[idx])
+
+            if not (np.isfinite(Pt) and np.isfinite(St)) or Pt <= 0:
+                if return_diagnostics:
+                    info["message"][idx] = "Invalid target (non-finite or P<=0)."
+                continue
+
+            # AUTO guess logic for the *first* unsolved element (and also if previous was None)
+            if guess == "auto" and (rho_guess_cur is None or T_guess_cur is None):
+                seeded = False
+
+                # 1) Seed from SP tables if possible (does NOT evaluate residuals from SP tables;
+                #    it’s only used as an initial guess)
+                try:
+                    # get_t_sp_tab expects S in J/mol/K
+                    T_try = float(self.get_t_sp_tab(St, Pt))
+                    rho_try = float(self.get_rho_sp_tab(St, Pt))
+                    if np.isfinite(T_try) and np.isfinite(rho_try) and (T_try > 0) and (rho_try > 0):
+                        rho_guess_cur = rho_try
+                        T_guess_cur   = T_try
+                        seeded = True
+                except Exception:
+                    seeded = False
+
+                # 2) Fallback: seed rho from P at a chosen Tseed, keep T=Tseed
+                if not seeded:
+                    try:
+                        rho_guess_cur = float(self.get_rho_pt_inv(Pt, Tseed))
+                    except Exception:
+                        rho_guess_cur = 0.5 * (rho_lo + rho_hi)
+                    T_guess_cur = Tseed
+
+            # Clamp guesses
+            rho_guess_cur = min(max(float(rho_guess_cur), rho_lo), rho_hi)
+            T_guess_cur   = min(max(float(T_guess_cur),   T_lo),   T_hi)
+
+            x0 = np.array([np.log(rho_guess_cur), np.log(T_guess_cur)], dtype=float)
+
+            # Scaling to keep equations comparable
+            P_scale = max(abs(Pt), 1e-12)   # GPa
+            S_scale = max(abs(St), 1e-12)   # J/mol/K
+
+            def residuals(x):
+                rho = float(np.exp(x[0]))
+                T   = float(np.exp(x[1]))
+
+                Pm = float(self.get_p_rhot(rho, T))   # GPa
+                Sm = float(self.get_s_rhot(rho, T))   # J/mol/K (native)
+
+                if not (np.isfinite(Pm) and np.isfinite(Sm)):
+                    return np.array([1e30, 1e30], dtype=float)
+
+                return np.array([(Pm - Pt) / P_scale, (Sm - St) / S_scale], dtype=float)
+
+            try:
+                sol = least_squares(
+                    residuals,
+                    x0,
+                    bounds=(lb, ub),
+                    xtol=xtol,
+                    ftol=ftol,
+                    gtol=gtol,
+                    max_nfev=max_nfev,
+                    method="trf",
+                )
+
+                if sol.success and np.all(np.isfinite(sol.x)):
+                    rho_sol = float(np.exp(sol.x[0]))
+                    T_sol   = float(np.exp(sol.x[1]))
+
+                    rho_out[idx] = rho_sol
+                    T_out[idx]   = T_sol
+
+                    # Warm-start continuation: update guesses ONLY on success
+                    rho_guess_cur = rho_sol
+                    T_guess_cur   = T_sol
+
+                    if return_diagnostics:
+                        info["success"][idx] = True
+                        info["cost"][idx] = sol.cost
+                        info["nfev"][idx] = sol.nfev
+
+                        r = residuals(sol.x)
+                        info["resid_P_frac"][idx] = abs(r[0])
+                        info["resid_S_frac"][idx] = abs(r[1])
+                        info["message"][idx] = sol.message
+                else:
+                    if return_diagnostics:
+                        info["message"][idx] = getattr(sol, "message", "least_squares failed")
+                    # keep last good guess
+            except Exception as e:
+                if return_diagnostics:
+                    info["message"][idx] = f"Exception: {e}"
+                # keep last good guess
+
+        if return_diagnostics:
+            return rho_out, T_out, info
+        return rho_out, T_out
 
     def get_rhot_sp_inv(self, S, P, **inv_kwargs):
         T = self.get_t_sp_inv(S, P, **inv_kwargs)
