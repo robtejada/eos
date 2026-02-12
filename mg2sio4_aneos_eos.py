@@ -70,6 +70,7 @@ class MG2SIO4_ANEOS_EOS:
         # ------------------------------------------------------------------
         pt_table_path: str = "eos/rock_eos/mg2sio4_aneos_PT.npz",
         sp_table_path: str = "eos/rock_eos/mg2sio4_aneos_SP.npz",
+        melt_transition_width_K: float = 50.0,
     ):
         # Unit conversions
         self.erg_to_kbbar = float((u.erg / u.Kelvin / u.gram).to(k_B / amu))
@@ -81,6 +82,9 @@ class MG2SIO4_ANEOS_EOS:
         self.dyn_to_Pa = (u.dyn / u.cm**2).to("Pa")
         self.dyn_to_GPa = (u.dyn / u.cm**2).to("GPa")
         self.GPa_to_dyncm2 = u.GPa.to("dyn/cm^2")
+        self.melt_transition_width_K = float(melt_transition_width_K)
+        if self.melt_transition_width_K <= 0.0:
+            raise ValueError("melt_transition_width_K must be > 0.")
 
         # Always-available rho-T ANEOS backend
 
@@ -481,12 +485,35 @@ class MG2SIO4_ANEOS_EOS:
 
         return float(cp) if np.isscalar(rho) and np.isscalar(T) else cp
 
-    # ---------- no phase-transition-specific hooks (compatibility only) ----------
+    # ---------- melt-curve hooks ----------
+
+    def _melt_fraction_PT(self, P_arr, T_arr):
+        """
+        Smooth melt-fraction proxy in [0, 1] across Tm(P):
+            x_melt = 0.5 * [1 + tanh((T - Tm)/dT)]
+        with dT = 50 K by default.
+        """
+        Tm = self.get_T_melt(P_arr)
+        arg = (T_arr - Tm) / self.melt_transition_width_K
+        x_melt = 0.5 * (1.0 + np.tanh(arg))
+        return np.clip(x_melt, 0.0, 1.0)
+
+    def _get_rho_pt_safe(self, P_arr, T_arr):
+        # Prefer PT table if loaded, otherwise always fall back to inversion.
+        use_tab = bool(getattr(self, "_has_pt_table", False) and hasattr(self, "_rho_rgi_pt"))
+        return self.get_rho_pt(P_arr, T_arr, tab=use_tab)
 
     def get_T_melt(self, P):
-        P_arr = np.array(P, ndmin=1, dtype=float)
-        out = np.full_like(P_arr, np.nan, dtype=float)
-        return float(out[0]) if np.isscalar(P) else out
+        """
+        Forsterite melt curve from Presnall & Walter (1993), Eq. (12):
+            P(GPa) = 2.44 * ((T/2171 K)^11.4 - 1)
+        Rearranged to T(P):
+            Tm(P) = 2171 K * (1 + P/2.44 GPa)^(1/11.4)
+        """
+        P_arr = np.asarray(P, dtype=float)
+        base = np.maximum(1.0 + P_arr / 2.44, 1e-12)
+        Tm = 2171.0 * np.power(base, 1.0 / 11.4)
+        return float(Tm) if np.isscalar(P) else Tm
 
     def get_S_liq_at_melt(self, P):
         P_arr = np.array(P, ndmin=1, dtype=float)
@@ -672,10 +699,41 @@ class MG2SIO4_ANEOS_EOS:
         cv = self.get_cv_rhot(rho, T_arr)
         return float(cv) if np.isscalar(P) and np.isscalar(T) else cv
 
-    def get_alpha_x(self, P, T, rho, x):
-        P_arr, T_arr = self._as_arrays(P, T)
-        out = np.zeros_like(P_arr, dtype=float)
-        return float(out) if np.isscalar(P) and np.isscalar(T) else out
+    def get_alpha_x(self, P, T, rho, x, eps_rel=1e-3, dx_floor=1e-6, x_floor=1e-4):
+        """
+        Numerical constant-pressure derivative:
+            alpha_x = -(1/rho) * (d rho / d x)|_P
+        with centered finite differences in temperature:
+            (d rho / d x)|_P ~= [rho(P,T+dT)-rho(P,T-dT)] / [x(P,T+dT)-x(P,T-dT)].
+        """
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        _ = x  # kept for API compatibility
+
+        T_arr = np.asarray(T_arr, dtype=float)
+        dT = np.maximum(np.abs(T_arr) * float(eps_rel), 1e-3)
+        T_hi = np.minimum(T_arr + dT, float(self.domain.T_max))
+        T_lo = np.maximum(T_arr - dT, float(self.domain.T_min))
+
+        rho_arr = np.asarray(rho, dtype=float)
+        rho_arr, _ = np.broadcast_arrays(rho_arr, P_arr)
+        rho_safe = np.maximum(np.asarray(rho_arr, dtype=float), 1e-30)
+
+        rho_hi = np.asarray(self._get_rho_pt_safe(P_arr, T_hi), dtype=float)
+        rho_lo = np.asarray(self._get_rho_pt_safe(P_arr, T_lo), dtype=float)
+        x_hi = self._melt_fraction_PT(P_arr, T_hi)
+        x_lo = self._melt_fraction_PT(P_arr, T_lo)
+
+        drho = rho_hi - rho_lo
+        dx = x_hi - x_lo
+        drho_dx = np.zeros_like(drho, dtype=float)
+        x_mid = self._melt_fraction_PT(P_arr, T_arr)
+        in_transition = (x_mid > float(x_floor)) & (x_mid < (1.0 - float(x_floor)))
+        valid = np.isfinite(drho) & np.isfinite(dx) & (np.abs(dx) > float(dx_floor)) & in_transition
+        drho_dx[valid] = drho[valid] / dx[valid]
+
+        alpha_x = -(1.0 / rho_safe) * drho_dx
+        alpha_x = np.where(np.isfinite(alpha_x), alpha_x, 0.0)
+        return float(np.asarray(alpha_x).reshape(-1)[0]) if scalar else alpha_x
 
     # ---------- SP inversion ----------
 
