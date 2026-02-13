@@ -647,7 +647,7 @@ class MG2SIO4_ANEOS_EOS:
         P_arr, T_arr = self._as_arrays(P, T)
 
         if tab and self._has_pt_table:
-            u_cgs = self.get_u_pt(P_arr, T_arr)
+            u_cgs = self.get_u_pt_tab(P_arr, T_arr)
             return float(u_cgs) if np.isscalar(P) and np.isscalar(T) else u_cgs
 
         rho = self.get_rho_pt(P_arr, T_arr, tab=False)
@@ -692,40 +692,60 @@ class MG2SIO4_ANEOS_EOS:
         cv = self.get_cv_rhot(rho, T_arr)
         return float(cv) if np.isscalar(P) and np.isscalar(T) else cv
 
-    def get_alpha_x(self, P, T, rho, eps_rel=1e-3, dx_floor=1e-6, x_floor=1e-4):
+    def get_alpha_x(self, P, T, rho, eps_rel=1e-3, dx_floor=1e-6, x_floor=1e-4, dT_melt=None):
         """
-        Numerical constant-pressure derivative:
-            alpha_x = -(1/rho) * (d rho / d x)|_P
-        with centered finite differences in temperature:
-            (d rho / d x)|_P ~= [rho(P,T+dT)-rho(P,T-dT)] / [x(P,T+dT)-x(P,T-dT)].
+        Effective compositional expansivity-like coefficient for melt fraction:
+            alpha_x = rho * (1/rho_melt - 1/rho_solid)
+
+        For Mg2SiO4 ANEOS we do not have separate solid/liquid EOS objects, so
+        we estimate phase-endpoint densities using two PT states around the melt
+        curve at fixed pressure:
+            rho_solid ~ rho(P, Tm(P) - dT)
+            rho_melt  ~ rho(P, Tm(P) + dT)
+
+        This avoids the unstable division by dx/dT when x_melt saturates at 0 or 1.
         """
+        del dx_floor, x_floor  # retained only for backward-compatible call signatures
         scalar, P_arr, T_arr = self._broadcast(P, T)
 
-        T_arr = np.asarray(T_arr, dtype=float)
-        dT = np.maximum(np.abs(T_arr) * float(eps_rel), 1e-3)
-        T_hi = np.minimum(T_arr + dT, float(self.domain.T_max))
-        T_lo = np.maximum(T_arr - dT, float(self.domain.T_min))
-
         rho_arr = np.asarray(rho, dtype=float)
-        rho_arr, _ = np.broadcast_arrays(rho_arr, P_arr)
-        rho_safe = np.maximum(np.asarray(rho_arr, dtype=float), 1e-30)
+        if rho_arr.shape != P_arr.shape:
+            rho_arr = np.broadcast_to(rho_arr, P_arr.shape)
 
-        rho_hi = np.asarray(self._get_rho_pt_safe(P_arr, T_hi), dtype=float)
-        rho_lo = np.asarray(self._get_rho_pt_safe(P_arr, T_lo), dtype=float)
-        x_hi = self._melt_fraction_PT(P_arr, T_hi)
-        x_lo = self._melt_fraction_PT(P_arr, T_lo)
+        Tm = np.asarray(self.get_T_melt(P_arr), dtype=float)
 
-        drho = rho_hi - rho_lo
-        dx = x_hi - x_lo
-        drho_dx = np.zeros_like(drho, dtype=float)
-        x_mid = self._melt_fraction_PT(P_arr, T_arr)
-        in_transition = (x_mid > float(x_floor)) & (x_mid < (1.0 - float(x_floor)))
-        valid = np.isfinite(drho) & np.isfinite(dx) & (np.abs(dx) > float(dx_floor)) & in_transition
-        drho_dx[valid] = drho[valid] / dx[valid]
+        if dT_melt is None:
+            # Physically motivated default probe width: latent-heat temperature scale.
+            cp_tm = np.asarray(self.get_cp_pt(P_arr, np.clip(Tm, self.domain.T_min, self.domain.T_max), tab=False), dtype=float)
+            dT = self.L / np.maximum(cp_tm, 1e-30)
+            dT = np.clip(
+                dT,
+                2.0 * self.melt_transition_width_K,
+                3000.0,
+            )
+            dT = np.maximum(dT, eps_rel * np.maximum(Tm, 1.0))
+        else:
+            dT = np.asarray(dT_melt, dtype=float)
+            if dT.shape == ():
+                dT = np.full(P_arr.shape, float(dT), dtype=float)
+            elif dT.shape != P_arr.shape:
+                dT = np.broadcast_to(dT, P_arr.shape)
+            dT = np.maximum(dT, 1.0)
 
-        alpha_x = -(1.0 / rho_safe) * drho_dx
-        alpha_x = np.where(np.isfinite(alpha_x), alpha_x, 0.0)
-        return float(np.asarray(alpha_x).reshape(-1)[0]) if scalar else alpha_x
+        Tmin = float(self.domain.T_min)
+        Tmax = float(self.domain.T_max)
+        T_solid = np.clip(Tm - dT, Tmin, Tmax)
+        T_melt = np.clip(Tm + dT, Tmin, Tmax)
+
+        rho_solid = self._get_rho_pt_safe(P_arr, T_solid)
+        rho_melt = self._get_rho_pt_safe(P_arr, T_melt)
+
+        alpha_x = rho_arr * (
+            1.0 / np.maximum(np.asarray(rho_melt, dtype=float), 1e-99)
+            - 1.0 / np.maximum(np.asarray(rho_solid, dtype=float), 1e-99)
+        )
+
+        return alpha_x if not scalar else float(alpha_x)
 
     # ---------- SP inversion ----------
 
