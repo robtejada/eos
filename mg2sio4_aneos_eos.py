@@ -716,7 +716,7 @@ class MG2SIO4_ANEOS_EOS:
 
         if dT_melt is None:
             # Physically motivated default probe width: latent-heat temperature scale.
-            cp_tm = np.asarray(self.get_cp_pt(P_arr, np.clip(Tm, self.domain.T_min, self.domain.T_max), tab=False), dtype=float)
+            cp_tm = np.asarray(self.get_cp_pt(P_arr, np.clip(Tm, self.domain.T_min, self.domain.T_max), tab=True), dtype=float)
             dT = self.L / np.maximum(cp_tm, 1e-30)
             dT = np.clip(
                 dT,
