@@ -26,9 +26,9 @@ class GonzalezRectGridBuilder:
     """
     Build a rectangular (P, T) grid from irregular EOS samples.
 
-    Two-step construction (both linear with extrapolation):
-      1) For each unique table T, interpolate property vs P onto regular P axis.
-      2) For each regular P, interpolate property vs T onto regular T axis.
+    Two-step construction (both linear in log10-space with extrapolation):
+      1) For each unique table T, interpolate property vs log10(P) onto regular log10(P) axis.
+      2) For each regular log10(P), interpolate property vs log10(T) onto regular log10(T) axis.
     """
 
     def __init__(
@@ -48,6 +48,8 @@ class GonzalezRectGridBuilder:
 
         if self.P_raw.size == 0 or self.T_raw.size == 0:
             raise ValueError("Empty raw P/T arrays.")
+        if np.any(self.P_raw <= 0) or np.any(self.T_raw <= 0):
+            raise ValueError("Raw P and T values must be strictly positive for log10 interpolation.")
 
         if not all(v.size == self.P_raw.size for v in self.fields.values()):
             raise ValueError("All field arrays must have same length as P_raw/T_raw.")
@@ -86,9 +88,12 @@ class GonzalezRectGridBuilder:
         if self.n_P < 2 or self.n_T < 2:
             raise ValueError("n_P and n_T must be >= 2.")
 
-        self.P_axis = np.linspace(P_lo, P_hi, self.n_P)
-        self.T_axis = np.linspace(T_lo, T_hi, self.n_T)
+        self.logP_axis = np.linspace(np.log10(P_lo), np.log10(P_hi), self.n_P)
+        self.logT_axis = np.linspace(np.log10(T_lo), np.log10(T_hi), self.n_T)
+        self.P_axis = np.power(10.0, self.logP_axis)
+        self.T_axis = np.power(10.0, self.logT_axis)
         self.T_unique = np.array(sorted(np.unique(self.T_raw)), dtype=float)
+        self.logT_unique = np.log10(self.T_unique)
 
     @staticmethod
     def _dedupe_sorted_xy(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -125,25 +130,31 @@ class GonzalezRectGridBuilder:
         return np.asarray(f(x_new), dtype=float)
 
     def _build_one_field(self, vals_raw: np.ndarray) -> np.ndarray:
-        # Step 1: for each table T, interpolate/extrapolate along P onto regular P axis
+        # Step 1: for each table T, interpolate/extrapolate along log10(P) onto regular log10(P) axis
         vals_P_on_Traw = np.empty((self.T_unique.size, self.n_P), dtype=float)
 
         for i, T0 in enumerate(self.T_unique):
             mask = self.T_raw == T0
             P_slice = self.P_raw[mask]
             v_slice = vals_raw[mask]
-            vals_P_on_Traw[i, :] = self._interp1d_linear_extrap(P_slice, v_slice, self.P_axis)
+            vals_P_on_Traw[i, :] = self._interp1d_linear_extrap(
+                np.log10(P_slice),
+                v_slice,
+                self.logP_axis,
+            )
 
-        # Step 2: for each regular P, interpolate/extrapolate along T onto regular T axis
+        # Step 2: for each regular log10(P), interpolate/extrapolate along log10(T) onto regular log10(T) axis
         grid_pt = np.empty((self.n_P, self.n_T), dtype=float)
         for j in range(self.n_P):
             v_Tslice = vals_P_on_Traw[:, j]
-            grid_pt[j, :] = self._interp1d_linear_extrap(self.T_unique, v_Tslice, self.T_axis)
+            grid_pt[j, :] = self._interp1d_linear_extrap(self.logT_unique, v_Tslice, self.logT_axis)
 
         return grid_pt
 
     def build(self) -> Dict[str, np.ndarray]:
         out = {
+            "logP_axis": self.logP_axis.copy(),
+            "logT_axis": self.logT_axis.copy(),
             "P_axis": self.P_axis.copy(),
             "T_axis": self.T_axis.copy(),
         }
@@ -157,12 +168,13 @@ class GonzalezRectGridBuilder:
 class GonzalezRegularGridSurface:
     """
     RegularGridInterpolator wrapper for a single thermodynamic surface.
-    Uses linear interpolation and linear extrapolation (fill_value=None).
+    Uses linear interpolation and linear extrapolation (fill_value=None)
+    in log10(P), log10(T) coordinates.
     """
 
-    def __init__(self, P_axis: np.ndarray, T_axis: np.ndarray, grid_pt: np.ndarray) -> None:
+    def __init__(self, logP_axis: np.ndarray, logT_axis: np.ndarray, grid_pt: np.ndarray) -> None:
         self._rgi = RegularGridInterpolator(
-            (np.asarray(P_axis, dtype=float), np.asarray(T_axis, dtype=float)),
+            (np.asarray(logP_axis, dtype=float), np.asarray(logT_axis, dtype=float)),
             np.asarray(grid_pt, dtype=float),
             method="linear",
             bounds_error=False,
@@ -173,9 +185,13 @@ class GonzalezRegularGridSurface:
         P_arr = np.asarray(P, dtype=float)
         T_arr = np.asarray(T, dtype=float)
         P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
-        pts = np.column_stack((P_arr.ravel(), T_arr.ravel()))
-        vals = np.asarray(self._rgi(pts), dtype=float).reshape(P_arr.shape)
-        return vals
+        out = np.full(P_arr.shape, np.nan, dtype=float)
+
+        good = np.isfinite(P_arr) & np.isfinite(T_arr) & (P_arr > 0.0) & (T_arr > 0.0)
+        if np.any(good):
+            pts = np.column_stack((np.log10(P_arr[good]), np.log10(T_arr[good])))
+            out[good] = np.asarray(self._rgi(pts), dtype=float)
+        return out
 
 
 class Fe_EOS:
@@ -186,6 +202,12 @@ class Fe_EOS:
       rho(P, T), S(P, T), U(P, T), G(P, T)
 
     RHOT quantities (e.g., P(rho,T), S(rho,T)) are obtained through inversion/wrappers.
+
+    Reference-state handling:
+      S and U outputs are shifted by constant phase-dependent offsets to avoid negative values.
+      G is shifted thermodynamically consistently as:
+        G_shifted = G_raw + dU - T*dS + dG0
+      where dG0 is an additional constant reference shift (independent of P,T).
 
     Units:
       Inputs:
@@ -226,16 +248,17 @@ class Fe_EOS:
 
     def __init__(
         self,
-        phase: str = "solid",
+        phase: str = "liquid",
         data_dir: Optional[Union[str, Path]] = None,
-        diff_rel_T: float = 5e-2,
-        diff_abs_T: float = 100.0,
-        diff_rel_P: float = 1e-2,
-        diff_abs_P: float = 1e9,
+        diff_rel_T: float = 1e-1,
+        diff_abs_T: float = 50.0,
+        diff_rel_P: float = 1e-1,
+        diff_abs_P: float = 1e8,
         grid_n_P: Optional[int] = None,
         grid_n_T: Optional[int] = None,
         grid_P_bounds: Optional[Tuple[float, float]] = None,
         grid_T_bounds: Optional[Tuple[float, float]] = None,
+        apply_reference_offsets: bool = False,
     ) -> None:
         """
         Parameters
@@ -246,6 +269,9 @@ class Fe_EOS:
             Number of regular P/T samples for the rectangularized EOS grid.
         grid_P_bounds, grid_T_bounds : tuple, optional
             Explicit (min, max) bounds for the regularized grid axes.
+        apply_reference_offsets : bool, optional
+            If True, apply constant reference shifts to S/U (and consistent T-dependent
+            shift to G). If False, return raw table-interpolated values.
         """
         self.phase = str(phase).lower()
         if self.phase not in self._PHASE_FILES:
@@ -255,6 +281,7 @@ class Fe_EOS:
         self.diff_abs_T = float(diff_abs_T)
         self.diff_rel_P = float(diff_rel_P)
         self.diff_abs_P = float(diff_abs_P)
+        self.apply_reference_offsets = bool(apply_reference_offsets)
 
         self._data_dir = self._resolve_data_dir(data_dir)
         self._file_path = self._data_dir / self._PHASE_FILES[self.phase]
@@ -291,12 +318,39 @@ class Fe_EOS:
         )
         rect = rect_builder.build()
 
+        self.logP_vals_rect = np.asarray(rect["logP_axis"], dtype=float)
+        self.logT_vals_rect = np.asarray(rect["logT_axis"], dtype=float)
         self.P_vals_rect = np.asarray(rect["P_axis"], dtype=float)
         self.T_vals_rect = np.asarray(rect["T_axis"], dtype=float)
         self.rho_grid_rect = np.asarray(rect["rho"], dtype=float)
         self.S_grid_rect_si = np.asarray(rect["S"], dtype=float)
         self.U_grid_rect_si = np.asarray(rect["U"], dtype=float)
         self.G_grid_rect_si = np.asarray(rect["G"], dtype=float)
+
+        # Phase-wise reference offsets (SI units) chosen to avoid negative S/U/G
+        # on the rectangular PT grid while preserving thermodynamic derivatives.
+        if self.apply_reference_offsets:
+            self.S_offset_si = max(0.0, -float(np.nanmin(self.S_grid_rect_si)))
+            self.U_offset_si = max(0.0, -float(np.nanmin(self.U_grid_rect_si)))
+            G_shift_consistent = self.G_grid_rect_si + self.U_offset_si - self.T_vals_rect[None, :] * self.S_offset_si
+            self.G_offset_si = max(0.0, -float(np.nanmin(G_shift_consistent)))
+        else:
+            self.S_offset_si = 0.0
+            self.U_offset_si = 0.0
+            self.G_offset_si = 0.0
+        self.S_offset_cgs = self.S_offset_si * S_CONV_CGS
+        self.U_offset_cgs = self.U_offset_si * U_CONV_CGS
+        self.G_offset_cgs = self.G_offset_si * U_CONV_CGS
+
+        # Convenience shifted table/grid views in SI units.
+        self.S_table_si_shifted = self.S_table_si + self.S_offset_si
+        self.U_table_si_shifted = self.U_table_si + self.U_offset_si
+        self.G_table_si_shifted = self.G_table_si + self.U_offset_si - self.T_table * self.S_offset_si + self.G_offset_si
+        self.S_grid_rect_si_shifted = self.S_grid_rect_si + self.S_offset_si
+        self.U_grid_rect_si_shifted = self.U_grid_rect_si + self.U_offset_si
+        self.G_grid_rect_si_shifted = (
+            self.G_grid_rect_si + self.U_offset_si - self.T_vals_rect[None, :] * self.S_offset_si + self.G_offset_si
+        )
 
         self.P_min = float(self.P_vals_rect[0])
         self.P_max = float(self.P_vals_rect[-1])
@@ -306,10 +360,10 @@ class Fe_EOS:
         self.rho_max = float(np.nanmax(self.rho_grid_rect))
 
         self._surf: Dict[str, GonzalezRegularGridSurface] = {
-            "rho": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.rho_grid_rect),
-            "S": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.S_grid_rect_si),
-            "U": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.U_grid_rect_si),
-            "G": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.G_grid_rect_si),
+            "rho": GonzalezRegularGridSurface(self.logP_vals_rect, self.logT_vals_rect, self.rho_grid_rect),
+            "S": GonzalezRegularGridSurface(self.logP_vals_rect, self.logT_vals_rect, self.S_grid_rect_si),
+            "U": GonzalezRegularGridSurface(self.logP_vals_rect, self.logT_vals_rect, self.U_grid_rect_si),
+            "G": GonzalezRegularGridSurface(self.logP_vals_rect, self.logT_vals_rect, self.G_grid_rect_si),
         }
 
         self._build_isotherm_seed_index()
@@ -489,6 +543,12 @@ class Fe_EOS:
             raise ValueError("Temperature T must be > 0 K.")
 
         vals = self._surf[key](P, T)
+        if key == "S":
+            vals = vals + self.S_offset_si
+        elif key == "U":
+            vals = vals + self.U_offset_si
+        elif key == "G":
+            vals = vals + self.U_offset_si - T * self.S_offset_si + self.G_offset_si
         vals = np.asarray(vals, dtype=float)
         return vals
 
@@ -497,7 +557,14 @@ class Fe_EOS:
             return np.nan
         if (not np.isfinite(T_K)) or (T_K <= 0):
             return np.nan
-        return float(self._surf[key](float(P_Pa), float(T_K)))
+        val = float(self._surf[key](float(P_Pa), float(T_K)))
+        if key == "S":
+            val += self.S_offset_si
+        elif key == "U":
+            val += self.U_offset_si
+        elif key == "G":
+            val += self.U_offset_si - float(T_K) * self.S_offset_si + self.G_offset_si
+        return val
 
     def _rho_seed_from_isotherms(self, P_Pa: float, T_K: float) -> float:
         Ts = self.tvals_iso
