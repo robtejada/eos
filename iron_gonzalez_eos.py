@@ -1532,6 +1532,7 @@ class Fe_COMBINED_EOS(Fe_EOS):
         dT: float = 50.0,
         allow_T_extrapolation: bool = True,
         T_extrap_max: float = 200000.0,
+        sp_table_path: Optional[Union[str, Path]] = None,
         diff_rel_T: float = 1e-1,
         diff_abs_T: float = 50.0,
         diff_rel_P: float = 1e-1,
@@ -1579,6 +1580,60 @@ class Fe_COMBINED_EOS(Fe_EOS):
         self.T_sp_max = max(self.T_max, self.T_extrap_max) if self.allow_T_extrapolation else self.T_max
         self.rho_min = min(self.solid.rho_min, self.liquid.rho_min)
         self.rho_max = max(self.solid.rho_max, self.liquid.rho_max)
+
+        # -------- SP tabulated data (S,P) -> (T,rho,u,cp,cv,alpha) --------
+        self._has_sp_table = False
+        self._sp_table_path = self._resolve_sp_table_path(sp_table_path)
+        if self._sp_table_path is not None and self._sp_table_path.is_file():
+            self.data_sp = np.load(self._sp_table_path)
+
+            self.svals_sp = np.asarray(self.data_sp["svals_sp"], dtype=float)  # kb/baryon
+            self.pvals_sp = np.asarray(self.data_sp["pvals_sp"], dtype=float)  # Pa
+
+            self.rho_grid_sp = np.asarray(self.data_sp["rho_grid_sp"], dtype=float)  # kg/m^3
+            self.t_grid_sp = np.asarray(self.data_sp["t_grid_sp"], dtype=float)  # K
+            self.u_grid_sp = np.asarray(self.data_sp["u_grid_sp"], dtype=float)  # erg/g
+            self.cp_grid_sp = np.asarray(self.data_sp["cp_grid_sp"], dtype=float)  # erg/g/K
+            self.cv_grid_sp = np.asarray(self.data_sp["cv_grid_sp"], dtype=float)  # erg/g/K
+            self.alpha_grid_sp = np.asarray(self.data_sp["alpha_grid_sp"], dtype=float)  # 1/K
+
+            rgi_kwargs = dict(method="linear", bounds_error=False, fill_value=None)
+            self.rho_rgi_sp = RegularGridInterpolator((self.svals_sp, self.pvals_sp), self.rho_grid_sp, **rgi_kwargs)
+            self.t_rgi_sp = RegularGridInterpolator((self.svals_sp, self.pvals_sp), self.t_grid_sp, **rgi_kwargs)
+            self.u_rgi_sp = RegularGridInterpolator((self.svals_sp, self.pvals_sp), self.u_grid_sp, **rgi_kwargs)
+            self.cp_rgi_sp = RegularGridInterpolator((self.svals_sp, self.pvals_sp), self.cp_grid_sp, **rgi_kwargs)
+            self.cv_rgi_sp = RegularGridInterpolator((self.svals_sp, self.pvals_sp), self.cv_grid_sp, **rgi_kwargs)
+            self.alpha_rgi_sp = RegularGridInterpolator((self.svals_sp, self.pvals_sp), self.alpha_grid_sp, **rgi_kwargs)
+            self._has_sp_table = True
+
+    @staticmethod
+    def _as_arrays(a, b):
+        A = np.array(a, ndmin=1, dtype=float)
+        B = np.array(b, ndmin=1, dtype=float)
+        A, B = np.broadcast_arrays(A, B)
+        return A, B
+
+    def _interp_sp(self, rgi: RegularGridInterpolator, S_arr: np.ndarray, P_arr: np.ndarray) -> np.ndarray:
+        pts = np.column_stack((np.asarray(S_arr, dtype=float).ravel(), np.asarray(P_arr, dtype=float).ravel()))
+        return np.asarray(rgi(pts), dtype=float).reshape(np.asarray(S_arr).shape)
+
+    @staticmethod
+    def _resolve_sp_table_path(sp_table_path: Optional[Union[str, Path]]) -> Optional[Path]:
+        if sp_table_path is not None:
+            return Path(sp_table_path)
+
+        this_dir = Path(__file__).resolve().parent
+        fname = "iron_eos_SP_comb_gonzalez.npz"
+        candidates = [
+            Path.cwd() / "eos" / "gonzales_iron_eos" / fname,
+            Path.cwd() / "gonzales_iron_eos" / fname,
+            this_dir / "gonzales_iron_eos" / fname,
+            this_dir / "eos" / "gonzales_iron_eos" / fname,
+        ]
+        for cand in candidates:
+            if cand.is_file():
+                return cand
+        return candidates[0]
 
     @staticmethod
     def _blend_linear(solid_vals: np.ndarray, liquid_vals: np.ndarray, w_liq: np.ndarray) -> np.ndarray:
@@ -1888,7 +1943,7 @@ class Fe_COMBINED_EOS(Fe_EOS):
     # SP interface
     # -------------------------
 
-    def get_T_sp_inv(self, _s, _P, bracket=(1.0, 200000.0), xtol=1e-8, maxiter=500, s_units="kbbar"):
+    def get_T_sp_inv(self, _s, _P, bracket=(1.0, 200000.0), xtol=1e-10, maxiter=500, s_units="kbbar"):
         s_arr = np.atleast_1d(_s).astype(float)
         P_arr = np.atleast_1d(_P).astype(float)
         s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
@@ -1899,8 +1954,11 @@ class Fe_COMBINED_EOS(Fe_EOS):
             s_target_cgs = s_arr
 
         Tmin, Tmax = float(bracket[0]), float(bracket[1])
-        Tmin = min(Tmin, self.T_min)
-        Tmax = max(Tmax, self.T_max)
+        Tmin = max(Tmin, self.T_min)
+        if self.allow_T_extrapolation:
+            Tmax = min(Tmax, self.T_sp_max)
+        else:
+            Tmax = min(Tmax, self.T_max)
         if Tmin <= 0:
             raise ValueError("bracket[0] must be > 0 K.")
         if Tmax <= Tmin:
@@ -2102,11 +2160,17 @@ class Fe_COMBINED_EOS(Fe_EOS):
 
     def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            vals = self._interp_sp(self.rho_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
         rho, _ = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         return float(rho) if scalar else rho
 
     def get_T_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            vals = self._interp_sp(self.t_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
         _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         return float(T) if scalar else T
 
@@ -2115,30 +2179,46 @@ class Fe_COMBINED_EOS(Fe_EOS):
 
     def get_u_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            vals = self._interp_sp(self.u_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_u_rhot(rho, T)
         return float(vals) if scalar else vals
 
     def get_g_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            T_tab = self._interp_sp(self.t_rgi_sp, S_arr, P_arr)
+            vals = self.get_g_pt(P_arr, T_tab)
+            return float(vals) if scalar else vals
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_g_rhot(rho, T)
         return float(vals) if scalar else vals
 
     def get_CP_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            vals = self._interp_sp(self.cp_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_CP_rhot(rho, T)
         return float(vals) if scalar else vals
 
     def get_CV_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            vals = self._interp_sp(self.cv_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_CV_rhot(rho, T)
         return float(vals) if scalar else vals
 
     def get_alpha_sp(self, S, P, tab=True, **inv_kwargs):
         scalar, S_arr, P_arr = self._broadcast(S, P)
+        if tab and self._has_sp_table:
+            vals = self._interp_sp(self.alpha_rgi_sp, S_arr, P_arr)
+            return float(vals) if scalar else vals
         rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_alpha_rhot(rho, T)
         return float(vals) if scalar else vals
