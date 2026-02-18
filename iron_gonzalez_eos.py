@@ -1198,6 +1198,62 @@ class Fe_EOS:
         if Tmax <= Tmin:
             raise ValueError("Temperature bracket does not overlap table range.")
 
+        logTmin = np.log(Tmin)
+        logTmax = np.log(Tmax)
+
+        def _fill_nans_logP_1d(Pv: np.ndarray, Tv: np.ndarray) -> np.ndarray:
+            Pv = np.asarray(Pv, dtype=float)
+            Tv = np.asarray(Tv, dtype=float)
+            out = Tv.copy()
+
+            valid_p = np.isfinite(Pv) & (Pv > 0.0)
+            good = valid_p & np.isfinite(Tv) & (Tv > 0.0)
+            need_fill = valid_p & (~np.isfinite(Tv) | (Tv <= 0.0))
+
+            if not np.any(need_fill):
+                return np.clip(out, Tmin, Tmax)
+            if np.count_nonzero(good) == 0:
+                return out
+
+            xg = np.log(Pv[good])
+            yg = np.log(np.clip(Tv[good], Tmin, Tmax))
+            order = np.argsort(xg)
+            xg = xg[order]
+            yg = yg[order]
+
+            # Deduplicate repeated pressures to avoid singular slopes.
+            xu, inv = np.unique(xg, return_inverse=True)
+            yu = np.zeros_like(xu, dtype=float)
+            cnt = np.zeros_like(xu, dtype=float)
+            for i, gi in enumerate(inv):
+                yu[gi] += yg[i]
+                cnt[gi] += 1.0
+            yu /= np.maximum(cnt, 1.0)
+            xg, yg = xu, yu
+
+            if xg.size == 1:
+                out[need_fill] = float(np.exp(np.clip(yg[0], logTmin, logTmax)))
+                return np.clip(out, Tmin, Tmax)
+
+            xt = np.log(Pv[need_fill])
+            yfill = np.interp(xt, xg, yg)
+
+            # Linear edge extrapolation in logP-logT for NaNs at array ends.
+            denom_l = xg[1] - xg[0]
+            denom_r = xg[-1] - xg[-2]
+            m_l = (yg[1] - yg[0]) / denom_l if denom_l != 0.0 else 0.0
+            m_r = (yg[-1] - yg[-2]) / denom_r if denom_r != 0.0 else 0.0
+
+            left = xt < xg[0]
+            right = xt > xg[-1]
+            if np.any(left):
+                yfill[left] = yg[0] + m_l * (xt[left] - xg[0])
+            if np.any(right):
+                yfill[right] = yg[-1] + m_r * (xt[right] - xg[-1])
+
+            out[need_fill] = np.exp(np.clip(yfill, logTmin, logTmax))
+            return np.clip(out, Tmin, Tmax)
+
         def _find_T(s_cgs, P_val):
             if P_val <= 0 or not np.isfinite(P_val) or not np.isfinite(s_cgs):
                 return np.nan
@@ -1220,7 +1276,18 @@ class Fe_EOS:
             except (ValueError, FloatingPointError, RuntimeError):
                 return np.nan
 
-        T_roots = np.vectorize(_find_T)(s_target_cgs, P_arr)
+        T_roots = np.asarray(np.vectorize(_find_T)(s_target_cgs, P_arr), dtype=float)
+
+        if np.any(~np.isfinite(T_roots)):
+            if T_roots.ndim == 1:
+                T_roots = _fill_nans_logP_1d(P_arr, T_roots)
+            else:
+                P_work = np.moveaxis(np.asarray(P_arr, dtype=float), -1, -1)
+                T_work = np.moveaxis(T_roots, -1, -1)
+                for sl in np.ndindex(T_work.shape[:-1]):
+                    T_work[sl] = _fill_nans_logP_1d(P_work[sl], T_work[sl])
+                T_roots = np.moveaxis(T_work, -1, -1)
+
         return float(T_roots) if T_roots.size == 1 else T_roots
 
     # -------------------------
@@ -1463,6 +1530,8 @@ class Fe_COMBINED_EOS(Fe_EOS):
         self,
         data_dir: Optional[Union[str, Path]] = None,
         dT: float = 50.0,
+        allow_T_extrapolation: bool = True,
+        T_extrap_max: float = 200000.0,
         diff_rel_T: float = 1e-1,
         diff_abs_T: float = 50.0,
         diff_rel_P: float = 1e-1,
@@ -1483,6 +1552,10 @@ class Fe_COMBINED_EOS(Fe_EOS):
         self.diff_rel_P = float(diff_rel_P)
         self.diff_abs_P = float(diff_abs_P)
         self.apply_reference_offsets = bool(apply_reference_offsets)
+        self.allow_T_extrapolation = bool(allow_T_extrapolation)
+        self.T_extrap_max = float(T_extrap_max)
+        if self.T_extrap_max <= 0.0:
+            raise ValueError("T_extrap_max must be > 0 K.")
 
         common_kwargs = dict(
             data_dir=data_dir,
@@ -1503,6 +1576,7 @@ class Fe_COMBINED_EOS(Fe_EOS):
         self.P_max = max(self.solid.P_max, self.liquid.P_max)
         self.T_min = min(self.solid.T_min, self.liquid.T_min)
         self.T_max = max(self.solid.T_max, self.liquid.T_max)
+        self.T_sp_max = max(self.T_max, self.T_extrap_max) if self.allow_T_extrapolation else self.T_max
         self.rho_min = min(self.solid.rho_min, self.liquid.rho_min)
         self.rho_max = max(self.solid.rho_max, self.liquid.rho_max)
 
@@ -1825,20 +1899,110 @@ class Fe_COMBINED_EOS(Fe_EOS):
             s_target_cgs = s_arr
 
         Tmin, Tmax = float(bracket[0]), float(bracket[1])
-        Tmin = max(Tmin, self.T_min)
-        Tmax = min(Tmax, self.T_max)
+        Tmin = min(Tmin, self.T_min)
+        Tmax = max(Tmax, self.T_max)
         if Tmin <= 0:
             raise ValueError("bracket[0] must be > 0 K.")
         if Tmax <= Tmin:
             raise ValueError("Temperature bracket does not overlap table range.")
 
-        def _find_T(s_cgs, P_val):
-            if P_val <= 0 or not np.isfinite(P_val) or not np.isfinite(s_cgs):
+        logTmin = np.log(Tmin)
+        logTmax = np.log(Tmax)
+
+        def _fill_nans_logP_1d(Pv: np.ndarray, Tv: np.ndarray) -> np.ndarray:
+            Pv = np.asarray(Pv, dtype=float)
+            Tv = np.asarray(Tv, dtype=float)
+            out = Tv.copy()
+
+            valid_p = np.isfinite(Pv) & (Pv > 0.0)
+            good = valid_p & np.isfinite(Tv) & (Tv > 0.0)
+            need_fill = valid_p & (~np.isfinite(Tv) | (Tv <= 0.0))
+
+            if not np.any(need_fill):
+                return np.clip(out, Tmin, Tmax)
+            if np.count_nonzero(good) == 0:
+                return out
+
+            xg = np.log(Pv[good])
+            yg = np.log(np.clip(Tv[good], Tmin, Tmax))
+            order = np.argsort(xg)
+            xg = xg[order]
+            yg = yg[order]
+
+            xu, inv = np.unique(xg, return_inverse=True)
+            yu = np.zeros_like(xu, dtype=float)
+            cnt = np.zeros_like(xu, dtype=float)
+            for i, gi in enumerate(inv):
+                yu[gi] += yg[i]
+                cnt[gi] += 1.0
+            yu /= np.maximum(cnt, 1.0)
+            xg, yg = xu, yu
+
+            if xg.size == 1:
+                out[need_fill] = float(np.exp(np.clip(yg[0], logTmin, logTmax)))
+                return np.clip(out, Tmin, Tmax)
+
+            xt = np.log(Pv[need_fill])
+            yfill = np.interp(xt, xg, yg)
+
+            denom_l = xg[1] - xg[0]
+            denom_r = xg[-1] - xg[-2]
+            m_l = (yg[1] - yg[0]) / denom_l if denom_l != 0.0 else 0.0
+            m_r = (yg[-1] - yg[-2]) / denom_r if denom_r != 0.0 else 0.0
+
+            left = xt < xg[0]
+            right = xt > xg[-1]
+            if np.any(left):
+                yfill[left] = yg[0] + m_l * (xt[left] - xg[0])
+            if np.any(right):
+                yfill[right] = yg[-1] + m_r * (xt[right] - xg[-1])
+
+            out[need_fill] = np.exp(np.clip(yfill, logTmin, logTmax))
+            return np.clip(out, Tmin, Tmax)
+
+        def _solve_from_guess(s_cgs: float, P_val: float, T_guess: float) -> float:
+            if P_val <= 0 or (not np.isfinite(P_val)) or (not np.isfinite(s_cgs)):
                 return np.nan
 
             def err(T):
-                return self._as_float(self.get_s_pt(P_val, T)) - s_cgs
+                if (not np.isfinite(T)) or T <= 0.0:
+                    return np.nan
+                sval = self._as_float(self.get_s_pt(P_val, T))
+                if not np.isfinite(sval):
+                    return np.nan
+                return sval - s_cgs
 
+            T_guess = float(np.clip(T_guess, Tmin, Tmax))
+            f0 = err(T_guess)
+            if np.isfinite(f0) and f0 == 0.0:
+                return T_guess
+
+            # Local bracket around continuation guess.
+            width = max(self.dT, 0.02 * T_guess, 25.0)
+            left = max(Tmin, T_guess - width)
+            right = min(Tmax, T_guess + width)
+
+            for _ in range(14):
+                f_l = err(left)
+                f_r = err(right)
+                if np.isfinite(f_l) and np.isfinite(f_r):
+                    if f_l == 0.0:
+                        return left
+                    if f_r == 0.0:
+                        return right
+                    if f_l * f_r < 0.0:
+                        try:
+                            return brenth(err, left, right, xtol=xtol, maxiter=maxiter)
+                        except (ValueError, FloatingPointError, RuntimeError):
+                            pass
+
+                if left <= Tmin and right >= Tmax:
+                    break
+                width *= 1.8
+                left = max(Tmin, T_guess - width)
+                right = min(Tmax, T_guess + width)
+
+            # Global fallback bracket.
             try:
                 f_lo = err(Tmin)
                 f_hi = err(Tmax)
@@ -1848,13 +2012,50 @@ class Fe_COMBINED_EOS(Fe_EOS):
                     return Tmin
                 if f_hi == 0.0:
                     return Tmax
-                if f_lo * f_hi > 0:
+                if f_lo * f_hi > 0.0:
                     return np.nan
                 return brenth(err, Tmin, Tmax, xtol=xtol, maxiter=maxiter)
             except (ValueError, FloatingPointError, RuntimeError):
                 return np.nan
 
-        T_roots = np.vectorize(_find_T)(s_target_cgs, P_arr)
+        # Continuation solve: each successful root seeds the next solve.
+        s_flat = np.ravel(s_target_cgs)
+        P_flat = np.ravel(P_arr)
+        T_flat = np.full(s_flat.shape, np.nan, dtype=float)
+        T_prev = np.nan
+
+        for i in range(s_flat.size):
+            si = float(s_flat[i])
+            Pi = float(P_flat[i])
+            if not (np.isfinite(si) and np.isfinite(Pi) and Pi > 0.0):
+                continue
+
+            if np.isfinite(T_prev):
+                T_guess = float(T_prev)
+            else:
+                Tm_guess = float(np.asarray(self.get_T_melt(Pi)))
+                if np.isfinite(Tm_guess):
+                    T_guess = float(np.clip(Tm_guess, Tmin, Tmax))
+                else:
+                    T_guess = np.sqrt(Tmin * Tmax)
+
+            T_sol = _solve_from_guess(si, Pi, T_guess)
+            T_flat[i] = T_sol
+            if np.isfinite(T_sol):
+                T_prev = float(T_sol)
+
+        T_roots = T_flat.reshape(s_target_cgs.shape)
+
+        if np.any(~np.isfinite(T_roots)):
+            if T_roots.ndim == 1:
+                T_roots = _fill_nans_logP_1d(P_arr, T_roots)
+            else:
+                P_work = np.moveaxis(np.asarray(P_arr, dtype=float), -1, -1)
+                T_work = np.moveaxis(T_roots, -1, -1)
+                for sl in np.ndindex(T_work.shape[:-1]):
+                    T_work[sl] = _fill_nans_logP_1d(P_work[sl], T_work[sl])
+                T_roots = np.moveaxis(T_work, -1, -1)
+
         return float(T_roots) if T_roots.size == 1 else T_roots
 
     def get_rhot_sp_2d_inv(
@@ -1873,7 +2074,7 @@ class Fe_COMBINED_EOS(Fe_EOS):
         s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
 
         T_out = np.asarray(
-            self.get_T_sp_inv(s_arr, P_arr, bracket=bounds_T or (self.T_min, self.T_max), s_units=s_units),
+            self.get_T_sp_inv(s_arr, P_arr, bracket=bounds_T or (self.T_min, self.T_sp_max), s_units=s_units),
             dtype=float,
         )
         rho_out = np.asarray(self.get_rho_pt(P_arr, T_out), dtype=float)
