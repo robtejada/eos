@@ -24,69 +24,69 @@ S_CONV_CGS = float((u.J / u.kg / u.K).to("erg/(g * K)"))  # J/kg/K -> erg/g/K
 
 class GonzalezRectGridBuilder:
     """
-    Build a rectangular (rho, T) grid from irregular EOS samples.
+    Build a rectangular (P, T) grid from irregular EOS samples.
 
     Two-step construction (both linear with extrapolation):
-      1) For each unique table T, interpolate property vs rho onto regular rho axis.
-      2) For each regular rho, interpolate property vs T onto regular T axis.
+      1) For each unique table T, interpolate property vs P onto regular P axis.
+      2) For each regular P, interpolate property vs T onto regular T axis.
     """
 
     def __init__(
         self,
-        rho_raw: np.ndarray,
+        P_raw: np.ndarray,
         T_raw: np.ndarray,
         fields: Dict[str, np.ndarray],
         *,
-        n_rho: Optional[int] = None,
+        n_P: Optional[int] = None,
         n_T: Optional[int] = None,
-        rho_bounds: Optional[Tuple[float, float]] = None,
+        P_bounds: Optional[Tuple[float, float]] = None,
         T_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
-        self.rho_raw = np.asarray(rho_raw, dtype=float)
+        self.P_raw = np.asarray(P_raw, dtype=float)
         self.T_raw = np.asarray(T_raw, dtype=float)
         self.fields = {k: np.asarray(v, dtype=float) for k, v in fields.items()}
 
-        if self.rho_raw.size == 0 or self.T_raw.size == 0:
-            raise ValueError("Empty raw rho/T arrays.")
+        if self.P_raw.size == 0 or self.T_raw.size == 0:
+            raise ValueError("Empty raw P/T arrays.")
 
-        if not all(v.size == self.rho_raw.size for v in self.fields.values()):
-            raise ValueError("All field arrays must have same length as rho_raw/T_raw.")
+        if not all(v.size == self.P_raw.size for v in self.fields.values()):
+            raise ValueError("All field arrays must have same length as P_raw/T_raw.")
 
-        rho_lo_raw = float(np.min(self.rho_raw))
-        rho_hi_raw = float(np.max(self.rho_raw))
+        P_lo_raw = float(np.min(self.P_raw))
+        P_hi_raw = float(np.max(self.P_raw))
         T_lo_raw = float(np.min(self.T_raw))
         T_hi_raw = float(np.max(self.T_raw))
 
-        if rho_bounds is None:
-            rho_lo, rho_hi = rho_lo_raw, rho_hi_raw
+        if P_bounds is None:
+            P_lo, P_hi = P_lo_raw, P_hi_raw
         else:
-            rho_lo, rho_hi = map(float, rho_bounds)
+            P_lo, P_hi = map(float, P_bounds)
 
         if T_bounds is None:
             T_lo, T_hi = T_lo_raw, T_hi_raw
         else:
             T_lo, T_hi = map(float, T_bounds)
 
-        if not (rho_hi > rho_lo > 0):
-            raise ValueError("rho bounds must satisfy 0 < rho_lo < rho_hi.")
+        if not (P_hi > P_lo > 0):
+            raise ValueError("P bounds must satisfy 0 < P_lo < P_hi.")
         if not (T_hi > T_lo > 0):
             raise ValueError("T bounds must satisfy 0 < T_lo < T_hi.")
 
-        rho_unique = np.unique(self.rho_raw)
+        P_unique = np.unique(self.P_raw)
         T_unique = np.unique(self.T_raw)
 
-        if n_rho is None:
-            n_rho = int(rho_unique.size)
+        if n_P is None:
+            n_P = int(P_unique.size)
         if n_T is None:
             # keep regular temperature grid meaningfully sampled for derivatives
             n_T = int(max(T_unique.size, 300))
 
-        self.n_rho = int(n_rho)
+        self.n_P = int(n_P)
         self.n_T = int(n_T)
-        if self.n_rho < 2 or self.n_T < 2:
-            raise ValueError("n_rho and n_T must be >= 2.")
+        if self.n_P < 2 or self.n_T < 2:
+            raise ValueError("n_P and n_T must be >= 2.")
 
-        self.rho_axis = np.linspace(rho_lo, rho_hi, self.n_rho)
+        self.P_axis = np.linspace(P_lo, P_hi, self.n_P)
         self.T_axis = np.linspace(T_lo, T_hi, self.n_T)
         self.T_unique = np.array(sorted(np.unique(self.T_raw)), dtype=float)
 
@@ -125,26 +125,26 @@ class GonzalezRectGridBuilder:
         return np.asarray(f(x_new), dtype=float)
 
     def _build_one_field(self, vals_raw: np.ndarray) -> np.ndarray:
-        # Step 1: for each table T, interpolate/extrapolate along rho onto regular rho axis
-        vals_rho_on_Traw = np.empty((self.T_unique.size, self.n_rho), dtype=float)
+        # Step 1: for each table T, interpolate/extrapolate along P onto regular P axis
+        vals_P_on_Traw = np.empty((self.T_unique.size, self.n_P), dtype=float)
 
         for i, T0 in enumerate(self.T_unique):
             mask = self.T_raw == T0
-            rho_slice = self.rho_raw[mask]
+            P_slice = self.P_raw[mask]
             v_slice = vals_raw[mask]
-            vals_rho_on_Traw[i, :] = self._interp1d_linear_extrap(rho_slice, v_slice, self.rho_axis)
+            vals_P_on_Traw[i, :] = self._interp1d_linear_extrap(P_slice, v_slice, self.P_axis)
 
-        # Step 2: for each regular rho, interpolate/extrapolate along T onto regular T axis
-        grid_rhot = np.empty((self.n_rho, self.n_T), dtype=float)
-        for j in range(self.n_rho):
-            v_Tslice = vals_rho_on_Traw[:, j]
-            grid_rhot[j, :] = self._interp1d_linear_extrap(self.T_unique, v_Tslice, self.T_axis)
+        # Step 2: for each regular P, interpolate/extrapolate along T onto regular T axis
+        grid_pt = np.empty((self.n_P, self.n_T), dtype=float)
+        for j in range(self.n_P):
+            v_Tslice = vals_P_on_Traw[:, j]
+            grid_pt[j, :] = self._interp1d_linear_extrap(self.T_unique, v_Tslice, self.T_axis)
 
-        return grid_rhot
+        return grid_pt
 
     def build(self) -> Dict[str, np.ndarray]:
         out = {
-            "rho_axis": self.rho_axis.copy(),
+            "P_axis": self.P_axis.copy(),
             "T_axis": self.T_axis.copy(),
         }
 
@@ -160,21 +160,21 @@ class GonzalezRegularGridSurface:
     Uses linear interpolation and linear extrapolation (fill_value=None).
     """
 
-    def __init__(self, rho_axis: np.ndarray, T_axis: np.ndarray, grid_rhot: np.ndarray) -> None:
+    def __init__(self, P_axis: np.ndarray, T_axis: np.ndarray, grid_pt: np.ndarray) -> None:
         self._rgi = RegularGridInterpolator(
-            (np.asarray(rho_axis, dtype=float), np.asarray(T_axis, dtype=float)),
-            np.asarray(grid_rhot, dtype=float),
+            (np.asarray(P_axis, dtype=float), np.asarray(T_axis, dtype=float)),
+            np.asarray(grid_pt, dtype=float),
             method="linear",
             bounds_error=False,
             fill_value=None,
         )
 
-    def __call__(self, rho: np.ndarray, T: np.ndarray) -> np.ndarray:
-        rho_arr = np.asarray(rho, dtype=float)
+    def __call__(self, P: np.ndarray, T: np.ndarray) -> np.ndarray:
+        P_arr = np.asarray(P, dtype=float)
         T_arr = np.asarray(T, dtype=float)
-        rho_arr, T_arr = np.broadcast_arrays(rho_arr, T_arr)
-        pts = np.column_stack((rho_arr.ravel(), T_arr.ravel()))
-        vals = np.asarray(self._rgi(pts), dtype=float).reshape(rho_arr.shape)
+        P_arr, T_arr = np.broadcast_arrays(P_arr, T_arr)
+        pts = np.column_stack((P_arr.ravel(), T_arr.ravel()))
+        vals = np.asarray(self._rgi(pts), dtype=float).reshape(P_arr.shape)
         return vals
 
 
@@ -221,6 +221,7 @@ class Fe_EOS:
         "solid": "Fe_EOS_solid.txt",
         "liquid": "Fe_EOS_liquid.txt",
     }
+    _RECT_P_MIN_DEFAULT_PA = 1.0e9  # Build rectangular P-grid down to 1 GPa by default.
     _GLOBAL_BOUNDS_CACHE: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
 
     def __init__(
@@ -261,7 +262,7 @@ class Fe_EOS:
         if grid_P_bounds is None or grid_T_bounds is None:
             P_bounds_all, T_bounds_all = self._global_phase_bounds(self._data_dir)
             if grid_P_bounds is None:
-                grid_P_bounds = P_bounds_all
+                grid_P_bounds = (self._RECT_P_MIN_DEFAULT_PA, float(P_bounds_all[1]))
             if grid_T_bounds is None:
                 grid_T_bounds = T_bounds_all
 
@@ -283,14 +284,14 @@ class Fe_EOS:
                 "U": self.U_table_si,
                 "G": self.G_table_si,
             },
-            n_rho=grid_n_P,
+            n_P=grid_n_P,
             n_T=grid_n_T,
-            rho_bounds=grid_P_bounds,
+            P_bounds=grid_P_bounds,
             T_bounds=grid_T_bounds,
         )
         rect = rect_builder.build()
 
-        self.P_vals_rect = np.asarray(rect["rho_axis"], dtype=float)
+        self.P_vals_rect = np.asarray(rect["P_axis"], dtype=float)
         self.T_vals_rect = np.asarray(rect["T_axis"], dtype=float)
         self.rho_grid_rect = np.asarray(rect["rho"], dtype=float)
         self.S_grid_rect_si = np.asarray(rect["S"], dtype=float)
