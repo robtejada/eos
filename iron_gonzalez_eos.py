@@ -5,7 +5,7 @@ import re
 from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
-from scipy.interpolate import CloughTocher2DInterpolator, NearestNDInterpolator
+from scipy.interpolate import RegularGridInterpolator, interp1d
 from scipy.optimize import brenth, least_squares
 
 from astropy.constants import k_B
@@ -22,34 +22,159 @@ U_CONV_CGS = float((u.J / u.kg).to("erg/g"))  # J/kg -> erg/g
 S_CONV_CGS = float((u.J / u.kg / u.K).to("erg/(g * K)"))  # J/kg/K -> erg/g/K
 
 
-class _Scattered2DInterpolator:
+class GonzalezRectGridBuilder:
     """
-    Scattered 2D interpolation using Clough-Tocher splines.
-    Input coordinates are in log-space: (log(rho), log(T)).
+    Build a rectangular (rho, T) grid from irregular EOS samples.
+
+    Two-step construction (both linear with extrapolation):
+      1) For each unique table T, interpolate property vs rho onto regular rho axis.
+      2) For each regular rho, interpolate property vs T onto regular T axis.
     """
 
     def __init__(
         self,
-        points_log: np.ndarray,
-        values: np.ndarray,
+        rho_raw: np.ndarray,
+        T_raw: np.ndarray,
+        fields: Dict[str, np.ndarray],
         *,
-        nearest_fallback: bool = False,
+        n_rho: Optional[int] = None,
+        n_T: Optional[int] = None,
+        rho_bounds: Optional[Tuple[float, float]] = None,
+        T_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
-        self._ct = CloughTocher2DInterpolator(points_log, values, fill_value=np.nan)
-        self._near = NearestNDInterpolator(points_log, values) if nearest_fallback else None
+        self.rho_raw = np.asarray(rho_raw, dtype=float)
+        self.T_raw = np.asarray(T_raw, dtype=float)
+        self.fields = {k: np.asarray(v, dtype=float) for k, v in fields.items()}
 
-    def __call__(self, points_log: np.ndarray) -> np.ndarray:
-        pts = np.asarray(points_log, dtype=float)
-        pts2 = np.atleast_2d(pts)
+        if self.rho_raw.size == 0 or self.T_raw.size == 0:
+            raise ValueError("Empty raw rho/T arrays.")
 
-        vals = np.asarray(self._ct(pts2), dtype=float).reshape(-1)
-        if self._near is not None:
-            bad = ~np.isfinite(vals)
-            if np.any(bad):
-                vals[bad] = np.asarray(self._near(pts2[bad]), dtype=float).reshape(-1)
+        if not all(v.size == self.rho_raw.size for v in self.fields.values()):
+            raise ValueError("All field arrays must have same length as rho_raw/T_raw.")
 
-        if pts.ndim == 1:
-            return float(vals[0])
+        rho_lo_raw = float(np.min(self.rho_raw))
+        rho_hi_raw = float(np.max(self.rho_raw))
+        T_lo_raw = float(np.min(self.T_raw))
+        T_hi_raw = float(np.max(self.T_raw))
+
+        if rho_bounds is None:
+            rho_lo, rho_hi = rho_lo_raw, rho_hi_raw
+        else:
+            rho_lo, rho_hi = map(float, rho_bounds)
+
+        if T_bounds is None:
+            T_lo, T_hi = T_lo_raw, T_hi_raw
+        else:
+            T_lo, T_hi = map(float, T_bounds)
+
+        if not (rho_hi > rho_lo > 0):
+            raise ValueError("rho bounds must satisfy 0 < rho_lo < rho_hi.")
+        if not (T_hi > T_lo > 0):
+            raise ValueError("T bounds must satisfy 0 < T_lo < T_hi.")
+
+        rho_unique = np.unique(self.rho_raw)
+        T_unique = np.unique(self.T_raw)
+
+        if n_rho is None:
+            n_rho = int(rho_unique.size)
+        if n_T is None:
+            # keep regular temperature grid meaningfully sampled for derivatives
+            n_T = int(max(T_unique.size, 300))
+
+        self.n_rho = int(n_rho)
+        self.n_T = int(n_T)
+        if self.n_rho < 2 or self.n_T < 2:
+            raise ValueError("n_rho and n_T must be >= 2.")
+
+        self.rho_axis = np.linspace(rho_lo, rho_hi, self.n_rho)
+        self.T_axis = np.linspace(T_lo, T_hi, self.n_T)
+        self.T_unique = np.array(sorted(np.unique(self.T_raw)), dtype=float)
+
+    @staticmethod
+    def _dedupe_sorted_xy(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        order = np.argsort(x)
+        xs = np.asarray(x[order], dtype=float)
+        ys = np.asarray(y[order], dtype=float)
+
+        xu, inv = np.unique(xs, return_inverse=True)
+        if xu.size == xs.size:
+            return xs, ys
+
+        yu = np.zeros_like(xu, dtype=float)
+        counts = np.zeros_like(xu, dtype=float)
+        for i, g in enumerate(inv):
+            yu[g] += ys[i]
+            counts[g] += 1.0
+        yu /= np.maximum(counts, 1.0)
+        return xu, yu
+
+    @classmethod
+    def _interp1d_linear_extrap(cls, x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+        xs, ys = cls._dedupe_sorted_xy(x, y)
+        if xs.size == 1:
+            return np.full_like(x_new, ys[0], dtype=float)
+
+        f = interp1d(
+            xs,
+            ys,
+            kind="linear",
+            bounds_error=False,
+            fill_value="extrapolate",
+            assume_sorted=True,
+        )
+        return np.asarray(f(x_new), dtype=float)
+
+    def _build_one_field(self, vals_raw: np.ndarray) -> np.ndarray:
+        # Step 1: for each table T, interpolate/extrapolate along rho onto regular rho axis
+        vals_rho_on_Traw = np.empty((self.T_unique.size, self.n_rho), dtype=float)
+
+        for i, T0 in enumerate(self.T_unique):
+            mask = self.T_raw == T0
+            rho_slice = self.rho_raw[mask]
+            v_slice = vals_raw[mask]
+            vals_rho_on_Traw[i, :] = self._interp1d_linear_extrap(rho_slice, v_slice, self.rho_axis)
+
+        # Step 2: for each regular rho, interpolate/extrapolate along T onto regular T axis
+        grid_rhot = np.empty((self.n_rho, self.n_T), dtype=float)
+        for j in range(self.n_rho):
+            v_Tslice = vals_rho_on_Traw[:, j]
+            grid_rhot[j, :] = self._interp1d_linear_extrap(self.T_unique, v_Tslice, self.T_axis)
+
+        return grid_rhot
+
+    def build(self) -> Dict[str, np.ndarray]:
+        out = {
+            "rho_axis": self.rho_axis.copy(),
+            "T_axis": self.T_axis.copy(),
+        }
+
+        for key, vals_raw in self.fields.items():
+            out[key] = self._build_one_field(vals_raw)
+
+        return out
+
+
+class GonzalezRegularGridSurface:
+    """
+    RegularGridInterpolator wrapper for a single thermodynamic surface.
+    Uses linear interpolation and linear extrapolation (fill_value=None).
+    """
+
+    def __init__(self, rho_axis: np.ndarray, T_axis: np.ndarray, grid_rhot: np.ndarray) -> None:
+        self._rgi = RegularGridInterpolator(
+            (np.asarray(rho_axis, dtype=float), np.asarray(T_axis, dtype=float)),
+            np.asarray(grid_rhot, dtype=float),
+            method="linear",
+            bounds_error=False,
+            fill_value=None,
+        )
+
+    def __call__(self, rho: np.ndarray, T: np.ndarray) -> np.ndarray:
+        rho_arr = np.asarray(rho, dtype=float)
+        T_arr = np.asarray(T, dtype=float)
+        rho_arr, T_arr = np.broadcast_arrays(rho_arr, T_arr)
+        pts = np.column_stack((rho_arr.ravel(), T_arr.ravel()))
+        vals = np.asarray(self._rgi(pts), dtype=float).reshape(rho_arr.shape)
         return vals
 
 
@@ -94,6 +219,7 @@ class Fe_EOS:
         "solid": "Fe_EOS_solid.txt",
         "liquid": "Fe_EOS_liquid.txt",
     }
+    _GLOBAL_BOUNDS_CACHE: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
 
     def __init__(
         self,
@@ -103,16 +229,20 @@ class Fe_EOS:
         diff_abs_T: float = 100.0,
         diff_rel_P: float = 1e-2,
         diff_abs_P: float = 1e9,
-        nearest_fallback: bool = False,
+        grid_n_rho: Optional[int] = None,
+        grid_n_T: Optional[int] = None,
+        grid_rho_bounds: Optional[Tuple[float, float]] = None,
+        grid_T_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
         """
         Parameters
         ----------
         phase : {"solid", "liquid"}
             Which Gonzalez table to load.
-        nearest_fallback : bool
-            If False (default), interpolation outside the Clough-Tocher hull returns NaN.
-            If True, NaNs are filled with nearest-neighbor values.
+        grid_n_rho, grid_n_T : int, optional
+            Number of regular rho/T samples for the rectangularized EOS grid.
+        grid_rho_bounds, grid_T_bounds : tuple, optional
+            Explicit (min, max) bounds for the regularized grid axes.
         """
         self.phase = str(phase).lower()
         if self.phase not in self._PHASE_FILES:
@@ -122,10 +252,16 @@ class Fe_EOS:
         self.diff_abs_T = float(diff_abs_T)
         self.diff_rel_P = float(diff_rel_P)
         self.diff_abs_P = float(diff_abs_P)
-        self.nearest_fallback = bool(nearest_fallback)
 
         self._data_dir = self._resolve_data_dir(data_dir)
         self._file_path = self._data_dir / self._PHASE_FILES[self.phase]
+
+        if grid_rho_bounds is None or grid_T_bounds is None:
+            rho_bounds_all, T_bounds_all = self._global_phase_bounds(self._data_dir)
+            if grid_rho_bounds is None:
+                grid_rho_bounds = rho_bounds_all
+            if grid_T_bounds is None:
+                grid_T_bounds = T_bounds_all
 
         table = self._read_table(self._file_path)
 
@@ -136,20 +272,41 @@ class Fe_EOS:
         self.U_table_si = table["U_Jkg"]
         self.G_table_si = table["G_Jkg"]
 
-        self.rho_min = float(np.min(self.rho_table))
-        self.rho_max = float(np.max(self.rho_table))
-        self.T_min = float(np.min(self.T_table))
-        self.T_max = float(np.max(self.T_table))
+        rect_builder = GonzalezRectGridBuilder(
+            self.rho_table,
+            self.T_table,
+            {
+                "P": self.P_table,
+                "S": self.S_table_si,
+                "U": self.U_table_si,
+                "G": self.G_table_si,
+            },
+            n_rho=grid_n_rho,
+            n_T=grid_n_T,
+            rho_bounds=grid_rho_bounds,
+            T_bounds=grid_T_bounds,
+        )
+        rect = rect_builder.build()
+
+        self.rho_vals_rect = np.asarray(rect["rho_axis"], dtype=float)
+        self.T_vals_rect = np.asarray(rect["T_axis"], dtype=float)
+        self.P_grid_rect = np.asarray(rect["P"], dtype=float)
+        self.S_grid_rect_si = np.asarray(rect["S"], dtype=float)
+        self.U_grid_rect_si = np.asarray(rect["U"], dtype=float)
+        self.G_grid_rect_si = np.asarray(rect["G"], dtype=float)
+
+        self.rho_min = float(self.rho_vals_rect[0])
+        self.rho_max = float(self.rho_vals_rect[-1])
+        self.T_min = float(self.T_vals_rect[0])
+        self.T_max = float(self.T_vals_rect[-1])
         self.P_min = float(np.min(self.P_table))
         self.P_max = float(np.max(self.P_table))
 
-        points_log = np.column_stack((np.log(self.rho_table), np.log(self.T_table)))
-
-        self._surf: Dict[str, _Scattered2DInterpolator] = {
-            "P": _Scattered2DInterpolator(points_log, self.P_table, nearest_fallback=self.nearest_fallback),
-            "S": _Scattered2DInterpolator(points_log, self.S_table_si, nearest_fallback=self.nearest_fallback),
-            "U": _Scattered2DInterpolator(points_log, self.U_table_si, nearest_fallback=self.nearest_fallback),
-            "G": _Scattered2DInterpolator(points_log, self.G_table_si, nearest_fallback=self.nearest_fallback),
+        self._surf: Dict[str, GonzalezRegularGridSurface] = {
+            "P": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.P_grid_rect),
+            "S": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.S_grid_rect_si),
+            "U": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.U_grid_rect_si),
+            "G": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.G_grid_rect_si),
         }
 
         self._build_isotherm_seed_index()
@@ -183,6 +340,34 @@ class Fe_EOS:
             "Could not locate 'gonzales_iron_eos' directory. "
             "Pass data_dir explicitly."
         )
+
+    @classmethod
+    def _global_phase_bounds(cls, data_dir: Path) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        key = str(Path(data_dir).resolve())
+        if key in cls._GLOBAL_BOUNDS_CACHE:
+            return cls._GLOBAL_BOUNDS_CACHE[key]
+
+        rho_min = np.inf
+        rho_max = -np.inf
+        T_min = np.inf
+        T_max = -np.inf
+
+        for _, fname in cls._PHASE_FILES.items():
+            path = Path(data_dir) / fname
+            if not path.is_file():
+                continue
+            table = cls._read_table(path)
+            rho_min = min(rho_min, float(np.min(table["rho_kgm3"])))
+            rho_max = max(rho_max, float(np.max(table["rho_kgm3"])))
+            T_min = min(T_min, float(np.min(table["T_K"])))
+            T_max = max(T_max, float(np.max(table["T_K"])))
+
+        if not np.isfinite(rho_min) or not np.isfinite(T_min):
+            raise FileNotFoundError("Could not determine global bounds for Gonzalez iron tables.")
+
+        out = ((rho_min, rho_max), (T_min, T_max))
+        cls._GLOBAL_BOUNDS_CACHE[key] = out
+        return out
 
     @classmethod
     def _extract_float(cls, pat: re.Pattern, text: str) -> Optional[float]:
@@ -290,9 +475,8 @@ class Fe_EOS:
         if np.any(T <= 0):
             raise ValueError("Temperature T must be > 0 K.")
 
-        pts = np.column_stack((np.log(rho.ravel()), np.log(T.ravel())))
-        vals = self._surf[key](pts)
-        vals = np.asarray(vals, dtype=float).reshape(rho.shape)
+        vals = self._surf[key](rho, T)
+        vals = np.asarray(vals, dtype=float)
         return vals
 
     def _interp_property_si_scalar(self, key: str, rho_kgm3: float, T_K: float) -> float:
@@ -300,8 +484,7 @@ class Fe_EOS:
             return np.nan
         if (not np.isfinite(T_K)) or (T_K <= 0):
             return np.nan
-        pt = np.array([np.log(float(rho_kgm3)), np.log(float(T_K))], dtype=float)
-        return float(self._surf[key](pt))
+        return float(self._surf[key](float(rho_kgm3), float(T_K)))
 
     def _rho_seed_from_isotherms(self, P_Pa: float, T_K: float) -> float:
         Ts = self.tvals_iso
