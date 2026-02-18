@@ -1450,5 +1450,598 @@ class Fe_EOS:
         return Tm.reshape(P_arr.shape)
 
 
+class Fe_COMBINED_EOS(Fe_EOS):
+    """
+    Combined Gonzalez iron EOS with smooth solid/liquid blending around T_melt(P).
+
+    The class composes two phase-specific Fe_EOS instances and blends thermodynamic
+    properties with a tanh weight:
+        w_liq = 0.5 * (1 + tanh((T - Tm(P))/dT))
+    """
+
+    def __init__(
+        self,
+        data_dir: Optional[Union[str, Path]] = None,
+        dT: float = 50.0,
+        diff_rel_T: float = 1e-1,
+        diff_abs_T: float = 50.0,
+        diff_rel_P: float = 1e-1,
+        diff_abs_P: float = 1e8,
+        grid_n_P: Optional[int] = None,
+        grid_n_T: Optional[int] = None,
+        grid_P_bounds: Optional[Tuple[float, float]] = None,
+        grid_T_bounds: Optional[Tuple[float, float]] = None,
+        apply_reference_offsets: bool = False,
+    ) -> None:
+        self.phase = "combined"
+        self.dT = float(dT)
+        if self.dT <= 0.0:
+            raise ValueError("dT must be > 0 K.")
+
+        self.diff_rel_T = float(diff_rel_T)
+        self.diff_abs_T = float(diff_abs_T)
+        self.diff_rel_P = float(diff_rel_P)
+        self.diff_abs_P = float(diff_abs_P)
+        self.apply_reference_offsets = bool(apply_reference_offsets)
+
+        common_kwargs = dict(
+            data_dir=data_dir,
+            diff_rel_T=diff_rel_T,
+            diff_abs_T=diff_abs_T,
+            diff_rel_P=diff_rel_P,
+            diff_abs_P=diff_abs_P,
+            grid_n_P=grid_n_P,
+            grid_n_T=grid_n_T,
+            grid_P_bounds=grid_P_bounds,
+            grid_T_bounds=grid_T_bounds,
+            apply_reference_offsets=apply_reference_offsets,
+        )
+        self.solid = Fe_EOS(phase="solid", **common_kwargs)
+        self.liquid = Fe_EOS(phase="liquid", **common_kwargs)
+
+        self.P_min = min(self.solid.P_min, self.liquid.P_min)
+        self.P_max = max(self.solid.P_max, self.liquid.P_max)
+        self.T_min = min(self.solid.T_min, self.liquid.T_min)
+        self.T_max = max(self.solid.T_max, self.liquid.T_max)
+        self.rho_min = min(self.solid.rho_min, self.liquid.rho_min)
+        self.rho_max = max(self.solid.rho_max, self.liquid.rho_max)
+
+    @staticmethod
+    def _blend_linear(solid_vals: np.ndarray, liquid_vals: np.ndarray, w_liq: np.ndarray) -> np.ndarray:
+        return (1.0 - w_liq) * solid_vals + w_liq * liquid_vals
+
+    def _blend_weight_PT(self, P_Pa: np.ndarray, T_K: np.ndarray) -> np.ndarray:
+        Tm = self.get_T_melt(P_Pa)
+        arg = (np.asarray(T_K, dtype=float) - np.asarray(Tm, dtype=float)) / self.dT
+        return np.clip(0.5 * (1.0 + np.tanh(arg)), 0.0, 1.0)
+
+    def get_T_melt(self, P):
+        """
+        Gonzalez et al. (2023) melt curve:
+            Tm(K) = 6469 * (1 + (P_GPa - 300) / 434.822) ** 0.54369
+        """
+        P_arr = np.asarray(P, dtype=float)
+        P_GPa = P_arr * 1e-9
+        arg = 1.0 + (P_GPa - 300.0) / 434.822
+        with np.errstate(invalid="ignore"):
+            Tm = 6469.0 * np.power(arg, 0.54369)
+        return Tm
+
+    # -------------------------
+    # PT interface
+    # -------------------------
+
+    def get_rho_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        rho_s = np.asarray(self.solid.get_rho_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        rho_l = np.asarray(self.liquid.get_rho_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        w = self._blend_weight_PT(P_arr, T_arr)
+        denom = (1.0 - w) / rho_s + w / rho_l
+        vals = np.where(np.isfinite(denom) & (denom != 0.0), 1.0 / denom, np.nan)
+        return float(vals) if scalar else vals
+
+    def get_s_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        s_s = np.asarray(self.solid.get_s_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        s_l = np.asarray(self.liquid.get_s_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        vals = self._blend_linear(s_s, s_l, self._blend_weight_PT(P_arr, T_arr))
+        return float(vals) if scalar else vals
+
+    def get_u_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        u_s = np.asarray(self.solid.get_u_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        u_l = np.asarray(self.liquid.get_u_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        vals = self._blend_linear(u_s, u_l, self._blend_weight_PT(P_arr, T_arr))
+        return float(vals) if scalar else vals
+
+    def get_g_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        g_s = np.asarray(self.solid.get_g_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        g_l = np.asarray(self.liquid.get_g_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        vals = self._blend_linear(g_s, g_l, self._blend_weight_PT(P_arr, T_arr))
+        return float(vals) if scalar else vals
+
+    def get_CP_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        cp_s = np.asarray(self.solid.get_CP_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        cp_l = np.asarray(self.liquid.get_CP_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        vals = self._blend_linear(cp_s, cp_l, self._blend_weight_PT(P_arr, T_arr))
+        return float(vals) if scalar else vals
+
+    def get_CV_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        cv_s = np.asarray(self.solid.get_CV_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        cv_l = np.asarray(self.liquid.get_CV_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        vals = self._blend_linear(cv_s, cv_l, self._blend_weight_PT(P_arr, T_arr))
+        return float(vals) if scalar else vals
+
+    def get_alpha_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        a_s = np.asarray(self.solid.get_alpha_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        a_l = np.asarray(self.liquid.get_alpha_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs), dtype=float)
+        vals = self._blend_linear(a_s, a_l, self._blend_weight_PT(P_arr, T_arr))
+        return float(vals) if scalar else vals
+
+    def get_cp_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        return self.get_CP_pt(P, T, tab=tab, rho0=rho0, **inv_kwargs)
+
+    def get_cv_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
+        return self.get_CV_pt(P, T, tab=tab, rho0=rho0, **inv_kwargs)
+
+    # Native aliases (same units/conventions as Fe_EOS PT-native methods).
+    def get_rho_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        return self.get_rho_pt(P, T)
+
+    def get_s_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        return self.get_s_pt(P, T)
+
+    def get_u_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        return self.get_u_pt(P, T)
+
+    def get_g_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        return self.get_g_pt(P, T)
+
+    def get_rho_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
+        return self.get_rho_pt(P, T, rho0=rho0, **inv_kwargs)
+
+    def get_s_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
+        return self.get_s_pt(P, T, rho0=rho0, **inv_kwargs)
+
+    def get_u_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
+        return self.get_u_pt(P, T, rho0=rho0, **inv_kwargs)
+
+    def get_g_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
+        return self.get_g_pt(P, T, rho0=rho0, **inv_kwargs)
+
+    # -------------------------
+    # RHOT interface
+    # -------------------------
+
+    def get_p_rhot(
+        self,
+        rho_kgm3: ArrayLike,
+        T_K: ArrayLike,
+        P_bracket_Pa: Optional[Tuple[float, float]] = None,
+        max_iter: int = 200,
+        rtol: float = 1e-10,
+        P0: Optional[ArrayLike] = None,
+        use_lsq_first: bool = True,
+        lsq_max_nfev: int = 60,
+        bracket_expand_steps: int = 30,
+        bracket_expand_factor: float = 1.6,
+        on_fail: str = "nan",
+    ) -> np.ndarray:
+        rho_arr = np.asarray(rho_kgm3, dtype=float)
+        T_arr = np.asarray(T_K, dtype=float)
+        shape = np.broadcast(rho_arr, T_arr).shape
+        rho_b = np.broadcast_to(rho_arr, shape)
+        T_b = np.broadcast_to(T_arr, shape)
+        out = np.full(shape, np.nan, dtype=float)
+
+        if P_bracket_Pa is None:
+            P_min = self.P_min
+            P_max = self.P_max
+        else:
+            P_min = float(P_bracket_Pa[0])
+            P_max = float(P_bracket_Pa[1])
+        if P_min <= 0 or P_max <= P_min:
+            raise ValueError("P_bracket_Pa must satisfy 0 < P_min < P_max")
+
+        logP_lo = np.log(P_min)
+        logP_hi = np.log(P_max)
+
+        P0_b = None
+        if P0 is not None:
+            P0_arr = np.asarray(P0, dtype=float)
+            P0_b = np.broadcast_to(P0_arr, shape)
+
+        P_prev = np.nan
+
+        def rho_of_P_scalar(P_val: float, Ti: float) -> float:
+            if P_val <= 0 or Ti <= 0:
+                return np.nan
+            return float(np.asarray(self.get_rho_pt(P_val, Ti)))
+
+        for idx in np.ndindex(shape):
+            rho_t = float(rho_b[idx])
+            Ti = float(T_b[idx])
+
+            if (not np.isfinite(rho_t)) or (not np.isfinite(Ti)) or rho_t <= 0 or Ti <= 0:
+                continue
+
+            if np.isfinite(P_prev):
+                P_guess = float(P_prev)
+            elif P0_b is not None and np.isfinite(P0_b[idx]) and P0_b[idx] > 0:
+                P_guess = float(P0_b[idx])
+            else:
+                Ps = float(np.asarray(self.solid.get_p_rhot(rho_t, Ti, on_fail="nan")))
+                Pl = float(np.asarray(self.liquid.get_p_rhot(rho_t, Ti, on_fail="nan")))
+                if np.isfinite(Ps) and np.isfinite(Pl):
+                    P_guess = 0.5 * (Ps + Pl)
+                elif np.isfinite(Ps):
+                    P_guess = Ps
+                elif np.isfinite(Pl):
+                    P_guess = Pl
+                else:
+                    P_guess = np.sqrt(P_min * P_max)
+
+            P_guess = min(max(P_guess, P_min), P_max)
+            rho_scale = max(abs(rho_t), 1.0)
+
+            def resid(logP_vec):
+                P_try = float(np.exp(logP_vec[0]))
+                rho_m = rho_of_P_scalar(P_try, Ti)
+                if not np.isfinite(rho_m):
+                    return np.array([1e30], dtype=float)
+                return np.array([(rho_m - rho_t) / rho_scale], dtype=float)
+
+            P_sol = np.nan
+
+            if use_lsq_first:
+                x0 = np.array([np.log(P_guess)], dtype=float)
+                try:
+                    sol = least_squares(
+                        resid,
+                        x0,
+                        bounds=([logP_lo], [logP_hi]),
+                        xtol=rtol,
+                        ftol=rtol,
+                        gtol=rtol,
+                        max_nfev=lsq_max_nfev,
+                        method="trf",
+                    )
+                    if sol.success and np.isfinite(sol.x[0]):
+                        P_try = float(np.exp(sol.x[0]))
+                        r = resid(np.array([np.log(P_try)], dtype=float))[0]
+                        if np.isfinite(r) and abs(r) < 1e-8:
+                            P_sol = P_try
+                except Exception:
+                    pass
+
+            if not np.isfinite(P_sol):
+                def f(P_val):
+                    return rho_of_P_scalar(P_val, Ti) - rho_t
+
+                left = right = P_guess
+                f_guess = f(P_guess)
+
+                if np.isfinite(f_guess) and f_guess == 0.0:
+                    P_sol = P_guess
+                else:
+                    for _ in range(bracket_expand_steps):
+                        left = max(P_min, left / bracket_expand_factor)
+                        right = min(P_max, right * bracket_expand_factor)
+                        f_l = f(left)
+                        f_r = f(right)
+                        if not (np.isfinite(f_l) and np.isfinite(f_r)):
+                            continue
+                        if f_l == 0.0:
+                            P_sol = left
+                            break
+                        if f_r == 0.0:
+                            P_sol = right
+                            break
+                        if f_l * f_r < 0:
+                            try:
+                                P_sol = brenth(f, left, right, xtol=rtol, maxiter=max_iter)
+                            except Exception:
+                                P_sol = np.nan
+                            break
+
+                    if not np.isfinite(P_sol):
+                        fA = f(P_min)
+                        fB = f(P_max)
+                        if np.isfinite(fA) and np.isfinite(fB) and (fA == 0.0 or fB == 0.0 or fA * fB < 0):
+                            try:
+                                P_sol = brenth(f, P_min, P_max, xtol=rtol, maxiter=max_iter)
+                            except Exception:
+                                P_sol = np.nan
+
+            if np.isfinite(P_sol):
+                out[idx] = P_sol
+                P_prev = P_sol
+            elif on_fail == "raise":
+                raise RuntimeError(
+                    f"Failed P(rho,T) inversion: rho={rho_t:.3e} kg/m^3, T={Ti:.3f} K "
+                    f"within [{P_min:.3e}, {P_max:.3e}] Pa"
+                )
+
+        return float(out) if out.size == 1 else out
+
+    def get_s_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals = self.get_s_pt(P_arr, T_arr)
+        return float(vals) if scalar else vals
+
+    def get_u_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals = self.get_u_pt(P_arr, T_arr)
+        return float(vals) if scalar else vals
+
+    def get_g_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals = self.get_g_pt(P_arr, T_arr)
+        return float(vals) if scalar else vals
+
+    def get_CP_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals = self.get_CP_pt(P_arr, T_arr)
+        return float(vals) if scalar else vals
+
+    def get_CV_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals = self.get_CV_pt(P_arr, T_arr)
+        return float(vals) if scalar else vals
+
+    def get_alpha_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals = self.get_alpha_pt(P_arr, T_arr)
+        return float(vals) if scalar else vals
+
+    def get_cp_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        return self.get_CP_rhot(rho_kgm3, T_K)
+
+    def get_cv_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        return self.get_CV_rhot(rho_kgm3, T_K)
+
+    # -------------------------
+    # SP interface
+    # -------------------------
+
+    def get_T_sp_inv(self, _s, _P, bracket=(1.0, 200000.0), xtol=1e-8, maxiter=500, s_units="kbbar"):
+        s_arr = np.atleast_1d(_s).astype(float)
+        P_arr = np.atleast_1d(_P).astype(float)
+        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+
+        if str(s_units).lower() == "kbbar":
+            s_target_cgs = s_arr / self.erg_to_kbbar
+        else:
+            s_target_cgs = s_arr
+
+        Tmin, Tmax = float(bracket[0]), float(bracket[1])
+        Tmin = max(Tmin, self.T_min)
+        Tmax = min(Tmax, self.T_max)
+        if Tmin <= 0:
+            raise ValueError("bracket[0] must be > 0 K.")
+        if Tmax <= Tmin:
+            raise ValueError("Temperature bracket does not overlap table range.")
+
+        def _find_T(s_cgs, P_val):
+            if P_val <= 0 or not np.isfinite(P_val) or not np.isfinite(s_cgs):
+                return np.nan
+
+            def err(T):
+                return self._as_float(self.get_s_pt(P_val, T)) - s_cgs
+
+            try:
+                f_lo = err(Tmin)
+                f_hi = err(Tmax)
+                if not (np.isfinite(f_lo) and np.isfinite(f_hi)):
+                    return np.nan
+                if f_lo == 0.0:
+                    return Tmin
+                if f_hi == 0.0:
+                    return Tmax
+                if f_lo * f_hi > 0:
+                    return np.nan
+                return brenth(err, Tmin, Tmax, xtol=xtol, maxiter=maxiter)
+            except (ValueError, FloatingPointError, RuntimeError):
+                return np.nan
+
+        T_roots = np.vectorize(_find_T)(s_target_cgs, P_arr)
+        return float(T_roots) if T_roots.size == 1 else T_roots
+
+    def get_rhot_sp_2d_inv(
+        self,
+        s_target,
+        P_target,
+        *,
+        s_units="kbbar",
+        bounds_T: Optional[Tuple[float, float]] = None,
+        fail_value=np.nan,
+        return_diagnostics=False,
+        **kwargs,
+    ):
+        s_arr = np.asarray(s_target, dtype=float)
+        P_arr = np.asarray(P_target, dtype=float)
+        s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
+
+        T_out = np.asarray(
+            self.get_T_sp_inv(s_arr, P_arr, bracket=bounds_T or (self.T_min, self.T_max), s_units=s_units),
+            dtype=float,
+        )
+        rho_out = np.asarray(self.get_rho_pt(P_arr, T_out), dtype=float)
+
+        bad = ~np.isfinite(T_out) | ~np.isfinite(rho_out)
+        if np.any(bad):
+            T_out = T_out.copy()
+            rho_out = rho_out.copy()
+            T_out[bad] = fail_value
+            rho_out[bad] = fail_value
+
+        if return_diagnostics:
+            info = {
+                "success": np.isfinite(rho_out) & np.isfinite(T_out),
+                "cost": np.full(rho_out.shape, np.nan),
+                "nfev": np.full(rho_out.shape, np.nan),
+                "resid_P_frac": np.full(rho_out.shape, np.nan),
+                "resid_S_frac": np.full(rho_out.shape, np.nan),
+                "message": np.empty(rho_out.shape, dtype=object),
+            }
+            info["message"][~info["success"]] = "Failed SP->T inversion."
+            info["message"][info["success"]] = "Solved via T(S,P) then rho(P,T)."
+            return rho_out, T_out, info
+        return rho_out, T_out
+
+    def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        rho, _ = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        return float(rho) if scalar else rho
+
+    def get_T_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        return float(T) if scalar else T
+
+    def get_t_sp(self, S, P, tab=True, **inv_kwargs):
+        return self.get_T_sp(S, P, tab=tab, **inv_kwargs)
+
+    def get_u_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_u_rhot(rho, T)
+        return float(vals) if scalar else vals
+
+    def get_g_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_g_rhot(rho, T)
+        return float(vals) if scalar else vals
+
+    def get_CP_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_CP_rhot(rho, T)
+        return float(vals) if scalar else vals
+
+    def get_CV_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_CV_rhot(rho, T)
+        return float(vals) if scalar else vals
+
+    def get_alpha_sp(self, S, P, tab=True, **inv_kwargs):
+        scalar, S_arr, P_arr = self._broadcast(S, P)
+        rho, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
+        vals = self.get_alpha_rhot(rho, T)
+        return float(vals) if scalar else vals
+
+    def get_cp_sp(self, S, P, tab=True, **inv_kwargs):
+        return self.get_CP_sp(S, P, tab=tab, **inv_kwargs)
+
+    def get_cv_sp(self, S, P, tab=True, **inv_kwargs):
+        return self.get_CV_sp(S, P, tab=tab, **inv_kwargs)
+
+    # -------------------------
+    # SRho interface
+    # -------------------------
+
+    def get_T_srho_inv(self, _s, _rho, bracket=(1.0, 200000.0), xtol=1e-8, maxiter=500, s_units="kbbar"):
+        s_arr = np.atleast_1d(_s).astype(float)
+        rho_arr = np.atleast_1d(_rho).astype(float)
+        s_arr, rho_arr = np.broadcast_arrays(s_arr, rho_arr)
+
+        if str(s_units).lower() == "kbbar":
+            s_target_cgs = s_arr / self.erg_to_kbbar
+        else:
+            s_target_cgs = s_arr
+
+        Tmin, Tmax = float(bracket[0]), float(bracket[1])
+        Tmin = max(Tmin, self.T_min)
+        Tmax = min(Tmax, self.T_max)
+        if Tmin <= 0:
+            raise ValueError("bracket[0] must be > 0 K.")
+        if Tmax <= Tmin:
+            raise ValueError("Temperature bracket does not overlap table range.")
+
+        def _find_T(s_cgs, rho_val):
+            if rho_val <= 0 or not np.isfinite(rho_val) or not np.isfinite(s_cgs):
+                return np.nan
+
+            def err(T):
+                return self._as_float(self.get_s_rhot(rho_val, T)) - s_cgs
+
+            try:
+                f_lo = err(Tmin)
+                f_hi = err(Tmax)
+                if not (np.isfinite(f_lo) and np.isfinite(f_hi)):
+                    return np.nan
+                if f_lo == 0.0:
+                    return Tmin
+                if f_hi == 0.0:
+                    return Tmax
+                if f_lo * f_hi > 0:
+                    return np.nan
+                return brenth(err, Tmin, Tmax, xtol=xtol, maxiter=maxiter)
+            except (ValueError, FloatingPointError, RuntimeError):
+                return np.nan
+
+        T_roots = np.vectorize(_find_T)(s_target_cgs, rho_arr)
+        return float(T_roots) if T_roots.size == 1 else T_roots
+
+    def get_T_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        return float(T) if scalar else T
+
+    def get_p_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_p_rhot(rho_arr, T)
+        return float(vals) if scalar else vals
+
+    def get_u_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_u_rhot(rho_arr, T)
+        return float(vals) if scalar else vals
+
+    def get_g_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_g_rhot(rho_arr, T)
+        return float(vals) if scalar else vals
+
+    def get_CP_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_CP_rhot(rho_arr, T)
+        return float(vals) if scalar else vals
+
+    def get_CV_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_CV_rhot(rho_arr, T)
+        return float(vals) if scalar else vals
+
+    def get_alpha_srho(self, S, rho, tab=True, **inv_kwargs):
+        scalar, S_arr, rho_arr = self._broadcast(S, rho)
+        T = self.get_T_srho_inv(S_arr, rho_arr, **inv_kwargs)
+        vals = self.get_alpha_rhot(rho_arr, T)
+        return float(vals) if scalar else vals
+
+    def get_cp_srho(self, S, rho, tab=True, **inv_kwargs):
+        return self.get_CP_srho(S, rho, tab=tab, **inv_kwargs)
+
+    def get_cv_srho(self, S, rho, tab=True, **inv_kwargs):
+        return self.get_CV_srho(S, rho, tab=tab, **inv_kwargs)
+
+
 # Alias for explicit naming
 Fe_EOS_Gonzalez = Fe_EOS
