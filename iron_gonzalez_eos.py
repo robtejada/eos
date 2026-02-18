@@ -182,8 +182,10 @@ class Fe_EOS:
     """
     Gonzalez-Cataldo & Militzer iron EOS reader/interpolator.
 
-    Loads either solid or liquid Fe text tables and builds interpolators for:
-      P(rho, T), S(rho, T), U(rho, T), G(rho, T)
+    Loads either solid or liquid Fe text tables and builds native PT interpolators for:
+      rho(P, T), S(P, T), U(P, T), G(P, T)
+
+    RHOT quantities (e.g., P(rho,T), S(rho,T)) are obtained through inversion/wrappers.
 
     Units:
       Inputs:
@@ -229,9 +231,9 @@ class Fe_EOS:
         diff_abs_T: float = 100.0,
         diff_rel_P: float = 1e-2,
         diff_abs_P: float = 1e9,
-        grid_n_rho: Optional[int] = None,
+        grid_n_P: Optional[int] = None,
         grid_n_T: Optional[int] = None,
-        grid_rho_bounds: Optional[Tuple[float, float]] = None,
+        grid_P_bounds: Optional[Tuple[float, float]] = None,
         grid_T_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
         """
@@ -239,9 +241,9 @@ class Fe_EOS:
         ----------
         phase : {"solid", "liquid"}
             Which Gonzalez table to load.
-        grid_n_rho, grid_n_T : int, optional
-            Number of regular rho/T samples for the rectangularized EOS grid.
-        grid_rho_bounds, grid_T_bounds : tuple, optional
+        grid_n_P, grid_n_T : int, optional
+            Number of regular P/T samples for the rectangularized EOS grid.
+        grid_P_bounds, grid_T_bounds : tuple, optional
             Explicit (min, max) bounds for the regularized grid axes.
         """
         self.phase = str(phase).lower()
@@ -256,10 +258,10 @@ class Fe_EOS:
         self._data_dir = self._resolve_data_dir(data_dir)
         self._file_path = self._data_dir / self._PHASE_FILES[self.phase]
 
-        if grid_rho_bounds is None or grid_T_bounds is None:
-            rho_bounds_all, T_bounds_all = self._global_phase_bounds(self._data_dir)
-            if grid_rho_bounds is None:
-                grid_rho_bounds = rho_bounds_all
+        if grid_P_bounds is None or grid_T_bounds is None:
+            P_bounds_all, T_bounds_all = self._global_phase_bounds(self._data_dir)
+            if grid_P_bounds is None:
+                grid_P_bounds = P_bounds_all
             if grid_T_bounds is None:
                 grid_T_bounds = T_bounds_all
 
@@ -273,40 +275,40 @@ class Fe_EOS:
         self.G_table_si = table["G_Jkg"]
 
         rect_builder = GonzalezRectGridBuilder(
-            self.rho_table,
+            self.P_table,
             self.T_table,
             {
-                "P": self.P_table,
+                "rho": self.rho_table,
                 "S": self.S_table_si,
                 "U": self.U_table_si,
                 "G": self.G_table_si,
             },
-            n_rho=grid_n_rho,
+            n_rho=grid_n_P,
             n_T=grid_n_T,
-            rho_bounds=grid_rho_bounds,
+            rho_bounds=grid_P_bounds,
             T_bounds=grid_T_bounds,
         )
         rect = rect_builder.build()
 
-        self.rho_vals_rect = np.asarray(rect["rho_axis"], dtype=float)
+        self.P_vals_rect = np.asarray(rect["rho_axis"], dtype=float)
         self.T_vals_rect = np.asarray(rect["T_axis"], dtype=float)
-        self.P_grid_rect = np.asarray(rect["P"], dtype=float)
+        self.rho_grid_rect = np.asarray(rect["rho"], dtype=float)
         self.S_grid_rect_si = np.asarray(rect["S"], dtype=float)
         self.U_grid_rect_si = np.asarray(rect["U"], dtype=float)
         self.G_grid_rect_si = np.asarray(rect["G"], dtype=float)
 
-        self.rho_min = float(self.rho_vals_rect[0])
-        self.rho_max = float(self.rho_vals_rect[-1])
+        self.P_min = float(self.P_vals_rect[0])
+        self.P_max = float(self.P_vals_rect[-1])
         self.T_min = float(self.T_vals_rect[0])
         self.T_max = float(self.T_vals_rect[-1])
-        self.P_min = float(np.min(self.P_table))
-        self.P_max = float(np.max(self.P_table))
+        self.rho_min = float(np.nanmin(self.rho_grid_rect))
+        self.rho_max = float(np.nanmax(self.rho_grid_rect))
 
         self._surf: Dict[str, GonzalezRegularGridSurface] = {
-            "P": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.P_grid_rect),
-            "S": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.S_grid_rect_si),
-            "U": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.U_grid_rect_si),
-            "G": GonzalezRegularGridSurface(self.rho_vals_rect, self.T_vals_rect, self.G_grid_rect_si),
+            "rho": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.rho_grid_rect),
+            "S": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.S_grid_rect_si),
+            "U": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.U_grid_rect_si),
+            "G": GonzalezRegularGridSurface(self.P_vals_rect, self.T_vals_rect, self.G_grid_rect_si),
         }
 
         self._build_isotherm_seed_index()
@@ -347,8 +349,8 @@ class Fe_EOS:
         if key in cls._GLOBAL_BOUNDS_CACHE:
             return cls._GLOBAL_BOUNDS_CACHE[key]
 
-        rho_min = np.inf
-        rho_max = -np.inf
+        P_min = np.inf
+        P_max = -np.inf
         T_min = np.inf
         T_max = -np.inf
 
@@ -357,15 +359,15 @@ class Fe_EOS:
             if not path.is_file():
                 continue
             table = cls._read_table(path)
-            rho_min = min(rho_min, float(np.min(table["rho_kgm3"])))
-            rho_max = max(rho_max, float(np.max(table["rho_kgm3"])))
+            P_min = min(P_min, float(np.min(table["P_Pa"])))
+            P_max = max(P_max, float(np.max(table["P_Pa"])))
             T_min = min(T_min, float(np.min(table["T_K"])))
             T_max = max(T_max, float(np.max(table["T_K"])))
 
-        if not np.isfinite(rho_min) or not np.isfinite(T_min):
+        if not np.isfinite(P_min) or not np.isfinite(T_min):
             raise FileNotFoundError("Could not determine global bounds for Gonzalez iron tables.")
 
-        out = ((rho_min, rho_max), (T_min, T_max))
+        out = ((P_min, P_max), (T_min, T_max))
         cls._GLOBAL_BOUNDS_CACHE[key] = out
         return out
 
@@ -418,9 +420,9 @@ class Fe_EOS:
         G_Jkg = np.asarray(G_Jkg, dtype=float)
         S_JkgK = np.asarray(S_JkgK, dtype=float)
 
-        # Drop exact duplicate (rho, T) rows (liquid table has a few exact duplicates).
-        rt = np.column_stack((rho_kgm3, T_K))
-        _, keep_idx = np.unique(rt, axis=0, return_index=True)
+        # Drop exact duplicate (P, T) rows (liquid table has a few exact duplicates).
+        pt = np.column_stack((P_Pa, T_K))
+        _, keep_idx = np.unique(pt, axis=0, return_index=True)
         keep_idx = np.sort(keep_idx)
 
         return {
@@ -434,7 +436,7 @@ class Fe_EOS:
 
     def _build_isotherm_seed_index(self) -> None:
         self.tvals_iso = np.array(sorted(np.unique(self.T_table)), dtype=float)
-        self._seed_by_T: Dict[float, Tuple[np.ndarray, np.ndarray]] = {}
+        self._seed_by_T: Dict[float, Dict[str, Tuple[np.ndarray, np.ndarray]]] = {}
 
         for T in self.tvals_iso:
             mask = self.T_table == T
@@ -445,9 +447,19 @@ class Fe_EOS:
             P = P[order]
             rho = rho[order]
 
-            P_u, idx = np.unique(P, return_index=True)
-            rho_u = rho[idx]
-            self._seed_by_T[float(T)] = (P_u, rho_u)
+            P_u, idxP = np.unique(P, return_index=True)
+            rho_uP = rho[idxP]
+
+            order_rho = np.argsort(rho)
+            rho_sorted = rho[order_rho]
+            P_sorted = P[order_rho]
+            rho_u, idxR = np.unique(rho_sorted, return_index=True)
+            P_uR = P_sorted[idxR]
+
+            self._seed_by_T[float(T)] = {
+                "rho_of_P": (P_u, rho_uP),
+                "P_of_rho": (rho_u, P_uR),
+            }
 
     # -------------------------
     # Utility helpers
@@ -466,25 +478,25 @@ class Fe_EOS:
     def _as_float(x) -> float:
         return float(np.asarray(x))
 
-    def _interp_property_si(self, key: str, rho_kgm3: np.ndarray, T_K: np.ndarray) -> np.ndarray:
-        rho = np.asarray(rho_kgm3, dtype=float)
+    def _interp_property_si(self, key: str, P_Pa: np.ndarray, T_K: np.ndarray) -> np.ndarray:
+        P = np.asarray(P_Pa, dtype=float)
         T = np.asarray(T_K, dtype=float)
 
-        if np.any(rho <= 0):
-            raise ValueError("Density rho must be > 0 kg/m^3.")
+        if np.any(P <= 0):
+            raise ValueError("Pressure P must be > 0 Pa.")
         if np.any(T <= 0):
             raise ValueError("Temperature T must be > 0 K.")
 
-        vals = self._surf[key](rho, T)
+        vals = self._surf[key](P, T)
         vals = np.asarray(vals, dtype=float)
         return vals
 
-    def _interp_property_si_scalar(self, key: str, rho_kgm3: float, T_K: float) -> float:
-        if (not np.isfinite(rho_kgm3)) or (rho_kgm3 <= 0):
+    def _interp_property_si_scalar(self, key: str, P_Pa: float, T_K: float) -> float:
+        if (not np.isfinite(P_Pa)) or (P_Pa <= 0):
             return np.nan
         if (not np.isfinite(T_K)) or (T_K <= 0):
             return np.nan
-        return float(self._surf[key](float(rho_kgm3), float(T_K)))
+        return float(self._surf[key](float(P_Pa), float(T_K)))
 
     def _rho_seed_from_isotherms(self, P_Pa: float, T_K: float) -> float:
         Ts = self.tvals_iso
@@ -492,7 +504,7 @@ class Fe_EOS:
             return np.sqrt(self.rho_min * self.rho_max)
 
         def rho_at_T(Tref: float) -> float:
-            P_grid, rho_grid = self._seed_by_T[float(Tref)]
+            P_grid, rho_grid = self._seed_by_T[float(Tref)]["rho_of_P"]
             return float(np.interp(P_Pa, P_grid, rho_grid, left=rho_grid[0], right=rho_grid[-1]))
 
         if T_K <= Ts[0]:
@@ -511,6 +523,32 @@ class Fe_EOS:
         rho_hi = rho_at_T(T_hi)
         w = (T_K - T_lo) / (T_hi - T_lo)
         return (1.0 - w) * rho_lo + w * rho_hi
+
+    def _p_seed_from_isotherms(self, rho_kgm3: float, T_K: float) -> float:
+        Ts = self.tvals_iso
+        if Ts.size == 0:
+            return np.sqrt(self.P_min * self.P_max)
+
+        def P_at_T(Tref: float) -> float:
+            rho_grid, P_grid = self._seed_by_T[float(Tref)]["P_of_rho"]
+            return float(np.interp(rho_kgm3, rho_grid, P_grid, left=P_grid[0], right=P_grid[-1]))
+
+        if T_K <= Ts[0]:
+            return P_at_T(Ts[0])
+        if T_K >= Ts[-1]:
+            return P_at_T(Ts[-1])
+
+        i_hi = int(np.searchsorted(Ts, T_K))
+        i_lo = i_hi - 1
+        T_lo = float(Ts[i_lo])
+        T_hi = float(Ts[i_hi])
+        if T_hi == T_lo:
+            return P_at_T(T_lo)
+
+        P_lo = P_at_T(T_lo)
+        P_hi = P_at_T(T_hi)
+        w = (T_K - T_lo) / (T_hi - T_lo)
+        return (1.0 - w) * P_lo + w * P_hi
 
     @staticmethod
     def _finite_diff_scalar(
@@ -558,29 +596,203 @@ class Fe_EOS:
         return np.nan
 
     # -------------------------
-    # Core RHOT interpolation API
+    # Core API (native PT basis)
     # -------------------------
 
-    def get_p_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
-        vals = self._interp_property_si("P", rho_arr, T_arr)
+    def get_rho_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals = self._interp_property_si("rho", P_arr, T_arr)
         return float(vals) if scalar else vals
+
+    def get_s_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals_si = self._interp_property_si("S", P_arr, T_arr)
+        vals = vals_si * S_CONV_CGS
+        return float(vals) if scalar else vals
+
+    def get_u_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals_si = self._interp_property_si("U", P_arr, T_arr)
+        vals = vals_si * U_CONV_CGS
+        return float(vals) if scalar else vals
+
+    def get_g_pt_native(self, P: ArrayLike, T: ArrayLike) -> np.ndarray:
+        scalar, P_arr, T_arr = self._broadcast(P, T)
+        vals_si = self._interp_property_si("G", P_arr, T_arr)
+        vals = vals_si * U_CONV_CGS
+        return float(vals) if scalar else vals
+
+    # -------------------------
+    # RHOT wrappers via PT inversion
+    # -------------------------
+
+    def get_p_rhot(
+        self,
+        rho_kgm3: ArrayLike,
+        T_K: ArrayLike,
+        P_bracket_Pa: Optional[Tuple[float, float]] = None,
+        max_iter: int = 200,
+        rtol: float = 1e-10,
+        P0: Optional[ArrayLike] = None,
+        use_lsq_first: bool = True,
+        lsq_max_nfev: int = 60,
+        bracket_expand_steps: int = 30,
+        bracket_expand_factor: float = 1.6,
+        on_fail: str = "nan",  # "nan" or "raise"
+    ) -> np.ndarray:
+        rho_arr = np.asarray(rho_kgm3, dtype=float)
+        T_arr = np.asarray(T_K, dtype=float)
+        shape = np.broadcast(rho_arr, T_arr).shape
+        rho_b = np.broadcast_to(rho_arr, shape)
+        T_b = np.broadcast_to(T_arr, shape)
+
+        out = np.full(shape, np.nan, dtype=float)
+
+        if P_bracket_Pa is None:
+            P_min = self.P_min
+            P_max = self.P_max
+        else:
+            P_min = float(P_bracket_Pa[0])
+            P_max = float(P_bracket_Pa[1])
+        if P_min <= 0 or P_max <= P_min:
+            raise ValueError("P_bracket_Pa must satisfy 0 < P_min < P_max")
+
+        logP_lo = np.log(P_min)
+        logP_hi = np.log(P_max)
+
+        P0_b = None
+        if P0 is not None:
+            P0_arr = np.asarray(P0, dtype=float)
+            P0_b = np.broadcast_to(P0_arr, shape)
+
+        P_prev = np.nan
+
+        def rho_of_P_scalar(P_val: float, Ti: float) -> float:
+            if P_val <= 0 or Ti <= 0:
+                return np.nan
+            return self._interp_property_si_scalar("rho", P_val, Ti)
+
+        for idx in np.ndindex(shape):
+            rho_t = float(rho_b[idx])
+            Ti = float(T_b[idx])
+
+            if (not np.isfinite(rho_t)) or (not np.isfinite(Ti)) or rho_t <= 0 or Ti <= 0:
+                continue
+
+            if np.isfinite(P_prev):
+                P_guess = float(P_prev)
+            elif P0_b is not None and np.isfinite(P0_b[idx]) and P0_b[idx] > 0:
+                P_guess = float(P0_b[idx])
+            else:
+                P_guess = self._p_seed_from_isotherms(rho_t, Ti)
+            P_guess = min(max(P_guess, P_min), P_max)
+
+            rho_scale = max(abs(rho_t), 1.0)
+
+            def resid(logP_vec):
+                P_try = float(np.exp(logP_vec[0]))
+                rho_m = rho_of_P_scalar(P_try, Ti)
+                if not np.isfinite(rho_m):
+                    return np.array([1e30], dtype=float)
+                return np.array([(rho_m - rho_t) / rho_scale], dtype=float)
+
+            P_sol = np.nan
+
+            if use_lsq_first:
+                x0 = np.array([np.log(P_guess)], dtype=float)
+                try:
+                    sol = least_squares(
+                        resid,
+                        x0,
+                        bounds=([logP_lo], [logP_hi]),
+                        xtol=rtol,
+                        ftol=rtol,
+                        gtol=rtol,
+                        max_nfev=lsq_max_nfev,
+                        method="trf",
+                    )
+                    if sol.success and np.isfinite(sol.x[0]):
+                        P_try = float(np.exp(sol.x[0]))
+                        r = resid(np.array([np.log(P_try)], dtype=float))[0]
+                        if np.isfinite(r) and abs(r) < 1e-8:
+                            P_sol = P_try
+                except Exception:
+                    pass
+
+            if not np.isfinite(P_sol):
+                def f(P_val):
+                    return rho_of_P_scalar(P_val, Ti) - rho_t
+
+                left = right = P_guess
+                f_left = f(right)
+
+                if not np.isfinite(f_left):
+                    P_guess = np.sqrt(P_min * P_max)
+                    left = right = P_guess
+                    f_left = f(right)
+
+                if np.isfinite(f_left) and f_left == 0.0:
+                    P_sol = P_guess
+                else:
+                    for _ in range(bracket_expand_steps):
+                        left = max(P_min, left / bracket_expand_factor)
+                        right = min(P_max, right * bracket_expand_factor)
+
+                        f_l = f(left)
+                        f_r = f(right)
+                        if not (np.isfinite(f_l) and np.isfinite(f_r)):
+                            continue
+                        if f_l == 0.0:
+                            P_sol = left
+                            break
+                        if f_r == 0.0:
+                            P_sol = right
+                            break
+                        if f_l * f_r < 0:
+                            try:
+                                P_sol = brenth(f, left, right, xtol=rtol, maxiter=max_iter)
+                            except Exception:
+                                P_sol = np.nan
+                            break
+
+                    if not np.isfinite(P_sol):
+                        fA = f(P_min)
+                        fB = f(P_max)
+                        if np.isfinite(fA) and np.isfinite(fB) and (fA == 0.0 or fB == 0.0 or fA * fB < 0):
+                            try:
+                                P_sol = brenth(f, P_min, P_max, xtol=rtol, maxiter=max_iter)
+                            except Exception:
+                                P_sol = np.nan
+
+            if np.isfinite(P_sol):
+                out[idx] = P_sol
+                P_prev = P_sol
+            elif on_fail == "raise":
+                raise RuntimeError(
+                    f"Failed P(rho,T) inversion: rho={rho_t:.3e} kg/m^3, T={Ti:.3f} K "
+                    f"within [{P_min:.3e}, {P_max:.3e}] Pa"
+                )
+
+        return float(out) if out.size == 1 else out
 
     def get_s_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
         scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
-        vals_si = self._interp_property_si("S", rho_arr, T_arr)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals_si = self._interp_property_si("S", P_arr, T_arr)
         vals = vals_si * S_CONV_CGS
         return float(vals) if scalar else vals
 
     def get_u_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
         scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
-        vals_si = self._interp_property_si("U", rho_arr, T_arr)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals_si = self._interp_property_si("U", P_arr, T_arr)
         vals = vals_si * U_CONV_CGS
         return float(vals) if scalar else vals
 
     def get_g_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
         scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
-        vals_si = self._interp_property_si("G", rho_arr, T_arr)
+        P_arr = self.get_p_rhot(rho_arr, T_arr)
+        vals_si = self._interp_property_si("G", P_arr, T_arr)
         vals = vals_si * U_CONV_CGS
         return float(vals) if scalar else vals
 
@@ -590,7 +802,11 @@ class Fe_EOS:
 
     def _cv_si_scalar(self, rho: float, T: float) -> float:
         def u_of_T(Ti: float) -> float:
-            return self._interp_property_si_scalar("U", rho, Ti)
+            P_i = self.get_p_rhot(rho, Ti)
+            P_i = float(np.asarray(P_i))
+            if not np.isfinite(P_i):
+                return np.nan
+            return self._interp_property_si_scalar("U", P_i, Ti)
 
         return self._finite_diff_scalar(
             u_of_T,
@@ -604,22 +820,12 @@ class Fe_EOS:
     def _s_pt_si_scalar(self, P: float, T: float, rho0: Optional[float] = None) -> float:
         if (not np.isfinite(P)) or (not np.isfinite(T)) or (P <= 0) or (T <= 0):
             return np.nan
-        rho_guess = rho0 if (rho0 is not None and np.isfinite(rho0) and rho0 > 0) else self._rho_seed_from_isotherms(P, T)
-        rho = self.get_rho_pt_inv(P, T, rho0=rho_guess, on_fail="nan")
-        rho = float(np.asarray(rho))
-        if not np.isfinite(rho):
-            return np.nan
-        return self._interp_property_si_scalar("S", rho, T)
+        return self._interp_property_si_scalar("S", P, T)
 
     def _g_pt_si_scalar(self, P: float, T: float, rho0: Optional[float] = None) -> float:
         if (not np.isfinite(P)) or (not np.isfinite(T)) or (P <= 0) or (T <= 0):
             return np.nan
-        rho_guess = rho0 if (rho0 is not None and np.isfinite(rho0) and rho0 > 0) else self._rho_seed_from_isotherms(P, T)
-        rho = self.get_rho_pt_inv(P, T, rho0=rho_guess, on_fail="nan")
-        rho = float(np.asarray(rho))
-        if not np.isfinite(rho):
-            return np.nan
-        return self._interp_property_si_scalar("G", rho, T)
+        return self._interp_property_si_scalar("G", P, T)
 
     def _cp_pt_si_scalar(self, P: float, T: float, rho0: Optional[float] = None) -> float:
         def s_of_T(Ti: float) -> float:
@@ -722,7 +928,7 @@ class Fe_EOS:
         return self.get_CP_rhot(rho_kgm3, T_K)
 
     # -------------------------
-    # Inversion rho(P,T)
+    # PT inversion wrappers
     # -------------------------
 
     def get_rho_pt_inv(
@@ -739,155 +945,20 @@ class Fe_EOS:
         bracket_expand_factor: float = 1.6,
         on_fail: str = "nan",  # "nan" or "raise"
     ) -> np.ndarray:
-        P_arr = np.asarray(P, dtype=float)
-        T_arr = np.asarray(T_K, dtype=float)
-        shape = np.broadcast(P_arr, T_arr).shape
-        P_b = np.broadcast_to(P_arr, shape)
-        T_b = np.broadcast_to(T_arr, shape)
-
-        out = np.full(shape, np.nan, dtype=float)
-
-        if rho_bracket_kgm3 is None:
-            rho_min = self.rho_min
-            rho_max = self.rho_max
-        else:
-            rho_min = float(rho_bracket_kgm3[0])
-            rho_max = float(rho_bracket_kgm3[1])
-
-        if rho_min <= 0 or rho_max <= rho_min:
-            raise ValueError("rho_bracket_kgm3 must satisfy 0 < rho_min < rho_max")
-
-        log_rho_lo = np.log(rho_min)
-        log_rho_hi = np.log(rho_max)
-
-        rho0_b = None
-        if rho0 is not None:
-            rho0_arr = np.asarray(rho0, dtype=float)
-            rho0_b = np.broadcast_to(rho0_arr, shape)
-
-        rho_prev = np.nan
-
-        def P_of_rho_scalar(rho_val: float, Ti: float) -> float:
-            if rho_val <= 0 or Ti <= 0:
-                return np.nan
-            return self._interp_property_si_scalar("P", rho_val, Ti)
-
-        for idx in np.ndindex(shape):
-            Pt = float(P_b[idx])
-            Ti = float(T_b[idx])
-
-            if (not np.isfinite(Pt)) or (not np.isfinite(Ti)) or Pt <= 0 or Ti <= 0:
-                continue
-
-            if np.isfinite(rho_prev):
-                rho_guess = float(rho_prev)
-            elif rho0_b is not None and np.isfinite(rho0_b[idx]) and rho0_b[idx] > 0:
-                rho_guess = float(rho0_b[idx])
-            else:
-                rho_guess = self._rho_seed_from_isotherms(Pt, Ti)
-
-            rho_guess = min(max(rho_guess, rho_min), rho_max)
-
-            P_scale = max(abs(Pt), 1.0)
-
-            def resid(logrho_vec):
-                rho_try = float(np.exp(logrho_vec[0]))
-                Pm = P_of_rho_scalar(rho_try, Ti)
-                if not np.isfinite(Pm):
-                    return np.array([1e30], dtype=float)
-                return np.array([(Pm - Pt) / P_scale], dtype=float)
-
-            rho_sol = np.nan
-
-            if use_lsq_first:
-                x0 = np.array([np.log(rho_guess)], dtype=float)
-                try:
-                    sol = least_squares(
-                        resid,
-                        x0,
-                        bounds=([log_rho_lo], [log_rho_hi]),
-                        xtol=rtol,
-                        ftol=rtol,
-                        gtol=rtol,
-                        max_nfev=lsq_max_nfev,
-                        method="trf",
-                    )
-                    if sol.success and np.isfinite(sol.x[0]):
-                        rho_try = float(np.exp(sol.x[0]))
-                        r = resid(np.array([np.log(rho_try)], dtype=float))[0]
-                        if np.isfinite(r) and abs(r) < 1e-8:
-                            rho_sol = rho_try
-                except Exception:
-                    pass
-
-            if not np.isfinite(rho_sol):
-                def f(rho_val):
-                    return P_of_rho_scalar(rho_val, Ti) - Pt
-
-                left = right = rho_guess
-                f_left = f(right)
-
-                if not np.isfinite(f_left):
-                    rho_guess = np.sqrt(rho_min * rho_max)
-                    left = right = rho_guess
-                    f_left = f(right)
-
-                if np.isfinite(f_left) and f_left == 0.0:
-                    rho_sol = rho_guess
-                else:
-                    for _ in range(bracket_expand_steps):
-                        left = max(rho_min, left / bracket_expand_factor)
-                        right = min(rho_max, right * bracket_expand_factor)
-
-                        f_l = f(left)
-                        f_r = f(right)
-                        if not (np.isfinite(f_l) and np.isfinite(f_r)):
-                            continue
-
-                        if f_l == 0.0:
-                            rho_sol = left
-                            break
-                        if f_r == 0.0:
-                            rho_sol = right
-                            break
-                        if f_l * f_r < 0:
-                            try:
-                                rho_sol = brenth(f, left, right, xtol=rtol, maxiter=max_iter)
-                            except Exception:
-                                rho_sol = np.nan
-                            break
-
-                    if not np.isfinite(rho_sol):
-                        fA = f(rho_min)
-                        fB = f(rho_max)
-                        if np.isfinite(fA) and np.isfinite(fB) and (fA == 0.0 or fB == 0.0 or fA * fB < 0):
-                            try:
-                                rho_sol = brenth(f, rho_min, rho_max, xtol=rtol, maxiter=max_iter)
-                            except Exception:
-                                rho_sol = np.nan
-
-            if np.isfinite(rho_sol):
-                out[idx] = rho_sol
-                rho_prev = rho_sol
-            elif on_fail == "raise":
-                raise RuntimeError(
-                    f"Failed rho(P,T) inversion: P={Pt:.3e} Pa, T={Ti:.3f} K "
-                    f"within [{rho_min}, {rho_max}] kg/m^3"
-                )
-
-        return float(out) if out.size == 1 else out
+        vals = self.get_rho_pt_native(P, T_K)
+        arr = np.asarray(vals, dtype=float)
+        if on_fail == "raise" and np.any(~np.isfinite(arr)):
+            raise RuntimeError("Failed rho(P,T) interpolation.")
+        return vals
 
     def get_s_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
-        rho = self.get_rho_pt_inv(P, T, rho0=rho0, **inv_kwargs)
-        return self.get_s_rhot(rho, T)
+        return self.get_s_pt_native(P, T)
 
     def get_u_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
-        rho = self.get_rho_pt_inv(P, T, rho0=rho0, **inv_kwargs)
-        return self.get_u_rhot(rho, T)
+        return self.get_u_pt_native(P, T)
 
     def get_g_pt_inv(self, P: ArrayLike, T: ArrayLike, rho0: Optional[ArrayLike] = None, **inv_kwargs):
-        rho = self.get_rho_pt_inv(P, T, rho0=rho0, **inv_kwargs)
-        return self.get_g_rhot(rho, T)
+        return self.get_g_pt_native(P, T)
 
     # -------------------------
     # Inversion T(S,rho)
@@ -1108,125 +1179,31 @@ class Fe_EOS:
         s_arr = np.asarray(s_target, dtype=float)
         P_arr = np.asarray(P_target, dtype=float)
         s_arr, P_arr = np.broadcast_arrays(s_arr, P_arr)
-        shape = s_arr.shape
 
-        if str(s_units).lower() == "kbbar":
-            s_cgs = s_arr / self.erg_to_kbbar
-        else:
-            s_cgs = s_arr
+        T_out = np.asarray(
+            self.get_T_sp_inv(s_arr, P_arr, bracket=bounds_T or (self.T_min, self.T_max), s_units=s_units),
+            dtype=float,
+        )
+        rho_out = np.asarray(self.get_rho_pt(P_arr, T_out), dtype=float)
 
-        rho_out = np.full(shape, fail_value, dtype=float)
-        T_out = np.full(shape, fail_value, dtype=float)
-
-        info = {
-            "success": np.zeros(shape, dtype=bool),
-            "cost": np.full(shape, np.nan),
-            "nfev": np.full(shape, np.nan),
-            "resid_P_frac": np.full(shape, np.nan),
-            "resid_S_frac": np.full(shape, np.nan),
-            "message": np.empty(shape, dtype=object),
-        } if return_diagnostics else None
-
-        if bounds_rho is None:
-            rho_lo = self.rho_min
-            rho_hi = self.rho_max
-        else:
-            rho_lo, rho_hi = map(float, bounds_rho)
-
-        if bounds_T is None:
-            T_lo = self.T_min
-            T_hi = self.T_max
-        else:
-            T_lo, T_hi = map(float, bounds_T)
-
-        if rho_lo <= 0 or T_lo <= 0:
-            raise ValueError("Lower bounds for rho and T must be > 0.")
-
-        lb = np.array([np.log(rho_lo), np.log(T_lo)], dtype=float)
-        ub = np.array([np.log(rho_hi), np.log(T_hi)], dtype=float)
-
-        if guess == "auto":
-            T_seed = float(np.median(self.tvals_iso) if T_guess0 is None else T_guess0)
-            T_seed = min(max(T_seed, T_lo), T_hi)
-            rho_seed = None
-        else:
-            rho_seed, T_seed = map(float, guess)
-            rho_seed = min(max(rho_seed, rho_lo), rho_hi)
-            T_seed = min(max(T_seed, T_lo), T_hi)
-
-        rho_guess_cur = rho_seed
-        T_guess_cur = T_seed
-
-        for idx in np.ndindex(shape):
-            Pt = float(P_arr[idx])
-            St = float(s_cgs[idx])
-
-            if not (np.isfinite(Pt) and np.isfinite(St)) or Pt <= 0:
-                if return_diagnostics:
-                    info["message"][idx] = "Invalid target (non-finite or P<=0)."
-                continue
-
-            if guess == "auto" and rho_guess_cur is None:
-                rho_guess_cur = float(
-                    np.asarray(self.get_rho_pt_inv(Pt, T_guess_cur, on_fail="nan"))
-                )
-                if not np.isfinite(rho_guess_cur):
-                    rho_guess_cur = self._rho_seed_from_isotherms(Pt, T_guess_cur)
-
-            rho_guess_cur = min(max(float(rho_guess_cur), rho_lo), rho_hi)
-            T_guess_cur = min(max(float(T_guess_cur), T_lo), T_hi)
-
-            x0 = np.array([np.log(rho_guess_cur), np.log(T_guess_cur)], dtype=float)
-
-            P_scale = max(abs(Pt), 1.0e9)
-            S_scale = max(abs(St), 1.0)
-
-            def residuals(x):
-                rho = float(np.exp(x[0]))
-                T = float(np.exp(x[1]))
-                Pm = float(np.asarray(self.get_p_rhot(rho, T)))
-                Sm = float(np.asarray(self.get_s_rhot(rho, T)))
-                if not (np.isfinite(Pm) and np.isfinite(Sm)):
-                    return np.array([1e30, 1e30], dtype=float)
-                return np.array([(Pm - Pt) / P_scale, (Sm - St) / S_scale], dtype=float)
-
-            try:
-                sol = least_squares(
-                    residuals,
-                    x0,
-                    bounds=(lb, ub),
-                    xtol=xtol,
-                    ftol=ftol,
-                    gtol=gtol,
-                    max_nfev=max_nfev,
-                    method="trf",
-                )
-
-                if sol.success and np.all(np.isfinite(sol.x)):
-                    rho_sol = float(np.exp(sol.x[0]))
-                    T_sol = float(np.exp(sol.x[1]))
-                    rho_out[idx] = rho_sol
-                    T_out[idx] = T_sol
-
-                    rho_guess_cur = rho_sol
-                    T_guess_cur = T_sol
-
-                    if return_diagnostics:
-                        info["success"][idx] = True
-                        info["cost"][idx] = sol.cost
-                        info["nfev"][idx] = sol.nfev
-                        r = residuals(sol.x)
-                        info["resid_P_frac"][idx] = abs(r[0])
-                        info["resid_S_frac"][idx] = abs(r[1])
-                        info["message"][idx] = sol.message
-                else:
-                    if return_diagnostics:
-                        info["message"][idx] = getattr(sol, "message", "least_squares failed")
-            except Exception as e:
-                if return_diagnostics:
-                    info["message"][idx] = f"Exception: {e}"
+        bad = ~np.isfinite(T_out) | ~np.isfinite(rho_out)
+        if np.any(bad):
+            T_out = T_out.copy()
+            rho_out = rho_out.copy()
+            T_out[bad] = fail_value
+            rho_out[bad] = fail_value
 
         if return_diagnostics:
+            info = {
+                "success": np.isfinite(rho_out) & np.isfinite(T_out),
+                "cost": np.full(rho_out.shape, np.nan),
+                "nfev": np.full(rho_out.shape, np.nan),
+                "resid_P_frac": np.full(rho_out.shape, np.nan),
+                "resid_S_frac": np.full(rho_out.shape, np.nan),
+                "message": np.empty(rho_out.shape, dtype=object),
+            }
+            info["message"][~info["success"]] = "Failed SP->T inversion."
+            info["message"][info["success"]] = "Solved via T(S,P) then rho(P,T)."
             return rho_out, T_out, info
         return rho_out, T_out
 
@@ -1236,25 +1213,22 @@ class Fe_EOS:
 
     def get_rho_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         scalar, P_arr, T_arr = self._broadcast(P, T)
-        vals = self.get_rho_pt_inv(P_arr, T_arr, rho0=rho0, **inv_kwargs)
+        vals = self.get_rho_pt_native(P_arr, T_arr)
         return float(vals) if scalar else vals
 
     def get_s_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         scalar, P_arr, T_arr = self._broadcast(P, T)
-        rho = self.get_rho_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs)
-        vals = self.get_s_rhot(rho, T_arr)
+        vals = self.get_s_pt_native(P_arr, T_arr)
         return float(vals) if scalar else vals
 
     def get_u_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         scalar, P_arr, T_arr = self._broadcast(P, T)
-        rho = self.get_rho_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs)
-        vals = self.get_u_rhot(rho, T_arr)
+        vals = self.get_u_pt_native(P_arr, T_arr)
         return float(vals) if scalar else vals
 
     def get_g_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         scalar, P_arr, T_arr = self._broadcast(P, T)
-        rho = self.get_rho_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs)
-        vals = self.get_g_rhot(rho, T_arr)
+        vals = self.get_g_pt_native(P_arr, T_arr)
         return float(vals) if scalar else vals
 
     def get_CP_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
@@ -1275,8 +1249,11 @@ class Fe_EOS:
 
     def get_CV_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         scalar, P_arr, T_arr = self._broadcast(P, T)
-        rho = self.get_rho_pt(P_arr, T_arr, tab=tab, rho0=rho0, **inv_kwargs)
-        vals = self.get_CV_rhot(rho, T_arr)
+        out = np.full(P_arr.shape, np.nan, dtype=float)
+        rho_arr = self.get_rho_pt_native(P_arr, T_arr)
+        for idx in np.ndindex(P_arr.shape):
+            out[idx] = self._cv_si_scalar(float(rho_arr[idx]), float(T_arr[idx]))
+        vals = out * S_CONV_CGS
         return float(vals) if scalar else vals
 
     def get_alpha_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
