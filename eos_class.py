@@ -2,7 +2,7 @@ import numpy as np
 import os
 from scipy.interpolate import RegularGridInterpolator as RGI
 from scipy.interpolate import interp1d
-import const
+import eos.const as const
 import pdb
 import pandas as pd
 from tqdm import tqdm
