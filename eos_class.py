@@ -157,7 +157,7 @@ class hhe:
 
 class mixtures(hhe):
     def __init__(self, hhe_eos,
-                    z_eos,
+                    z_eos = 'aqua',
                     zmix_eos1 = 'aqua',
                     zmix_eos2 = 'methane',
                     zmix_eos3 = 'ammonia',

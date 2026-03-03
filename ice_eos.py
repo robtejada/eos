@@ -261,4 +261,3 @@ class ice_eos:
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return s_intrinsic.item() if hasattr(s_intrinsic, 'item') else s_intrinsic
         return s_intrinsic
-

@@ -167,7 +167,7 @@ def get_p_rhou_tab(lgrho, lgu):
         float(p_rgi_rhou(np.array([lgrho, lgu]).T))
     return p_rgi_rhou(np.array([lgrho, lgu]).T)
 
-def get_t_rhou_tab(lgrho, lgu):
+def get_logt_rhou_tab(lgrho, lgu):
     if np.isscalar(lgrho):
         return float(t_rgi_rhou(np.array([lgrho, lgu]).T))
     return t_rgi_rhou(np.array([lgrho, lgu]).T)
@@ -247,7 +247,7 @@ def err_t_srho(lgt, sval, rhoval):
     s_ = get_s_pt_tab(lgp, lgt)*erg_to_kbbar
     return  s_/sval - 1
 
-def get_p_rhot(rho, t ,alg='brenth'):
+def get_logp_rhot(rho, t ,alg='brenth'):
     if alg == 'root':
         if np.isscalar(rho):
             rho, t = np.array([rho]), np.array([t])
@@ -262,10 +262,10 @@ def get_p_rhot(rho, t ,alg='brenth'):
             except:
                 #print('rho={}, t={}, y={}'.format(rho, t, y))
                 raise
-        sol = np.array([get_p_rhot(rho_, t_) for rho_, t_ in zip(rho, t)])
+        sol = np.array([get_logp_rhot(rho_, t_) for rho_, t_ in zip(rho, t)])
         return sol
 
-def get_t_sp(s, p, alg='brenth'):
+def get_logt_sp(s, p, alg='brenth'):
     if alg == 'root':
         if np.isscalar(s):
             s, p = np.array([s]), np.array([p])
@@ -280,10 +280,10 @@ def get_t_sp(s, p, alg='brenth'):
             except:
                 #print('s={}, p={}, y={}'.format(s, p, y))
                 raise
-        sol = np.array([get_t_sp(s_, p_) for s_, p_ in zip(s, p)])
+        sol = np.array([get_logt_sp(s_, p_) for s_, p_ in zip(s, p)])
         return sol
 
-def get_t_srho(s, rho, alg='brenth'):
+def get_logt_srho(s, rho, alg='brenth'):
     if alg == 'root':
         if np.isscalar(s):
             s, rho = np.array([s]), np.array([rho])
@@ -298,7 +298,7 @@ def get_t_srho(s, rho, alg='brenth'):
             except:
                 #print('s={}, rho={}, y={}'.format(s, rho, y))
                 raise
-        sol = np.array([get_t_srho(s_, rho_) for s_, rho_ in zip(s, rho)])
+        sol = np.array([get_logt_srho(s_, rho_) for s_, rho_ in zip(s, rho)])
         return sol
 
 
