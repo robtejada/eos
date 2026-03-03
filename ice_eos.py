@@ -34,9 +34,6 @@ class ice_eos:
             Path to the directory containing the data files.
         """
 
-        # self.methane = np.load('%s/methane_ammonia/methane_eos_pt.npz' % CURR_DIR)
-        # self.ammonia = np.load('%s/methane_ammonia/ammonia_eos_pt.npz' % CURR_DIR)
-
         self.methane = np.load('%s/methane_ammonia/methane_eos_pt_extended.npz' % CURR_DIR)
         self.ammonia = np.load('%s/methane_ammonia/ammonia_eos_pt_extended.npz' % CURR_DIR)
 
@@ -44,48 +41,6 @@ class ice_eos:
             self.water = aqua_mlcp_eos
         else:
             self.water = aqua_eos
-        self.rock = ppv2_eos
-        self.iron = iron2_eos
-
-        # For methane:
-
-        # self.rho_pt_methane_rgi = RGI((self.methane["logt"][:, 0], self.methane["logp"][0, :]),
-        #                         self.methane["logrho"],
-        #                         method='linear',
-        #                         bounds_error=False,
-        #                         fill_value=None)
-
-        # self.u_pt_methane_rgi = RGI((self.methane["logt"][:, 0], self.methane["logp"][0, :]),
-        #                         self.methane["u"],
-        #                         method='linear',
-        #                         bounds_error=False,
-        #                         fill_value=None)
-
-        # self.s_pt_methane_rgi = RGI((self.methane["logt"][:, 0], self.methane["logp"][0, :]),
-        #                         self.methane["s"],
-        #                         method='linear',
-        #                         bounds_error=False,
-        #                         fill_value=None)
-
-        # # For ammonia:
-
-        # self.rho_pt_ammonia_rgi = RGI((self.ammonia["logt"][:, 0], self.ammonia["logp"][0, :]),
-        #                         self.ammonia["logrho"],
-        #                         method='linear',
-        #                         bounds_error=False,
-        #                         fill_value=None)
-
-        # self.u_pt_ammonia_rgi = RGI((self.ammonia["logt"][:, 0], self.ammonia["logp"][0, :]),
-        #                         self.ammonia["u"],
-        #                         method='linear',
-        #                         bounds_error=False,
-        #                         fill_value=None)
-
-        # self.s_pt_ammonia_rgi = RGI((self.ammonia["logt"][:, 0], self.ammonia["logp"][0, :]),
-        #                         self.ammonia["s"],
-        #                         method='linear',
-        #                         bounds_error=False,
-        #                         fill_value=None)
 
         self.rho_pt_methane_rgi = RGI((self.methane["logT"], self.methane["logP"]),
                                 self.methane["logrho"],
@@ -142,9 +97,6 @@ class ice_eos:
         (in log-space) for methane, ammonia, and water. The independent variables
         are log10(P) and log10(T).
 
-        For logt < 3.0 or logp < 10.0 (the low-pressure/temperature region
-        where methane and ammonia EOS are not defined), only the water EOS is used.
-
         Parameters
         ----------
         _lgp : float or array_like
@@ -164,10 +116,12 @@ class ice_eos:
             In the low-(T,P) region (logt < 3.0 or logp < 10.0), the result is that
             of water only.
         """
-        # Ensure inputs are arrays:
+        # Ensure inputs are arrays and broadcast to a common shape:
         logt_arr = np.atleast_1d(_lgt)
         logp_arr = np.atleast_1d(_lgp)
-
+        _zm = np.atleast_1d(_zm)
+        _za = np.atleast_1d(_za)
+        logp_arr, logt_arr, _zm, _za = np.broadcast_arrays(logp_arr, logt_arr, _zm, _za)
 
         # Build the interpolation points from logT and logP:
         pts = np.column_stack((logt_arr, logp_arr))
@@ -183,42 +137,19 @@ class ice_eos:
         logrho_water = self.water.get_logrho_pt_tab(logp_arr, logt_arr)
         rho_water = 10 ** logrho_water
 
-        # Post-perovskite EOS: assume ppv2_eos.get_rho_pt_tab returns log10(rho) on the same grid.
-        # logrho_rock = self.rock.get_logrho_pt_tab(logp_arr, logt_arr)
-        # rho_rock = 10 ** logrho_rock
-
-        # # Iron EOS: assume iron2_eos.get_rho_pt_tab returns log10(rho) on the same grid.
-        # logrho_iron = self.iron.get_logrho_pt_tab(logp_arr, logt_arr)
-        # rho_iron = 10 ** logrho_iron
-
         # Compute the specific volumes for each component:
         v_water    = 1.0 / rho_water
         v_methane  = 1.0 / rho_methane
         v_ammonia  = 1.0 / rho_ammonia
-        # v_rock    = 1.0 / rho_rock
-        # v_iron    = 1.0 / rho_iron
-
-        # Volume-addition rule (water is weighted by (1-_zm)*(1-_za))
-
-        # f_water   = (1 - _zm) * (1 - _za) * (1 - _zr) * (1 - _zfe)
-        # f_methane = _zm * (1 - _za) * (1 - _zr) * (1 - _zfe)
-        # f_ammonia = _za * (1 - _zr) * (1 - _zfe)
-        # f_rock    = _zr * (1 - _zfe)
-        # f_iron    = _zfe
 
         f_water   = (1 - _zm) * (1 - _za)
         f_methane = _zm * (1 - _za)
         f_ammonia = _za
 
-        v_mix = f_water * v_water + f_methane * v_methane  + f_ammonia * v_ammonia# + f_rock * v_rock + f_iron * v_iron
+        v_mix = f_water * v_water + f_methane * v_methane  + f_ammonia * v_ammonia
         # Convert back to density (log10 scale):
         rho_mix = 1.0 / v_mix
         mixture_logrho = np.log10(rho_mix)
-
-        # Create a boolean mask for where the water EOS should apply
-        # mask = (logt_arr < 3.0) | (logp_arr < 10.0)
-        # # For those indices, override the mixture with the water-only value.
-        # mixture_logrho[mask] = logrho_water[mask]
 
         # Return scalar if inputs were scalars.
         if np.isscalar(_lgp) and np.isscalar(_lgt):
@@ -251,28 +182,25 @@ class ice_eos:
         u_mix : float or array
             Mixture specific internal energy (erg/g).
         """
-        # Ensure inputs are arrays:
+        # Ensure inputs are arrays and broadcast to a common shape:
         logt_arr = np.atleast_1d(_lgt)
         logp_arr = np.atleast_1d(_lgp)
+        _zm = np.atleast_1d(_zm)
+        _za = np.atleast_1d(_za)
+        logp_arr, logt_arr, _zm, _za = np.broadcast_arrays(logp_arr, logt_arr, _zm, _za)
         pts = np.column_stack((logt_arr, logp_arr))
 
         # Get pure-component internal energies (assumed in erg/g)
         u_methane = self.u_pt_methane_rgi(pts)
         u_ammonia = self.u_pt_ammonia_rgi(pts)
         u_water = 10 ** self.water.get_logu_pt_tab(logp_arr, logt_arr)
-        #u_rock = 10 ** self.rock.get_logu_pt_tab(logp_arr, logt_arr)
-        #u_iron = 10 ** self.iron.get_logu_pt_tab(logp_arr, logt_arr)
 
         # Mass fractions:
         f_water   = (1 - _zm) * (1 - _za)
         f_methane = _zm * (1 - _za)
         f_ammonia = _za
 
-        u_mix = f_water * u_water + f_methane * u_methane + f_ammonia * u_ammonia# + f_rock * u_rock + f_iron * u_iron
-
-        # Override: if logt < 3.0 or logp < 10.0, use water-only value.
-        # mask = (logt_arr < 2.6) | (logp_arr < 10.0)
-        # u_mix[mask] = u_water[mask]
+        u_mix = f_water * u_water + f_methane * u_methane + f_ammonia * u_ammonia
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return u_mix.item() if hasattr(u_mix, 'item') else u_mix
@@ -309,37 +237,25 @@ class ice_eos:
         s_intrinsic : float or array
             Mixture specific entropy (erg/(g·K)) (NOTE: Without ideal entropy of mixing).
         """
-        # Ensure inputs are arrays:
+        # Ensure inputs are arrays and broadcast to a common shape:
         logt_arr = np.atleast_1d(_lgt)
         logp_arr = np.atleast_1d(_lgp)
+        _zm = np.atleast_1d(_zm)
+        _za = np.atleast_1d(_za)
+        logp_arr, logt_arr, _zm, _za = np.broadcast_arrays(logp_arr, logt_arr, _zm, _za)
         pts = np.column_stack((logt_arr, logp_arr))
 
         # Interpolate pure-component entropies (in erg/(g·K)).
         s_methane = self.s_pt_methane_rgi(pts)
         s_ammonia = self.s_pt_ammonia_rgi(pts)
         s_water   = self.water.get_s_pt_tab(logp_arr, logt_arr)
-        # s_rock    = self.rock.get_s_pt_tab(logp_arr, logt_arr)
-        # s_iron    = self.iron.get_s_pt_tab(logp_arr, logt_arr)
-
-        # s_methane[(s_water > s_methane)] = s_water[(s_water > s_methane)]
-        # s_ammonia[(s_water > s_ammonia)] = s_water[(s_water > s_ammonia)]
 
         # Mass fractions:
         f_water   = (1 - _zm) * (1 - _za)
         f_methane = _zm * (1 - _za)
         f_ammonia = _za
 
-        # f_water = 1 - _zm - _za
-        # f_methane = _zm
-        # f_ammonia = _za
-
         s_intrinsic = f_water * s_water + f_methane * s_methane + f_ammonia * s_ammonia
-
-        #s_mix = s_intrinsic
-
-        # Override: for logt < 3.0 or logp < 10.0, use water-only value.
-        # mask = (logt_arr < 2.6) | (logp_arr < 9.0)
-        # s_intrinsic[mask] = s_water[mask]
 
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):

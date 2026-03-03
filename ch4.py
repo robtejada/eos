@@ -17,8 +17,8 @@ erg_to_kJ = (u.erg/u.gram).to('kJ/g')
 
 
 """
-This module contains the equation of state for ammonia (NH3) using
-the analytic fits of Gao et al. (2023) and the DFT data from
+This module contains the equation of state for methane (CH4) using
+the analytic fits of Setzmann et al. (1991) and the DFT data from
 Bethkenhagen et al. (2017). It interpolates smoothly between the two
 methods using a logistic function. The pressure is calculated
 using the analytic fit for low densities and the DFT data for high
