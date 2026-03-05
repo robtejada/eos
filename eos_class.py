@@ -159,10 +159,10 @@ class mixtures(hhe):
     def __init__(self, hhe_eos,
                     z_eos = 'aqua',
                     zmix_eos1 = 'aqua',
-                    zmix_eos2 = 'methane',
-                    zmix_eos3 = 'ammonia',
-                    zmix_eos4 = 'ppv2',
-                    zmix_eos5 = 'iron2',
+                    zmix_eos2 = 'ppv2',
+                    zmix_eos3 = 'iron2',
+                    zmix_eos4 = 'methane',
+                    zmix_eos5 = 'ammonia',
                     hg=True,
                     y_prime=False,
                     interp_method='linear',
@@ -386,8 +386,8 @@ class mixtures(hhe):
         m_h = 1.0
         m_he = 4.0026
         m_water = 18.015
-        m_methane = 17.031
-        m_ammonia = 16.04
+        m_methane = 16.04     # CH4
+        m_ammonia = 17.031    # NH3
         m_rock = 100.3887
         m_iron = 55.845
 
@@ -415,6 +415,48 @@ class mixtures(hhe):
         #Ideal entropy of mixing term (using natural logs and a guarded logarithm):
         s_mix_id = - (self.guarded_log(x_h) + self.guarded_log(x_he) + self.guarded_log(x_water) + self.guarded_log(x_methane) + self.guarded_log(x_ammonia) \
                         + self.guarded_log(x_rock) + self.guarded_log(x_iron)) / q
+
+        return s_mix_id
+
+    def get_smix_ideal_abs(self, f_h, f_he, f_water, f_methane, f_ammonia, f_rock=0.0, f_iron=0.0):
+        """
+        Ideal entropy of mixing from absolute (physical) mass fractions.
+        Unlike get_smix_ideal, this takes the actual mass fractions directly
+        rather than nested conditional fractions.
+        """
+        m_h = 1.0
+        m_he = 4.0026
+        m_water = 18.015
+        m_methane = 16.04     # CH4
+        m_ammonia = 17.031    # NH3
+        m_rock = 100.3887
+        m_iron = 55.845
+
+        n_h       = f_h / m_h
+        n_he      = f_he / m_he
+        n_water   = f_water / m_water
+        n_methane = f_methane / m_methane
+        n_ammonia = f_ammonia / m_ammonia
+        n_rock    = f_rock / m_rock
+        n_iron    = f_iron / m_iron
+        Ntot = n_h + n_he + n_water + n_methane + n_ammonia + n_rock + n_iron
+
+        x_h       = n_h       / Ntot
+        x_he      = n_he      / Ntot
+        x_water   = n_water   / Ntot
+        x_methane = n_methane / Ntot
+        x_ammonia = n_ammonia / Ntot
+        x_rock    = n_rock    / Ntot
+        x_iron    = n_iron    / Ntot
+
+        q = (m_h * x_h + m_he * x_he + m_water * x_water
+             + m_methane * x_methane + m_ammonia * x_ammonia
+             + m_rock * x_rock + m_iron * x_iron)
+
+        s_mix_id = -(self.guarded_log(x_h) + self.guarded_log(x_he)
+                     + self.guarded_log(x_water) + self.guarded_log(x_methane)
+                     + self.guarded_log(x_ammonia) + self.guarded_log(x_rock)
+                     + self.guarded_log(x_iron)) / q
 
         return s_mix_id
 
@@ -482,14 +524,29 @@ class mixtures(hhe):
             smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=0.0, _za=0.0, _zr=_zr, _zfe=0.0) / erg_to_kbbar
         elif 'ice_mixture' in self.z_eos:
             s_z = self.ices.get_s_pt_val(_lgp, _lgt, _zm, _za)
-            smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=_zm, _za=_za, _zr=0.0, _zfe=0.0) / erg_to_kbbar
+            # Physical mass fractions: H-He make up (1-Z), ices make up Z
+            smix_xyz_ideal = self.get_smix_ideal_abs(
+                f_h       = (1 - _y_prime) * (1 - _z),
+                f_he      = _y_prime * (1 - _z),
+                f_water   = (1 - _zm) * (1 - _za) * _z,
+                f_methane = _zm * (1 - _za) * _z,
+                f_ammonia = _za * _z,
+            ) / erg_to_kbbar
 
         elif 'ice_rock' in self.z_eos:
             s_z_ice = self.ices.get_s_pt_val(_lgp, _lgt, _zm, _za)
             s_z_rock = metals_eos.get_s_pt_tab(_lgp, _lgt, eos='ppv2')
 
             s_z = (1 - _zr) * s_z_ice + _zr * s_z_rock
-            smix_xyz_ideal = self.get_smix_ideal(_y_prime, _z, _zm=_zm, _za=_za, _zr=_zr, _zfe=0.0) / erg_to_kbbar
+            # Physical mass fractions: H-He at (1-Z), ices at (1-_zr)*Z, rock at _zr*Z
+            smix_xyz_ideal = self.get_smix_ideal_abs(
+                f_h       = (1 - _y_prime) * (1 - _z),
+                f_he      = _y_prime * (1 - _z),
+                f_water   = (1 - _zm) * (1 - _za) * (1 - _zr) * _z,
+                f_methane = _zm * (1 - _za) * (1 - _zr) * _z,
+                f_ammonia = _za * (1 - _zr) * _z,
+                f_rock    = _zr * _z,
+            ) / erg_to_kbbar
 
         elif self.z_eos == 'aqua' or self.z_eos == 'aqua_smooth' or self.z_eos == 'aqua_smooth2':
             self.z_eos = 'aqua'
