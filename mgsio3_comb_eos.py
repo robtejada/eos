@@ -316,7 +316,7 @@ class MGSIO3_COMBINED_EOS:
         cv_mix = (1.0 - w) * cv_s + w * cv_l
         return cv_mix.reshape(P_arr.shape)
 
-    def get_alpha_x(self, P, T, rho):
+    def get_alpha_x(self, P, T, rho, dT_melt=None):
         P_arr, T_arr = self._as_arrays(P, T)
 
         rho_s = self.solid.get_rho_pt(P_arr, T_arr)
