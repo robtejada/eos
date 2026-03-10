@@ -2315,6 +2315,12 @@ class mixtures(hhe):
         lgrho1 = self.get_logrho_sp(_s, _lgp - dp, _y, _z, _frock, **kwargs)
         lgrho2 = self.get_logrho_sp(_s, _lgp + dp, _y, _z, _frock, **kwargs)
         return (2*dp)/(lgrho2 - lgrho1)
+    
+    def get_gamma3(self, _s, _lgrho, _y, _z, _frock=0.0, drho = 0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
+        logT1 = self.get_logt_srho(_s, _lgrho - drho, _y, _z, _frock, **kwargs)
+        logT2 = self.get_logt_srho(_s, _lgrho + drho, _y, _z, _frock, **kwargs)
+        return (logT2 - logT1)/(2*drho)
 
     # Brunt coefficient when computing in drho space
     def get_dlogrho_ds_py(self, _s, _lgp, _y, _z, _frock=0.0, ds=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
@@ -2322,6 +2328,20 @@ class mixtures(hhe):
         lgrho2 = self.get_logrho_sp(_s + ds, _lgp, _y, _z, _frock, **kwargs)
         lgrho1 = self.get_logrho_sp(_s - ds, _lgp, _y, _z, _frock, **kwargs)
         return ((lgrho2 - lgrho1) * log10_to_loge) / (2 * ds / erg_to_kbbar)
+
+    def get_chi_rho(self, _lgp, _lgt, _y, _z, _frock=0.0, dp=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+
+        lgrho2 = self.get_logrho_pt_tab(_lgp + dp, _lgt, _y, _z, _frock)
+        lgrho1 = self.get_logrho_pt_tab(_lgp - dp, _lgt, _y, _z, _frock)
+
+        return (2 * dp) / (lgrho2 - lgrho1)
+
+    def get_chi_T(self, _lgrho, _lgt, _y, _z, _frock=0.0, dt=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
+        lgp2 = self.get_logp_rhot_tab(_lgrho, _lgt + dt, _y, _z, _frock)
+        lgp1 = self.get_logp_rhot_tab(_lgrho, _lgt - dt, _y, _z, _frock)
+
+        return (lgp2 - lgp1) / (2 * dt)
+
 
     # Chi_T/Chi_rho
     # aka "delta" in MLT flux
@@ -2331,6 +2351,12 @@ class mixtures(hhe):
         lgrho2 = self.get_logrho_pt_tab(_lgp, _lgt + dt, _y, _z, _frock)
 
         return (lgrho2 - lgrho1)/(2 * dt)
+    
+    def get_alpha(self, _lgp, _lgt, _y, _z, _frock=0.0, dt=1e-2):
+
+        chi_T_chi_rho = self.get_dlogrho_dlogt_py(_lgp, _lgt, _y, _z, _frock=_frock, dt=dt)
+
+        return -chi_T_chi_rho/(10 ** _lgt)
 
     def get_dlogp_dy_rhot(self, _lgrho, _lgt,  _y, _z, _frock=0.0, dy=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
         # Chi_Y
