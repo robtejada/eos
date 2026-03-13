@@ -3485,7 +3485,7 @@ class total_eos(mixtures):
         else:
             _y = _y / (1 - _z+1e-6)
             _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zr+1e-6)
+            _za = _z / (1 - _zm+1e-6)
 
             logt = self.get_logt_sp( _s, _lgp, _y, _z, _zm, _za)
             return self.get_u_pt(_lgp, logt, _y, _z, _zm, _za)
