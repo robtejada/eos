@@ -70,9 +70,9 @@ class AQUA_CORE_EOS:
 
     def __init__(self):
         self.erg_to_kbbar = float((u.erg / u.Kelvin / u.gram).to(k_B / amu))
-        self.kbbar_to_erggK = 1.0 / self.erg_to_kbbar
-        self.GPa_to_dyncm2 = float(u.GPa.to("dyn/cm^2"))
-        self.dyncm2_to_GPa = float((u.dyn / u.cm**2).to("GPa"))
+        self.kbbar_to_erg = 1.0 / self.erg_to_kbbar
+        self.GPa_to_dyn = float(u.GPa.to("dyn/cm^2"))
+        self.dyn_to_GPa = float((u.dyn / u.cm**2).to("GPa"))
 
         self._has_pt_table = True
         self._has_sp_table = True
@@ -95,8 +95,8 @@ class AQUA_CORE_EOS:
             rho_max=float(10.0 ** np.max(self.logrhovals_rhot)),
             T_min=float(10.0 ** np.min(self.logtvals_rhot)),
             T_max=float(10.0 ** np.max(self.logtvals_rhot)),
-            P_min=float((10.0 ** np.min(self.logpvals_pt)) * self.dyncm2_to_GPa),
-            P_max=float((10.0 ** np.max(self.logpvals_pt)) * self.dyncm2_to_GPa),
+            P_min=float((10.0 ** np.min(self.logpvals_pt)) * self.dyn_to_GPa),
+            P_max=float((10.0 ** np.max(self.logpvals_pt)) * self.dyn_to_GPa),
         )
 
         self._logrho_rgi_pt = aqua_eos.rho_rgi
@@ -116,6 +116,8 @@ class AQUA_CORE_EOS:
 
         self._logp_rgi_srho = aqua_eos.get_p_rgi_srho
         self._logt_rgi_srho = aqua_eos.get_t_rgi_srho
+
+        self._build_phase_transition_profiles()
 
     # ---------- helpers ----------
 
@@ -151,7 +153,7 @@ class AQUA_CORE_EOS:
 
     def _to_logp(self, P):
         P_arr = self._clip_positive(P)
-        return np.log10(P_arr * self.GPa_to_dyncm2)
+        return np.log10(P_arr * self.GPa_to_dyn)
 
     @staticmethod
     def _to_logt(T):
@@ -169,7 +171,7 @@ class AQUA_CORE_EOS:
         return np.log10(U_arr)
 
     def _from_logp(self, logp):
-        return (10.0 ** np.asarray(logp, dtype=float)) * self.dyncm2_to_GPa
+        return (10.0 ** np.asarray(logp, dtype=float)) * self.dyn_to_GPa
 
     @staticmethod
     def _from_logt(logt):
@@ -187,13 +189,104 @@ class AQUA_CORE_EOS:
         su = str(s_units).lower()
         s_arr = np.asarray(s_in, dtype=float)
         if su in ("kbbar", "kb/baryon", "kbperbaryon", "native"):
-            return s_arr * self.kbbar_to_erggK
+            return s_arr * self.kbbar_to_erg
         if su in ("cgs", "erg/g/k", "erg/g/kelvin"):
             return s_arr
         raise ValueError("s_units must be one of {'kbbar', 'cgs', 'native'}")
 
     def _entropy_to_sp_table(self, s_in, *, s_units: str = "kbbar"):
         return self._entropy_to_cgs(s_in, s_units=s_units) * self.erg_to_kbbar
+
+    def _build_phase_transition_profiles(self):
+        """
+        Build a solidus directly from the AQUA PT phase map.
+
+        AQUA phase IDs from the table header:
+            ice-VII: -7
+            ice-X  : -10
+            supercritical+superionic: 5
+
+        We use the full solidus (max T among all solid phases at fixed P) for
+        `get_T_melt`, which keeps the transport code supplied with a finite
+        freezing curve across the whole mantle pressure range. At high pressure
+        (P >= ~65 GPa) this becomes the specific phase-5 -> ice-X boundary that
+        the user asked for.
+        """
+        pt_df = aqua_eos.aqua_reader("pt")
+        press_pa = np.asarray(pt_df["press"], dtype=float)
+        press_gpa = press_pa * float(u.Pa.to("GPa"))
+        temp_k = np.asarray(pt_df["temp"], dtype=float)
+        s_cgs = np.asarray(pt_df["s"], dtype=float)
+        phase = np.asarray(pt_df["phase"], dtype=float)
+
+        solid_mask = phase < 0.0
+        solid_pressures = np.unique(press_gpa[solid_mask])
+        solidus_t = np.empty_like(solid_pressures)
+        for i, p_gpa in enumerate(solid_pressures):
+            mask = solid_mask & (press_gpa == p_gpa)
+            solidus_t[i] = np.max(temp_k[mask])
+
+        self._solidus_pressures_gpa = solid_pressures
+        self._solidus_logp_gpa = np.log10(np.clip(solid_pressures, 1e-300, None))
+        self._solidus_t = solidus_t
+
+        icex_mask = phase == -10.0
+        icex_pressures = np.unique(press_gpa[icex_mask])
+        icex_t = np.empty_like(icex_pressures)
+        icex_latent_ergg = np.full_like(icex_pressures, np.nan, dtype=float)
+
+        for i, p_gpa in enumerate(icex_pressures):
+            solid_here = (press_gpa == p_gpa) & (phase == -10.0)
+            fluid_here = (press_gpa == p_gpa) & (phase == 5.0)
+            t_solid = np.max(temp_k[solid_here])
+            icex_t[i] = t_solid
+
+            if np.any(fluid_here):
+                fluid_t = temp_k[fluid_here]
+                fluid_s = s_cgs[fluid_here]
+                above = fluid_t > t_solid
+                if np.any(above):
+                    j = np.argmin(fluid_t[above])
+                    s_solid = s_cgs[solid_here & (temp_k == t_solid)][0]
+                    s_fluid = fluid_s[above][j]
+                    t_mid = 0.5 * (t_solid + fluid_t[above][j])
+                    icex_latent_ergg[i] = t_mid * (s_fluid - s_solid)
+
+        self._icex_pressures_gpa = icex_pressures
+        self._icex_logp_gpa = np.log10(np.clip(icex_pressures, 1e-300, None))
+        self._icex_t = icex_t
+        self._icex_latent_ergg = icex_latent_ergg
+        self.P_ice_x_min_GPa = float(icex_pressures[0]) if icex_pressures.size else np.nan
+
+        rep_mask = (
+            np.isfinite(icex_latent_ergg)
+            & (icex_pressures >= self.P_ice_x_min_GPa)
+            & (icex_pressures <= 100.0)
+        )
+        if not np.any(rep_mask):
+            rep_mask = np.isfinite(icex_latent_ergg)
+        self.L = float(np.nanmedian(icex_latent_ergg[rep_mask])) if np.any(rep_mask) else 0.0
+
+        # Approximate fluid -> superionic boundary, anchored to primary-source
+        # landmarks:
+        #   - 47 GPa, 1000 K  : Goncharov et al. (2005), slope change in the
+        #                        high-pressure water melting curve.
+        #   - 75 GPa, 2000 K  : Schwegler et al. (2008), stable superionic
+        #                        oxygen lattice along the 2000 K isotherm.
+        self.P_superionic_min_GPa = 47.0
+        self.T_superionic_ref_K = 1000.0
+        self._superionic_power = np.log10(2000.0 / 1000.0) / np.log10(75.0 / 47.0)
+
+    @staticmethod
+    def _normalize_transition_phase(phase: Optional[str]) -> str:
+        if phase is None:
+            raise ValueError("phase must be specified explicitly: use 'superionic' or 'ice_x'.")
+        key = str(phase).strip().lower()
+        if key in ("icex", "ice_x", "ice-x", "ice x"):
+            return "ice_x"
+        if key in ("superionic", "superion", "si"):
+            return "superionic"
+        raise ValueError("phase must be one of {'superionic', 'ice_x'}.")
 
     def _dT_dS_sp_num(self, s_tab, P, eps_rel=1e-3):
         s_cgs = self._entropy_to_cgs(s_tab, s_units="kbbar")
@@ -380,7 +473,7 @@ class AQUA_CORE_EOS:
             cv = np.asarray(self.get_cv_rhot(rho_arr, T_arr, eps_rel=eps_rel, method="rhou"), dtype=float)
             P_arr = np.asarray(self.get_p_rhot(rho_arr, T_arr), dtype=float)
             alpha = np.asarray(self.get_alpha_pt(P_arr, T_arr, eps_rel=eps_rel), dtype=float)
-            dP_drho = self._dP_drho_rhot_num(rho_arr, T_arr, eps_rel=eps_rel) * self.GPa_to_dyncm2
+            dP_drho = self._dP_drho_rhot_num(rho_arr, T_arr, eps_rel=eps_rel) * self.GPa_to_dyn
             cp = cv + T_arr * alpha * alpha * dP_drho
         elif method_l == "entropy":
             P_arr = np.asarray(self.get_p_rhot(rho_arr, T_arr), dtype=float)
@@ -452,26 +545,73 @@ class AQUA_CORE_EOS:
 
     # ---------- compatibility hooks ----------
 
-    def get_T_melt(self, P):
-        P_arr = np.array(P, ndmin=1, dtype=float)
-        out = np.full_like(P_arr, np.nan, dtype=float)
-        return float(out[0]) if np.isscalar(P) else out
+    def get_T_melt_ice_x(self, P):
+        scalar, P_arr, _ = self._broadcast(P, P)
+        logp = np.log10(self._clip_positive(P_arr))
+        vals = np.interp(logp, self._icex_logp_gpa, self._icex_t, left=np.nan, right=self._icex_t[-1])
+        return self._maybe_scalar(scalar, vals)
 
-    def get_S_liq_at_melt(self, P):
-        P_arr = np.array(P, ndmin=1, dtype=float)
-        out = np.full_like(P_arr, np.nan, dtype=float)
-        return float(out[0]) if np.isscalar(P) else out
+    def get_T_melt_superionic(self, P):
+        scalar, P_arr, _ = self._broadcast(P, P)
+        vals = np.full(P_arr.shape, np.nan, dtype=float)
+        mask = P_arr >= self.P_superionic_min_GPa
+        if np.any(mask):
+            vals[mask] = self.T_superionic_ref_K * (
+                np.asarray(P_arr[mask], dtype=float) / self.P_superionic_min_GPa
+            ) ** self._superionic_power
+        return self._maybe_scalar(scalar, vals)
 
-    def get_S_sol_at_melt(self, P):
-        P_arr = np.array(P, ndmin=1, dtype=float)
-        out = np.full_like(P_arr, np.nan, dtype=float)
-        return float(out[0]) if np.isscalar(P) else out
+    def get_T_melt(self, P, phase=None):
+        phase_key = self._normalize_transition_phase(phase)
+        if phase_key == "ice_x":
+            return self.get_T_melt_ice_x(P)
+        return self.get_T_melt_superionic(P)
+
+    def get_S_liq_at_melt(self, P, phase="ice_x"):
+        scalar, P_arr, _ = self._broadcast(P, P)
+        Tm = np.asarray(self.get_T_melt(P_arr, phase=phase), dtype=float)
+        dT = np.maximum(25.0, 0.02 * Tm)
+        T_liq = np.clip(Tm + dT, self.domain.T_min, self.domain.T_max)
+        vals = self.get_s_pt(P_arr, T_liq, tab=True)
+        return self._maybe_scalar(scalar, vals)
+
+    def get_S_sol_at_melt(self, P, phase="ice_x"):
+        scalar, P_arr, _ = self._broadcast(P, P)
+        Tm = np.asarray(self.get_T_melt(P_arr, phase=phase), dtype=float)
+        dT = np.maximum(25.0, 0.02 * Tm)
+        T_sol = np.clip(Tm - dT, self.domain.T_min, self.domain.T_max)
+        vals = self.get_s_pt(P_arr, T_sol, tab=True)
+        return self._maybe_scalar(scalar, vals)
 
     def get_alpha_x(self, P, T, rho, **kwargs):
-        del T, rho, kwargs
-        P_arr = np.array(P, ndmin=1, dtype=float)
-        out = np.zeros_like(P_arr, dtype=float)
-        return float(out[0]) if np.isscalar(P) else out
+        del T
+        phase = kwargs.pop("phase", "ice_x")
+        dT_melt = kwargs.pop("dT_melt", None)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs.keys()))
+            raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+
+        scalar, P_arr, rho_arr = self._broadcast(P, rho)
+        Tm = np.asarray(self.get_T_melt(P_arr, phase=phase), dtype=float)
+        if dT_melt is None:
+            dT = np.maximum(25.0, 0.02 * Tm)
+        else:
+            dT = np.asarray(dT_melt, dtype=float)
+            if dT.shape == ():
+                dT = np.full(P_arr.shape, float(dT), dtype=float)
+            else:
+                dT = np.broadcast_to(dT, P_arr.shape)
+            dT = np.maximum(dT, 1.0)
+
+        T_sol = np.clip(Tm - dT, self.domain.T_min, self.domain.T_max)
+        T_liq = np.clip(Tm + dT, self.domain.T_min, self.domain.T_max)
+        rho_sol = np.asarray(self.get_rho_pt(P_arr, T_sol, tab=True), dtype=float)
+        rho_liq = np.asarray(self.get_rho_pt(P_arr, T_liq, tab=True), dtype=float)
+        alpha_x = rho_arr * (
+            1.0 / np.maximum(rho_liq, 1e-99)
+            - 1.0 / np.maximum(rho_sol, 1e-99)
+        )
+        return self._maybe_scalar(scalar, alpha_x)
 
     # ---------- SP getters ----------
 
