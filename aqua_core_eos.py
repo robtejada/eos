@@ -151,6 +151,33 @@ class AQUA_CORE_EOS:
     def _clip_positive(vals, floor=1e-300):
         return np.clip(np.asarray(vals, dtype=float), floor, None)
 
+    def _interp_loglog_profile(self, P, logp_knots, logt_knots, left=np.nan, right="hold"):
+        scalar, P_arr, _ = self._broadcast(P, P)
+        logp = np.log10(self._clip_positive(P_arr))
+        vals = np.full(P_arr.shape, np.nan, dtype=float)
+
+        in_range = (logp >= logp_knots[0]) & (logp <= logp_knots[-1])
+        if np.any(in_range):
+            vals[in_range] = 10.0 ** np.interp(logp[in_range], logp_knots, logt_knots)
+
+        below = logp < logp_knots[0]
+        if np.any(below) and np.isfinite(left):
+            vals[below] = float(left)
+
+        above = logp > logp_knots[-1]
+        if np.any(above):
+            if right == "hold":
+                vals[above] = 10.0 ** logt_knots[-1]
+            elif right == "extrap":
+                slope = (logt_knots[-1] - logt_knots[-2]) / (logp_knots[-1] - logp_knots[-2])
+                vals[above] = 10.0 ** (logt_knots[-1] + slope * (logp[above] - logp_knots[-1]))
+            elif np.isfinite(right):
+                vals[above] = float(right)
+            else:
+                vals[above] = np.nan
+
+        return self._maybe_scalar(scalar, vals)
+
     def _to_logp(self, P):
         P_arr = self._clip_positive(P)
         return np.log10(P_arr * self.GPa_to_dyn)
@@ -199,18 +226,18 @@ class AQUA_CORE_EOS:
 
     def _build_phase_transition_profiles(self):
         """
-        Build a solidus directly from the AQUA PT phase map.
+        Build phase-transition profiles directly from the AQUA PT phase map.
 
         AQUA phase IDs from the table header:
             ice-VII: -7
             ice-X  : -10
             supercritical+superionic: 5
 
-        We use the full solidus (max T among all solid phases at fixed P) for
-        `get_T_melt`, which keeps the transport code supplied with a finite
-        freezing curve across the whole mantle pressure range. At high pressure
-        (P >= ~65 GPa) this becomes the specific phase-5 -> ice-X boundary that
-        the user asked for.
+        The full solidus (max T among all solid phases at fixed P) is retained
+        as a helper profile. The strict `ice_x` branch is kept on the native
+        AQUA phase-5 -> ice-X boundary, while the `superionic` branch is a
+        digitized fit to the broad experimental melting line in Fig. 5 of
+        Millot et al. (2018).
         """
         pt_df = aqua_eos.aqua_reader("pt")
         press_pa = np.asarray(pt_df["press"], dtype=float)
@@ -266,16 +293,30 @@ class AQUA_CORE_EOS:
         if not np.any(rep_mask):
             rep_mask = np.isfinite(icex_latent_ergg)
         self.L = float(np.nanmedian(icex_latent_ergg[rep_mask])) if np.any(rep_mask) else 0.0
+        self.L_aqua_ice_x = self.L
+        self.L_ice_x = self.L_aqua_ice_x
+        self.P_ice_x_min_GPa_aqua = self.P_ice_x_min_GPa
 
-        # Approximate fluid -> superionic boundary, anchored to primary-source
-        # landmarks:
-        #   - 47 GPa, 1000 K  : Goncharov et al. (2005), slope change in the
-        #                        high-pressure water melting curve.
-        #   - 75 GPa, 2000 K  : Schwegler et al. (2008), stable superionic
-        #                        oxygen lattice along the 2000 K isotherm.
-        self.P_superionic_min_GPa = 47.0
-        self.T_superionic_ref_K = 1000.0
-        self._superionic_power = np.log10(2000.0 / 1000.0) / np.log10(75.0 / 47.0)
+        # Approximate broad white experimental melting line digitized from
+        # Fig. 5 of Millot et al. (2018, Nat. Phys.). This is the superionic
+        # fluid boundary requested by the user.
+        self.P_superionic_min_GPa = 10.0
+        self.P_superionic_max_data_GPa = 340.0
+        self._superionic_pressures_gpa = np.array(
+            [10.0, 20.0, 30.0, 50.0, 70.0, 100.0, 150.0, 200.0, 250.0, 300.0, 340.0],
+            dtype=float,
+        )
+        self._superionic_t = np.array(
+            [700.0, 950.0, 1300.0, 1800.0, 2300.0, 3000.0, 4000.0, 5000.0, 5700.0, 6300.0, 6800.0],
+            dtype=float,
+        )
+        self._superionic_logp_gpa = np.log10(self._superionic_pressures_gpa)
+        self._superionic_logt = np.log10(self._superionic_t)
+
+        self.L_superionic = self._estimate_latent_heat_from_curve(
+            self._superionic_pressures_gpa, phase="superionic"
+        )
+        self.L = self.L_ice_x
 
     @staticmethod
     def _normalize_transition_phase(phase: Optional[str]) -> str:
@@ -287,6 +328,24 @@ class AQUA_CORE_EOS:
         if key in ("superionic", "superion", "si"):
             return "superionic"
         raise ValueError("phase must be one of {'superionic', 'ice_x'}.")
+
+    def _estimate_latent_heat_from_curve(self, pressures_gpa, phase: str):
+        p_arr = np.asarray(pressures_gpa, dtype=float)
+        if p_arr.size == 0:
+            return np.nan
+
+        t_melt = np.asarray(self.get_T_melt(p_arr, phase=phase), dtype=float)
+        dT = np.maximum(25.0, 0.02 * t_melt)
+        t_lo = np.clip(t_melt - dT, self.domain.T_min, self.domain.T_max)
+        t_hi = np.clip(t_melt + dT, self.domain.T_min, self.domain.T_max)
+
+        s_sol = np.asarray(self.get_s_pt(p_arr, t_lo), dtype=float)
+        s_liq = np.asarray(self.get_s_pt(p_arr, t_hi), dtype=float)
+        latent = t_melt * (s_liq - s_sol)
+        latent = latent[np.isfinite(latent) & (latent > 0.0)]
+        if latent.size == 0:
+            return np.nan
+        return float(np.nanmedian(latent))
 
     def _dT_dS_sp_num(self, s_tab, P, eps_rel=1e-3):
         s_cgs = self._entropy_to_cgs(s_tab, s_units="kbbar")
@@ -548,18 +607,48 @@ class AQUA_CORE_EOS:
     def get_T_melt_ice_x(self, P):
         scalar, P_arr, _ = self._broadcast(P, P)
         logp = np.log10(self._clip_positive(P_arr))
-        vals = np.interp(logp, self._icex_logp_gpa, self._icex_t, left=np.nan, right=self._icex_t[-1])
+
+        # Match the earlier mantle-facing behavior: below the onset of the
+        # explicit Ice X branch, continue along the AQUA solidus so callers
+        # still see a finite freezing curve; above it, follow the phase-5 ->
+        # ice-X boundary directly.
+        vals = np.interp(
+            logp,
+            self._solidus_logp_gpa,
+            self._solidus_t,
+            left=self._solidus_t[0],
+            right=self._solidus_t[-1],
+        )
+
+        icex_mask = P_arr >= self.P_ice_x_min_GPa
+        if np.any(icex_mask):
+            vals[icex_mask] = np.interp(
+                logp[icex_mask],
+                self._icex_logp_gpa,
+                self._icex_t,
+                left=np.nan,
+                right=self._icex_t[-1],
+            )
+
         return self._maybe_scalar(scalar, vals)
 
     def get_T_melt_superionic(self, P):
-        scalar, P_arr, _ = self._broadcast(P, P)
-        vals = np.full(P_arr.shape, np.nan, dtype=float)
-        mask = P_arr >= self.P_superionic_min_GPa
-        if np.any(mask):
-            vals[mask] = self.T_superionic_ref_K * (
-                np.asarray(P_arr[mask], dtype=float) / self.P_superionic_min_GPa
-            ) ** self._superionic_power
-        return self._maybe_scalar(scalar, vals)
+        return self._interp_loglog_profile(
+            P,
+            self._superionic_logp_gpa,
+            self._superionic_logt,
+            left=np.nan,
+            right="extrap",
+        )
+
+    def get_T_solidus(self, P):
+        return self._interp_loglog_profile(
+            P,
+            self._solidus_logp_gpa,
+            np.log10(self._solidus_t),
+            left=self._solidus_t[0],
+            right="hold",
+        )
 
     def get_T_melt(self, P, phase=None):
         phase_key = self._normalize_transition_phase(phase)
