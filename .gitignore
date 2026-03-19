@@ -59,3 +59,6 @@ assets/methane_fluid_phase_diagram.csv
 assets/valleta_2022_neptune_formation_massgrid.csv
 assets/valleta_2022_uranus_formation_massgrid.csv
 misc/Z1Z2_P_T_table_watermisc_lowpressure.npz
+rock_eos/mgsio3_JJ.txt
+mgsio3_JJ_eos.py
+*.png
