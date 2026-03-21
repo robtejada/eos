@@ -61,4 +61,6 @@ assets/valleta_2022_uranus_formation_massgrid.csv
 misc/Z1Z2_P_T_table_watermisc_lowpressure.npz
 rock_eos/mgsio3_JJ.txt
 mgsio3_JJ_eos.py
+rock_eos/mgsio3_JJ_eos.txt
+rock_eos/mgsio3_JJ_SP.npz
 *.png

@@ -650,7 +650,7 @@ class AQUA_CORE_EOS:
             right="hold",
         )
 
-    def get_T_melt(self, P, phase=None):
+    def get_T_melt(self, P, phase='ice_x'):
         phase_key = self._normalize_transition_phase(phase)
         if phase_key == "ice_x":
             return self.get_T_melt_ice_x(P)
