@@ -211,12 +211,12 @@ class Fe_EOS:
 
     Units:
       Inputs:
-        rho : kg/m^3
+        rho : g/cm^3
         T   : K
-        P   : Pa
+        P   : GPa
 
       Outputs:
-        P : Pa
+        P : GPa
         S : erg/g/K
         U : erg/g
         G : erg/g
@@ -243,7 +243,7 @@ class Fe_EOS:
         "solid": "Fe_EOS_solid.txt",
         "liquid": "Fe_EOS_liquid.txt",
     }
-    _RECT_P_MIN_DEFAULT_PA = 1.0e9  # Build rectangular P-grid down to 1 GPa by default.
+    _RECT_P_MIN_DEFAULT_GPA = 1.0  # Build rectangular P-grid down to 1 GPa by default.
     _GLOBAL_BOUNDS_CACHE: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
 
     def __init__(
@@ -253,7 +253,7 @@ class Fe_EOS:
         diff_rel_T: float = 1e-1,
         diff_abs_T: float = 50.0,
         diff_rel_P: float = 1e-1,
-        diff_abs_P: float = 1e8,
+        diff_abs_P: float = 0.1,
         grid_n_P: Optional[int] = None,
         grid_n_T: Optional[int] = None,
         grid_P_bounds: Optional[Tuple[float, float]] = None,
@@ -268,7 +268,7 @@ class Fe_EOS:
         grid_n_P, grid_n_T : int, optional
             Number of regular P/T samples for the rectangularized EOS grid.
         grid_P_bounds, grid_T_bounds : tuple, optional
-            Explicit (min, max) bounds for the regularized grid axes.
+            Explicit (min, max) bounds for the regularized grid axes (P in GPa, T in K).
         apply_reference_offsets : bool, optional
             If True, apply constant reference shifts to S/U (and consistent T-dependent
             shift to G). If False, return raw table-interpolated values.
@@ -289,15 +289,15 @@ class Fe_EOS:
         if grid_P_bounds is None or grid_T_bounds is None:
             P_bounds_all, T_bounds_all = self._global_phase_bounds(self._data_dir)
             if grid_P_bounds is None:
-                grid_P_bounds = (self._RECT_P_MIN_DEFAULT_PA, float(P_bounds_all[1]))
+                grid_P_bounds = (self._RECT_P_MIN_DEFAULT_GPA, float(P_bounds_all[1]))
             if grid_T_bounds is None:
                 grid_T_bounds = T_bounds_all
 
         table = self._read_table(self._file_path)
 
-        self.rho_table = table["rho_kgm3"]
+        self.rho_table = table["rho_gcc"]
         self.T_table = table["T_K"]
-        self.P_table = table["P_Pa"]
+        self.P_table = table["P_GPa"]
         self.S_table_si = table["S_JkgK"]
         self.U_table_si = table["U_Jkg"]
         self.G_table_si = table["G_Jkg"]
@@ -414,8 +414,8 @@ class Fe_EOS:
             if not path.is_file():
                 continue
             table = cls._read_table(path)
-            P_min = min(P_min, float(np.min(table["P_Pa"])))
-            P_max = max(P_max, float(np.max(table["P_Pa"])))
+            P_min = min(P_min, float(np.min(table["P_GPa"])))
+            P_max = max(P_max, float(np.max(table["P_GPa"])))
             T_min = min(T_min, float(np.min(table["T_K"])))
             T_max = max(T_max, float(np.max(table["T_K"])))
 
@@ -468,22 +468,22 @@ class Fe_EOS:
         if len(rho_gcc) == 0:
             raise ValueError(f"No valid rows parsed from {path}")
 
-        rho_kgm3 = np.asarray(rho_gcc, dtype=float) * 1e3
+        rho_gcc_arr = np.asarray(rho_gcc, dtype=float)
         T_K = np.asarray(T_K, dtype=float)
-        P_Pa = np.asarray(P_GPa, dtype=float) * 1e9
+        P_GPa_arr = np.asarray(P_GPa, dtype=float)
         U_Jkg = np.asarray(E_Jkg, dtype=float)
         G_Jkg = np.asarray(G_Jkg, dtype=float)
         S_JkgK = np.asarray(S_JkgK, dtype=float)
 
         # Drop exact duplicate (P, T) rows (liquid table has a few exact duplicates).
-        pt = np.column_stack((P_Pa, T_K))
+        pt = np.column_stack((P_GPa_arr, T_K))
         _, keep_idx = np.unique(pt, axis=0, return_index=True)
         keep_idx = np.sort(keep_idx)
 
         return {
-            "rho_kgm3": rho_kgm3[keep_idx],
+            "rho_gcc": rho_gcc_arr[keep_idx],
             "T_K": T_K[keep_idx],
-            "P_Pa": P_Pa[keep_idx],
+            "P_GPa": P_GPa_arr[keep_idx],
             "U_Jkg": U_Jkg[keep_idx],
             "G_Jkg": G_Jkg[keep_idx],
             "S_JkgK": S_JkgK[keep_idx],
@@ -533,12 +533,12 @@ class Fe_EOS:
     def _as_float(x) -> float:
         return float(np.asarray(x))
 
-    def _interp_property_si(self, key: str, P_Pa: np.ndarray, T_K: np.ndarray) -> np.ndarray:
-        P = np.asarray(P_Pa, dtype=float)
+    def _interp_property_si(self, key: str, P_GPa: np.ndarray, T_K: np.ndarray) -> np.ndarray:
+        P = np.asarray(P_GPa, dtype=float)
         T = np.asarray(T_K, dtype=float)
 
         if np.any(P <= 0):
-            raise ValueError("Pressure P must be > 0 Pa.")
+            raise ValueError("Pressure P must be > 0 GPa.")
         if np.any(T <= 0):
             raise ValueError("Temperature T must be > 0 K.")
 
@@ -552,12 +552,12 @@ class Fe_EOS:
         vals = np.asarray(vals, dtype=float)
         return vals
 
-    def _interp_property_si_scalar(self, key: str, P_Pa: float, T_K: float) -> float:
-        if (not np.isfinite(P_Pa)) or (P_Pa <= 0):
+    def _interp_property_si_scalar(self, key: str, P_GPa: float, T_K: float) -> float:
+        if (not np.isfinite(P_GPa)) or (P_GPa <= 0):
             return np.nan
         if (not np.isfinite(T_K)) or (T_K <= 0):
             return np.nan
-        val = float(self._surf[key](float(P_Pa), float(T_K)))
+        val = float(self._surf[key](float(P_GPa), float(T_K)))
         if key == "S":
             val += self.S_offset_si
         elif key == "U":
@@ -592,14 +592,14 @@ class Fe_EOS:
         w = (T_K - T_lo) / (T_hi - T_lo)
         return (1.0 - w) * rho_lo + w * rho_hi
 
-    def _p_seed_from_isotherms(self, rho_kgm3: float, T_K: float) -> float:
+    def _p_seed_from_isotherms(self, rho_gcc: float, T_K: float) -> float:
         Ts = self.tvals_iso
         if Ts.size == 0:
             return np.sqrt(self.P_min * self.P_max)
 
         def P_at_T(Tref: float) -> float:
             rho_grid, P_grid = self._seed_by_T[float(Tref)]["P_of_rho"]
-            return float(np.interp(rho_kgm3, rho_grid, P_grid, left=P_grid[0], right=P_grid[-1]))
+            return float(np.interp(rho_gcc, rho_grid, P_grid, left=P_grid[0], right=P_grid[-1]))
 
         if T_K <= Ts[0]:
             return P_at_T(Ts[0])
@@ -696,9 +696,9 @@ class Fe_EOS:
 
     def get_p_rhot(
         self,
-        rho_kgm3: ArrayLike,
+        rho: ArrayLike,
         T_K: ArrayLike,
-        P_bracket_Pa: Optional[Tuple[float, float]] = None,
+        P_bracket_GPa: Optional[Tuple[float, float]] = None,
         max_iter: int = 200,
         rtol: float = 1e-10,
         P0: Optional[ArrayLike] = None,
@@ -708,7 +708,7 @@ class Fe_EOS:
         bracket_expand_factor: float = 1.6,
         on_fail: str = "nan",  # "nan" or "raise"
     ) -> np.ndarray:
-        rho_arr = np.asarray(rho_kgm3, dtype=float)
+        rho_arr = np.asarray(rho, dtype=float)
         T_arr = np.asarray(T_K, dtype=float)
         shape = np.broadcast(rho_arr, T_arr).shape
         rho_b = np.broadcast_to(rho_arr, shape)
@@ -716,14 +716,14 @@ class Fe_EOS:
 
         out = np.full(shape, np.nan, dtype=float)
 
-        if P_bracket_Pa is None:
+        if P_bracket_GPa is None:
             P_min = self.P_min
             P_max = self.P_max
         else:
-            P_min = float(P_bracket_Pa[0])
-            P_max = float(P_bracket_Pa[1])
+            P_min = float(P_bracket_GPa[0])
+            P_max = float(P_bracket_GPa[1])
         if P_min <= 0 or P_max <= P_min:
-            raise ValueError("P_bracket_Pa must satisfy 0 < P_min < P_max")
+            raise ValueError("P_bracket_GPa must satisfy 0 < P_min < P_max")
 
         logP_lo = np.log(P_min)
         logP_hi = np.log(P_max)
@@ -837,28 +837,28 @@ class Fe_EOS:
                 P_prev = P_sol
             elif on_fail == "raise":
                 raise RuntimeError(
-                    f"Failed P(rho,T) inversion: rho={rho_t:.3e} kg/m^3, T={Ti:.3f} K "
-                    f"within [{P_min:.3e}, {P_max:.3e}] Pa"
+                    f"Failed P(rho,T) inversion: rho={rho_t:.3e} g/cm^3, T={Ti:.3f} K "
+                    f"within [{P_min:.3e}, {P_max:.3e}] GPa"
                 )
 
         return float(out) if out.size == 1 else out
 
-    def get_s_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_s_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals_si = self._interp_property_si("S", P_arr, T_arr)
         vals = vals_si * S_CONV_CGS
         return float(vals) if scalar else vals
 
-    def get_u_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_u_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals_si = self._interp_property_si("U", P_arr, T_arr)
         vals = vals_si * U_CONV_CGS
         return float(vals) if scalar else vals
 
-    def get_g_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_g_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals_si = self._interp_property_si("G", P_arr, T_arr)
         vals = vals_si * U_CONV_CGS
@@ -949,8 +949,8 @@ class Fe_EOS:
             return np.nan
         return dv_dT / v
 
-    def get_CV_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_CV_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         out = np.full(rho_arr.shape, np.nan, dtype=float)
 
         for idx in np.ndindex(rho_arr.shape):
@@ -959,8 +959,8 @@ class Fe_EOS:
         out *= S_CONV_CGS
         return float(out) if scalar else out
 
-    def get_CP_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_CP_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         out = np.full(rho_arr.shape, np.nan, dtype=float)
 
         P_arr = self.get_p_rhot(rho_arr, T_arr)
@@ -974,8 +974,8 @@ class Fe_EOS:
         out *= S_CONV_CGS
         return float(out) if scalar else out
 
-    def get_alpha_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_alpha_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         out = np.full(rho_arr.shape, np.nan, dtype=float)
 
         P_arr = self.get_p_rhot(rho_arr, T_arr)
@@ -989,11 +989,11 @@ class Fe_EOS:
         return float(out) if scalar else out
 
     # lowercase aliases used in a few EOS modules
-    def get_cv_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        return self.get_CV_rhot(rho_kgm3, T_K)
+    def get_cv_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        return self.get_CV_rhot(rho, T_K)
 
-    def get_cp_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        return self.get_CP_rhot(rho_kgm3, T_K)
+    def get_cp_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        return self.get_CP_rhot(rho, T_K)
 
     # -------------------------
     # PT inversion wrappers
@@ -1003,7 +1003,7 @@ class Fe_EOS:
         self,
         P: ArrayLike,
         T_K: ArrayLike,
-        rho_bracket_kgm3: Optional[Tuple[float, float]] = None,
+        rho_bracket_gcm3: Optional[Tuple[float, float]] = None,
         max_iter: int = 200,
         rtol: float = 1e-10,
         rho0: Optional[ArrayLike] = None,
@@ -1511,9 +1511,9 @@ class Fe_EOS:
 
     # Optional convenience; same form used in dorogo_iron_eos.py docs.
     def get_T_melt(self, P):
+        """P in GPa. Return T_melt(P) in K."""
         P_arr = np.array(P, ndmin=1, dtype=float)
-        P_GPa = P_arr * 1e-9
-        Tm = 6469.0 * np.power(1.0 + (P_GPa - 300.0) / 434.822, 1.839)
+        Tm = 6469.0 * np.power(1.0 + (P_arr - 300.0) / 434.822, 1.839)
         return Tm.reshape(P_arr.shape)
 
 
@@ -1536,7 +1536,7 @@ class Fe_COMBINED_EOS(Fe_EOS):
         diff_rel_T: float = 1e-1,
         diff_abs_T: float = 50.0,
         diff_rel_P: float = 1e-1,
-        diff_abs_P: float = 1e8,
+        diff_abs_P: float = 0.1,
         grid_n_P: Optional[int] = None,
         grid_n_T: Optional[int] = None,
         grid_P_bounds: Optional[Tuple[float, float]] = None,
@@ -1588,9 +1588,9 @@ class Fe_COMBINED_EOS(Fe_EOS):
             self.data_sp = np.load(self._sp_table_path)
 
             self.svals_sp = np.asarray(self.data_sp["svals_sp"], dtype=float)  # kb/baryon
-            self.pvals_sp = np.asarray(self.data_sp["pvals_sp"], dtype=float)  # Pa
+            self.pvals_sp = np.asarray(self.data_sp["pvals_sp"], dtype=float) * 1e-9  # Pa -> GPa
 
-            self.rho_grid_sp = np.asarray(self.data_sp["rho_grid_sp"], dtype=float)  # kg/m^3
+            self.rho_grid_sp = np.asarray(self.data_sp["rho_grid_sp"], dtype=float) * 1e-3  # kg/m^3 -> g/cm^3
             self.t_grid_sp = np.asarray(self.data_sp["t_grid_sp"], dtype=float)  # K
             self.u_grid_sp = np.asarray(self.data_sp["u_grid_sp"], dtype=float)  # erg/g
             self.cp_grid_sp = np.asarray(self.data_sp["cp_grid_sp"], dtype=float)  # erg/g/K
@@ -1648,10 +1648,10 @@ class Fe_COMBINED_EOS(Fe_EOS):
         """
         Gonzalez et al. (2023) melt curve:
             Tm(K) = 6469 * (1 + (P_GPa - 300) / 434.822) ** 0.54369
+        P in GPa. Return T_melt(P) in K.
         """
         P_arr = np.asarray(P, dtype=float)
-        P_GPa = P_arr * 1e-9
-        arg = 1.0 + (P_GPa - 300.0) / 434.822
+        arg = 1.0 + (P_arr - 300.0) / 434.822
         with np.errstate(invalid="ignore"):
             Tm = 6469.0 * np.power(arg, 0.54369)
         return Tm
@@ -1748,9 +1748,9 @@ class Fe_COMBINED_EOS(Fe_EOS):
 
     def get_p_rhot(
         self,
-        rho_kgm3: ArrayLike,
+        rho: ArrayLike,
         T_K: ArrayLike,
-        P_bracket_Pa: Optional[Tuple[float, float]] = None,
+        P_bracket_GPa: Optional[Tuple[float, float]] = None,
         max_iter: int = 200,
         rtol: float = 1e-10,
         P0: Optional[ArrayLike] = None,
@@ -1760,21 +1760,21 @@ class Fe_COMBINED_EOS(Fe_EOS):
         bracket_expand_factor: float = 1.6,
         on_fail: str = "nan",
     ) -> np.ndarray:
-        rho_arr = np.asarray(rho_kgm3, dtype=float)
+        rho_arr = np.asarray(rho, dtype=float)
         T_arr = np.asarray(T_K, dtype=float)
         shape = np.broadcast(rho_arr, T_arr).shape
         rho_b = np.broadcast_to(rho_arr, shape)
         T_b = np.broadcast_to(T_arr, shape)
         out = np.full(shape, np.nan, dtype=float)
 
-        if P_bracket_Pa is None:
+        if P_bracket_GPa is None:
             P_min = self.P_min
             P_max = self.P_max
         else:
-            P_min = float(P_bracket_Pa[0])
-            P_max = float(P_bracket_Pa[1])
+            P_min = float(P_bracket_GPa[0])
+            P_max = float(P_bracket_GPa[1])
         if P_min <= 0 or P_max <= P_min:
-            raise ValueError("P_bracket_Pa must satisfy 0 < P_min < P_max")
+            raise ValueError("P_bracket_GPa must satisfy 0 < P_min < P_max")
 
         logP_lo = np.log(P_min)
         logP_hi = np.log(P_max)
@@ -1891,44 +1891,44 @@ class Fe_COMBINED_EOS(Fe_EOS):
                 P_prev = P_sol
             elif on_fail == "raise":
                 raise RuntimeError(
-                    f"Failed P(rho,T) inversion: rho={rho_t:.3e} kg/m^3, T={Ti:.3f} K "
-                    f"within [{P_min:.3e}, {P_max:.3e}] Pa"
+                    f"Failed P(rho,T) inversion: rho={rho_t:.3e} g/cm^3, T={Ti:.3f} K "
+                    f"within [{P_min:.3e}, {P_max:.3e}] GPa"
                 )
 
         return float(out) if out.size == 1 else out
 
-    def get_s_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_s_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals = self.get_s_pt(P_arr, T_arr)
         return float(vals) if scalar else vals
 
-    def get_u_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_u_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals = self.get_u_pt(P_arr, T_arr)
         return float(vals) if scalar else vals
 
-    def get_g_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_g_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals = self.get_g_pt(P_arr, T_arr)
         return float(vals) if scalar else vals
 
-    def get_CP_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_CP_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals = self.get_CP_pt(P_arr, T_arr)
         return float(vals) if scalar else vals
 
-    def get_CV_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_CV_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals = self.get_CV_pt(P_arr, T_arr)
         return float(vals) if scalar else vals
 
-    def get_alpha_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        scalar, rho_arr, T_arr = self._broadcast(rho_kgm3, T_K)
+    def get_alpha_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        scalar, rho_arr, T_arr = self._broadcast(rho, T_K)
         P_arr = self.get_p_rhot(rho_arr, T_arr)
         vals = self.get_alpha_pt(P_arr, T_arr)
         return float(vals) if scalar else vals

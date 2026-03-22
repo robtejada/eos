@@ -29,10 +29,10 @@ This class provides:
 - inversion ρ(P,T) via bisection
 
 Units:
-- Inputs: ρ in kg/m^3, T in K
+- Inputs: ρ in g/cm^3, P in GPa, T in K
 - Outputs:
-    unit_system="cgs" (default): P in dyn/cm^2, u in erg/g, s in erg/g/K
-    unit_system="si":           P in Pa,       u in J/kg,  s in J/kg/K
+    P in GPa, rho in g/cm^3
+    s in erg/g/K, u in erg/g, Cp/Cv in erg/g/K, alpha in 1/K
 """
 
 from __future__ import annotations
@@ -378,47 +378,54 @@ class Fe_EOS_Ichikawa2014_Liquid:
     # -------------------------
     # Public API (rho,T)
     # -------------------------
-    def get_p_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
+    def get_p_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """P(rho, T). rho in g/cm^3, T in K. Returns P in GPa."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         P_pa = self._p_total_pa(V, T_K)
-        return P_pa
+        return P_pa * 1e-9
 
-    def get_u_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
-        U_molar = self._u_molar_jmol(V, T_K) + self._U_offset_molar  # NEW
+    def get_u_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """u(rho, T). rho in g/cm^3, T in K. Returns u in erg/g."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
+        U_molar = self._u_molar_jmol(V, T_K) + self._U_offset_molar
         u_jkg = U_molar / self.M_molar_kg_per_mol + 1.5e7
-        return self._jkg_to_ergg(u_jkg) 
+        return self._jkg_to_ergg(u_jkg)
 
-    def get_s_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
-        S_molar = self._s_molar_jmolK(V, T_K) + self._S_offset_molar  # NEW
+    def get_s_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """s(rho, T). rho in g/cm^3, T in K. Returns s in erg/g/K."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
+        S_molar = self._s_molar_jmolK(V, T_K) + self._S_offset_molar
         s_jkgK = S_molar / self.M_molar_kg_per_mol
         return self._jkg_to_ergg(s_jkgK)
 
-    def get_CV_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
+    def get_CV_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """Cv(rho, T). rho in g/cm^3, T in K. Returns Cv in erg/g/K."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         Cv_molar = self._cv_molar_jmolK(V, T_K)
         cv_jkgK = Cv_molar / self.M_molar_kg_per_mol
         return self._jkg_to_ergg(cv_jkgK)
 
-    def get_alpha_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
+    def get_alpha_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """alpha(rho, T). rho in g/cm^3, T in K. Returns alpha in 1/K."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         return self._alpha_perK(V, T_K)
 
-    def get_kt_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
+    def get_kt_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """KT(rho, T). rho in g/cm^3, T in K. Returns KT in GPa."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         KT_pa = self._kt_pa(V, T_K)
-        return KT_pa
+        return KT_pa * 1e-9
 
-    def get_gamma_rhot(self, rho_kgm3: ArrayLike) -> np.ndarray:
-        V = self._V_molar_from_rho(rho_kgm3)
+    def get_gamma_rhot(self, rho: ArrayLike) -> np.ndarray:
+        """Gruneisen parameter. rho in g/cm^3."""
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         return self._gamma(V)
 
-    def get_CP_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+    def get_CP_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """Cp(rho, T). rho in g/cm^3, T in K. Returns Cp in erg/g/K.
+        Uses C_P/C_V = 1 + alpha * gamma * T (paper text).
         """
-        Use C_P/C_V = 1 + α γ T  (paper text).
-        """
-        V = self._V_molar_from_rho(rho_kgm3)
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         T = np.asarray(T_K, dtype=float)
 
         Cv_molar = self._cv_molar_jmolK(V, T)
@@ -429,11 +436,11 @@ class Fe_EOS_Ichikawa2014_Liquid:
         cp_jkgK = Cp_molar / self.M_molar_kg_per_mol
         return self._jkg_to_ergg(cp_jkgK)
 
-    def get_ks_rhot(self, rho_kgm3: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+    def get_ks_rhot(self, rho: ArrayLike, T_K: ArrayLike) -> np.ndarray:
+        """KS(rho, T). rho in g/cm^3, T in K. Returns KS in GPa.
+        Uses K_S/K_T = 1 + alpha * gamma * T (paper text).
         """
-        Use K_S/K_T = 1 + α γ T  (paper text).
-        """
-        V = self._V_molar_from_rho(rho_kgm3)
+        V = self._V_molar_from_rho(np.asarray(rho, dtype=float) * 1e3)
         T = np.asarray(T_K, dtype=float)
 
         KT = self._kt_pa(V, T)
@@ -441,7 +448,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         gamma = self._gamma(V)
 
         KS_pa = KT * (1.0 + alpha * gamma * T)
-        return KS_pa
+        return KS_pa * 1e-9
     
     # -------------------------
     # Inversion rho(P,T)
@@ -451,11 +458,11 @@ class Fe_EOS_Ichikawa2014_Liquid:
         self,
         P: ArrayLike,
         T_K: ArrayLike,
-        rho_bracket_kgm3: Optional[Tuple[float, float]] = None,
+        rho_bracket_gcm3: Optional[Tuple[float, float]] = None,
         max_iter: int = 200,
         rtol: float = 1e-10,
         # robustness / warm-start controls
-        rho_guess0: Optional[float] = None,   # first guess; if None use rho(V0)
+        rho_guess0: Optional[float] = None,   # first guess in g/cm^3; if None use rho(V0)
         use_lsq_first: bool = True,
         lsq_max_nfev: int = 60,
         bracket_expand_steps: int = 30,
@@ -465,14 +472,14 @@ class Fe_EOS_Ichikawa2014_Liquid:
         """
         Invert the EOS for density at given (P,T).
 
-        Warm-starts across array inputs: previous rho solution is used as the next guess.
-
         Parameters
         ----------
-        P : pressure (Pa if unit_system="si", else dyn/cm^2)
+        P : pressure in GPa
         T_K : temperature [K]
-        rho_bracket_kgm3 : optional (rho_lo, rho_hi). If None, uses a safe default bracket.
+        rho_bracket_gcm3 : optional (rho_lo, rho_hi) in g/cm^3.
         on_fail : "nan" or "raise"
+
+        Returns rho in g/cm^3.
         """
         P_in = np.asarray(P, dtype=float)
         T_in = np.asarray(T_K, dtype=float)
@@ -480,36 +487,36 @@ class Fe_EOS_Ichikawa2014_Liquid:
         if np.any(T_in <= 0):
             raise ValueError("Temperature must be > 0 K")
 
-        # Convert target pressure to Pa
-        P_target = P_in if self.unit_system == "si" else self._barye_to_pa(P_in)
+        # Convert GPa target to Pa for internal inversion
+        P_target_Pa = P_in * 1e9
 
         # Broadcast
-        shape = np.broadcast(P_target, T_in).shape
-        P_b = np.broadcast_to(P_target, shape)
+        shape = np.broadcast(P_target_Pa, T_in).shape
+        P_b = np.broadcast_to(P_target_Pa, shape)
         T_b = np.broadcast_to(T_in, shape)
 
         out = np.full(shape, np.nan, dtype=float)
 
-        # Default bracket if none supplied
-        if rho_bracket_kgm3 is None:
-            rho_min, rho_max = 1000.0, 40000.0
+        # Default bracket in kg/m^3 (internal SI)
+        if rho_bracket_gcm3 is None:
+            rho_min, rho_max = 1000.0, 40000.0  # kg/m^3
         else:
-            rho_min, rho_max = float(rho_bracket_kgm3[0]), float(rho_bracket_kgm3[1])
+            rho_min, rho_max = float(rho_bracket_gcm3[0]) * 1e3, float(rho_bracket_gcm3[1]) * 1e3
 
         if rho_min <= 0 or rho_max <= 0 or rho_min >= rho_max:
-            raise ValueError("rho_bracket_kgm3 must be positive and increasing (rho_min < rho_max).")
+            raise ValueError("rho_bracket_gcm3 must be positive and increasing (rho_min < rho_max).")
 
         log_rho_lo, log_rho_hi = np.log(rho_min), np.log(rho_max)
 
         # First-guess: density at V0 (reference), unless user supplies rho_guess0
         rho_V0 = float(self.M_molar_kg_per_mol / self.V0_molar_m3_per_mol)  # kg/m^3
-        rho_seed_first = float(rho_guess0) if rho_guess0 is not None else rho_V0
+        rho_seed_first = float(rho_guess0) * 1e3 if rho_guess0 is not None else rho_V0  # -> kg/m^3
         rho_seed_first = min(max(rho_seed_first, rho_min), rho_max)
 
-        def P_pa_of_rho_scalar(rho, Ti):
-            # Safe scalar evaluation
+        def P_pa_of_rho_scalar(rho_kgm3, Ti):
+            # Safe scalar evaluation (rho in kg/m^3, returns Pa)
             try:
-                V = self._V_molar_from_rho(rho)
+                V = self._V_molar_from_rho(rho_kgm3)
                 val = self._p_total_pa(V, Ti)
                 return float(np.asarray(val))
             except Exception:
@@ -625,14 +632,14 @@ class Fe_EOS_Ichikawa2014_Liquid:
                                 rho_sol = np.nan
 
             if np.isfinite(rho_sol):
-                out[idx] = rho_sol
+                out[idx] = rho_sol * 1e-3  # kg/m^3 -> g/cm^3
                 rho_prev = rho_sol
             else:
                 # keep rho_prev as warm-start if it exists; often best for smooth sequences
                 if on_fail == "raise":
                     raise RuntimeError(
-                        f"Failed to invert rho(P,T): P={Pt:.3e} Pa, T={Ti:.3f} K "
-                        f"within rho bracket [{rho_min}, {rho_max}] kg/m^3."
+                        f"Failed to invert rho(P,T): P={Pt*1e-9:.3e} GPa, T={Ti:.3f} K "
+                        f"within rho bracket [{rho_min*1e-3}, {rho_max*1e-3}] g/cm^3."
                     )
 
         return float(out) if out.size == 1 else out
@@ -647,19 +654,12 @@ class Fe_EOS_Ichikawa2014_Liquid:
     ):
         """
         Obtains S(P,T) via rho(P,T) inversion.
-        P: Pa
+        P: GPa
         T: K
-        rho0: kg/m^3
-        rho_bracket: tuple of floats (min, max)
-        tol: float
-        maxiter: int
-        newton_first: bool
-        dPdrho_eps_rel: float
         Returns:
           S: erg/g/K
         """
-        
-        rho = self.get_rho_pt_inv(P, T)
+        rho = self.get_rho_pt_inv(P, T)  # g/cm^3
 
         return self.get_s_rhot(rho, T) # output in cgs units
 
@@ -694,7 +694,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         _s : target entropy.
             If s_units="cgs":   erg/g/K
             If s_units="kbbar": kB/baryon
-        _rho : density [kg/m^3]
+        _rho : density [g/cm^3]
         bracket : (Tmin, Tmax) in K, Tmin MUST be > 0
         Returns
         -------
@@ -868,7 +868,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         """
         Invert s(P,T) -> T, where s(P,T) is computed via rho(P,T) inversion.
 
-        _P in Pa
+        _P in GPa
         _s in erg/g/K (default) or kB/baryon if s_units="kbbar"
         """
         s_arr = np.atleast_1d(_s).astype(float)
@@ -923,7 +923,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
         s_units="kbbar",                 # "cgs" (erg/g/K) or "kbbar" (kB/baryon)
         guess="auto",                  # "auto" or (rho_guess, T_guess)
         T_guess0=None,                 # used only if guess="auto"
-        bounds_rho=(1e3, 1e6),         # kg/m^3
+        bounds_rho=(1.0, 1e3),         # g/cm^3
         bounds_T=(1.0, 2e5),           # K (must be > 0)
         xtol=1e-10,
         ftol=1e-10,
@@ -934,7 +934,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
     ):
         """
         Solve the coupled system:
-            P(rho, T) = P_target   (Pa)
+            P(rho, T) = P_target   (GPa)
             S(rho, T) = s_target   (cgs by default: erg/g/K)
 
         Warm-start behavior for array inputs:
@@ -1024,7 +1024,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
             x0 = np.array([np.log(rho_guess_cur), np.log(T_guess_cur)], dtype=float)
 
             # Scaling to make the two equations comparable
-            P_scale = max(abs(Pt), 1.0e9)      # Pa
+            P_scale = max(abs(Pt), 1.0)        # GPa
             S_scale = max(abs(St), 1.0)        # erg/g/K
 
             def residuals(x):
@@ -1033,7 +1033,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
                 T   = float(np.exp(x[1]))
 
                 # Evaluate model
-                Pm = float(self.get_p_rhot(rho, T))      # Pa
+                Pm = float(self.get_p_rhot(rho, T))      # GPa
                 Sm = float(self.get_s_rhot(rho, T))      # erg/g/K (cgs)
 
                 # Guard against NaNs/Infs from the EOS
@@ -1096,10 +1096,10 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
       - tab=True  -> PT-table interpolation
       - tab=False -> analytic inversion via Fe_EOS.get_rho_pt_inv + analytic getters
 
-    Table expectations (default keys):
-      pvals_pt     [Pa]
+    Table expectations (default keys in NPZ files):
+      pvals_pt     [Pa in file -> converted to GPa]
       tvals_pt     [K]
-      rho_grid_pt  [g/cm^3 by default]  (converted to kg/m^3 internally)
+      rho_grid_pt  [kg/m^3 in file -> converted to g/cm^3]
       s_grid_pt    [erg/g/K]
       u_grid_pt    [erg/g]
     """
@@ -1119,24 +1119,24 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
 
         data_pt = np.load('eos/ichikawa_iron_eos/iron_eos_PT_liquid.npz')
 
-        self.pvals_pt = np.asarray(data_pt['pvals_pt'], dtype=float)  # Pa
+        self.pvals_pt = np.asarray(data_pt['pvals_pt'], dtype=float) * 1e-9  # Pa -> GPa
         self.tvals_pt = np.asarray(data_pt['tvals_pt'], dtype=float)  # K
 
-        self.rho_grid_pt = np.asarray(data_pt['rho_grid_pt'], dtype=float) # kg/m^3
+        self.rho_grid_pt = np.asarray(data_pt['rho_grid_pt'], dtype=float) * 1e-3  # kg/m^3 -> g/cm^3
         self.s_grid_pt = np.asarray(data_pt['s_grid_pt'], dtype=float)  # erg/g/K
         self.u_grid_pt = np.asarray(data_pt['u_grid_pt'], dtype=float)  # erg/g
         self.cp_grid_pt = np.asarray(data_pt['cp_grid_pt'], dtype=float)  # erg/g/K
         self.cv_grid_pt = np.asarray(data_pt['cv_grid_pt'], dtype=float)  # erg/g/K
-        self.alpha_grid_pt = np.asarray(data_pt['alpha_grid_pt'], dtype=float)  # erg/g/K
+        self.alpha_grid_pt = np.asarray(data_pt['alpha_grid_pt'], dtype=float)  # 1/K
 
         # S, P tables
 
         data_sp = np.load('eos/ichikawa_iron_eos/iron_eos_SP_liquid.npz')
 
         self.svals_sp = np.asarray(data_sp['svals_sp'], dtype=float)  # kb/baryon
-        self.pvals_sp = np.asarray(data_sp['pvals_sp'], dtype=float)  # Pa
+        self.pvals_sp = np.asarray(data_sp['pvals_sp'], dtype=float) * 1e-9  # Pa -> GPa
 
-        self.rho_grid_sp = np.asarray(data_sp['rho_grid_sp'], dtype=float) # kg/m^3
+        self.rho_grid_sp = np.asarray(data_sp['rho_grid_sp'], dtype=float) * 1e-3  # kg/m^3 -> g/cm^3
         self.t_grid_sp = np.asarray(data_sp['t_grid_sp'], dtype=float)  # K
         self.u_grid_sp = np.asarray(data_sp['u_grid_sp'], dtype=float)  # erg/g
         self.cp_grid_sp = np.asarray(data_sp['cp_grid_sp'], dtype=float)  # erg/g/K
@@ -1148,10 +1148,10 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
         data_srho = np.load('eos/ichikawa_iron_eos/iron_eos_SRho_liquid.npz')
 
         self.svals_srho = np.asarray(data_srho['svals_srho'], dtype=float)  # kb/baryon
-        self.rho_vals_srho = np.asarray(data_srho['rhovals_srho'], dtype=float)  # kg/m^3
+        self.rho_vals_srho = np.asarray(data_srho['rhovals_srho'], dtype=float) * 1e-3  # kg/m^3 -> g/cm^3
 
         self.t_grid_srho = np.asarray(data_srho['t_grid_srho'], dtype=float)  # K
-        self.p_grid_srho = np.asarray(data_srho['p_grid_srho'], dtype=float)  # Pa
+        self.p_grid_srho = np.asarray(data_srho['p_grid_srho'], dtype=float) * 1e-9  # Pa -> GPa
         self.u_grid_srho = np.asarray(data_srho['u_grid_srho'], dtype=float)  # erg/g
         self.cp_grid_srho = np.asarray(data_srho['cp_grid_srho'], dtype=float)  # erg/g/K
         self.cv_grid_srho = np.asarray(data_srho['cv_grid_srho'], dtype=float)  # erg/g/K
@@ -1202,7 +1202,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
     # -------------------------
     def get_rho_pt(self, P, T, tab=True, rho0=None, **inv_kwargs):
         """
-        rho(P,T) in kg/m^3.
+        rho(P,T) in g/cm^3.  P in GPa, T in K.
         If tab=False, uses Fe_EOS.get_rho_pt_inv.
         """
         scalar, P_arr, T_arr = self._broadcast(P, T)
@@ -1302,7 +1302,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
 
     def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
         """
-        rho(S,P) in kg/m^3.
+        rho(S,P) in g/cm^3.  P in GPa.
         If tab=False, uses Fe_EOS.get_rho_sp_inv.
         """
         scalar, S_arr, P_arr = self._broadcast(S, P)
@@ -1408,7 +1408,7 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
     
     def get_p_srho(self, S, rho, tab=True, **inv_kwargs):
         """
-        p(S,rho) in Pa.
+        p(S,rho) in GPa.  rho in g/cm^3.
         If tab=False, uses Fe_EOS.get_rho_srho_inv.
         """
         scalar, S_arr, rho_arr = self._broadcast(S, rho)
@@ -1484,9 +1484,8 @@ class Fe_EOS(Fe_EOS_Ichikawa2014_Liquid):
     def get_T_melt(self, P):
         """
         Zhang et al. (2015) melt curve used in ichikawa_iron_eos.
-        P in Pa. Return T_melt(P) in K.
+        P in GPa. Return T_melt(P) in K.
         """
         P_arr = self._as_array_single(P)
-        P_GPa = P_arr * 1e-9
-        Tm = 1900 * (P_GPa / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
+        Tm = 1900 * (P_arr / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
         return Tm.reshape(P_arr.shape)

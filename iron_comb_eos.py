@@ -32,9 +32,9 @@ Assumptions:
     get_rho_sp(S, P)
     get_u_sp(S, P)
 - Units match between solid and liquid implementations:
-    P in Pa
+    P in GPa
     T in K
-    rho in kg/m^3
+    rho in g/cm^3
     S in erg/g/K
     U in erg/g
     Cp, Cv in erg/g/K
@@ -100,9 +100,9 @@ class Fe_COMBINED_EOS:
         self.data_sp = np.load(f'eos/dorogokupets_iron_eos/iron_eos_SP_comb.npz')
 
         self.svals_sp = np.asarray(self.data_sp['svals_sp'], dtype=float)  # kb/baryon
-        self.pvals_sp = np.asarray(self.data_sp['pvals_sp'], dtype=float)  # Pa
+        self.pvals_sp = np.asarray(self.data_sp['pvals_sp'], dtype=float) * 1e-9  # Pa -> GPa
 
-        self.rho_grid_sp = np.asarray(self.data_sp['rho_grid_sp'], dtype=float) # kg/m^3
+        self.rho_grid_sp = np.asarray(self.data_sp['rho_grid_sp'], dtype=float) * 1e-3  # kg/m^3 -> g/cm^3
         self.t_grid_sp = np.asarray(self.data_sp['t_grid_sp'], dtype=float)  # K
         self.u_grid_sp = np.asarray(self.data_sp['u_grid_sp'], dtype=float)  # erg/g
         self.cp_grid_sp = np.asarray(self.data_sp['cp_grid_sp'], dtype=float)  # erg/g/K
@@ -177,7 +177,7 @@ class Fe_COMBINED_EOS:
     def get_T_melt(self, P):
         """
         Zhang et al. (2015) melt curve used in ichikawa_iron_eos.
-        P in Pa. Return T_melt(P) in K.
+        P in GPa. Return T_melt(P) in K.
         """
         P_arr = self._as_array_single(P)
         Tm = self.liquid.get_T_melt(P_arr)
@@ -680,7 +680,7 @@ class Fe_COMBINED_EOS:
 
     def get_rho_sp(self, S, P, tab=True, **inv_kwargs):
         """
-        rho(S,P) in kg/m^3.
+        rho(S,P) in g/cm^3.
         If tab=False, uses Fe_EOS.get_rho_sp_inv.
         """
         scalar, S_arr, P_arr = self._broadcast(S, P)
