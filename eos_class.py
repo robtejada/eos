@@ -496,16 +496,23 @@ class val_mixtures:
     """
 
     # Molecular weights for ideal entropy of mixing
-    _m_h       = 1.0
+    _m_h_atomic    = 1.0       # atomic / ionized hydrogen
+    _m_h_molecular = 2.0       # molecular H2
     _m_he      = 4.0026
     _m_water   = 18.015
     _m_methane = 16.04
     _m_ammonia = 17.031
     _m_rock    = 140.6935   # Mg2SiO4 (forsterite)
 
+    # H2 dissociation boundary from CMS19 C_P peak analysis:
+    #   logT_dissoc = _DISSOC_A + _DISSOC_B * logP_cgs
+    # Below this line: molecular H2 (mu=2). Above: atomic/ionized H (mu=1).
+    _DISSOC_A = 2.9656
+    _DISSOC_B = 0.0974
+
     def __init__(self, hhe_eos_name='cms', hg=True,
                  smooth_hhe=False, smooth_z=False,
-                 species_list=None):
+                 species_list=None, mu_h_vary=True):
         """
         Parameters
         ----------
@@ -520,12 +527,18 @@ class val_mixtures:
         species_list : list of str or None
             Which Z species to load. Default: all four
             ['water', 'methane', 'ammonia', 'mg2sio4'].
+        mu_h_vary : bool
+            If True (default), use P-T dependent molecular weight for
+            hydrogen: mu_H = 2 below the H2 dissociation boundary and
+            mu_H = 1 above it.  If False, use the legacy value mu_H = 1
+            everywhere.
         """
         if species_list is None:
             species_list = ['water', 'methane', 'ammonia', 'mg2sio4']
 
         self.hhe_eos_name = hhe_eos_name
         self.hg = hg
+        self.mu_h_vary = mu_h_vary
 
         # H-He EOS
         self.hhe = hhe_eos(hhe_eos_name, smooth_hhe=smooth_hhe)
@@ -557,10 +570,53 @@ class val_mixtures:
         return f_water, f_methane, f_ammonia, f_rock
 
     # -----------------------------------------------------------------
+    # P-T dependent hydrogen molecular weight
+    # -----------------------------------------------------------------
+    def _get_mu_h(self, _lgp, _lgt):
+        """Return the effective mean molecular weight of hydrogen.
+
+        Uses the H₂ dissociation boundary derived from the CMS19
+        C_P peak analysis:
+            logT_dissoc = 2.9656 + 0.0974 * logP_cgs
+
+        Below this line hydrogen is predominantly molecular (μ_H = 2).
+        Above it hydrogen is atomic or ionized (μ_H = 1).
+
+        When ``self.mu_h_vary`` is False, always returns 1.0 (legacy).
+
+        Parameters
+        ----------
+        _lgp, _lgt : float or array
+            log10(P [dyn/cm²]), log10(T [K]).
+
+        Returns
+        -------
+        mu_h : float or array
+            Effective molecular weight of hydrogen (1.0 or 2.0).
+        """
+        if not self.mu_h_vary:
+            if np.isscalar(_lgp) and np.isscalar(_lgt):
+                return self._m_h_atomic
+            return np.full_like(np.atleast_1d(_lgp), self._m_h_atomic,
+                                dtype=float)
+
+        _lgp_arr = np.atleast_1d(_lgp)
+        _lgt_arr = np.atleast_1d(_lgt)
+
+        logt_dissoc = self._DISSOC_A + self._DISSOC_B * _lgp_arr
+        mu_h = np.where(_lgt_arr < logt_dissoc,
+                         self._m_h_molecular,    # H2
+                         self._m_h_atomic)        # H / H+
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return mu_h.item()
+        return mu_h
+
+    # -----------------------------------------------------------------
     # ideal entropy of mixing
     # -----------------------------------------------------------------
     def _smix_ideal(self, f_h, f_he, f_water=0.0, f_methane=0.0,
-                    f_ammonia=0.0, f_rock=0.0):
+                    f_ammonia=0.0, f_rock=0.0, m_h=None):
         """Ideal entropy of mixing  -Σ(x_i ln x_i) / q   [kb/baryon].
 
         Accepts *physical* mass fractions (must sum to 1).  When the
@@ -568,11 +624,22 @@ class val_mixtures:
         ideal entropy of mixing, so a single function handles both
         the X-Y and the X-Y-Z cases.
 
+        Parameters
+        ----------
+        f_h, f_he, ... : float
+            Physical mass fractions of each species.
+        m_h : float or None
+            Molecular weight to use for hydrogen.  If None, defaults
+            to ``_m_h_atomic`` (1.0) for backward compatibility.
+
         Returns value in units of kb/baryon.  Caller must divide by
         ``erg_to_kbbar`` to convert to erg/(g·K).
         """
+        if m_h is None:
+            m_h = self._m_h_atomic
+
         m = self
-        n_h       = f_h       / m._m_h
+        n_h       = f_h       / m_h
         n_he      = f_he      / m._m_he
         n_water   = f_water   / m._m_water   if f_water   > 0 else 0.0
         n_methane = f_methane / m._m_methane  if f_methane > 0 else 0.0
@@ -588,7 +655,7 @@ class val_mixtures:
         x_ammonia = n_ammonia / Ntot
         x_rock    = n_rock    / Ntot
 
-        q = (m._m_h * x_h + m._m_he * x_he + m._m_water * x_water
+        q = (m_h * x_h + m._m_he * x_he + m._m_water * x_water
              + m._m_methane * x_methane + m._m_ammonia * x_ammonia
              + m._m_rock * x_rock)
 
@@ -752,16 +819,20 @@ class val_mixtures:
         f_h  = (1.0 - _y_prime) * (1.0 - _z)
         f_he = _y_prime * (1.0 - _z)
 
+        # --- P-T dependent hydrogen molecular weight ---
+        mu_h = self._get_mu_h(_lgp, _lgt)
+
         # --- Ideal entropy of mixing ---
         # X-Y only (pure H-He)
         smix_xy_ideal = self._smix_ideal(
-            1.0 - _y_prime, _y_prime
+            1.0 - _y_prime, _y_prime, m_h=mu_h
         ) / erg_to_kbbar
 
         # X-Y-Z (all species present) — reduces to smix_xy_ideal when Z=0
         smix_xyz_ideal = self._smix_ideal(
             f_h, f_he,
-            f_w * _z, f_m * _z, f_a * _z, f_r * _z
+            f_w * _z, f_m * _z, f_a * _z, f_r * _z,
+            m_h=mu_h
         ) / erg_to_kbbar
 
         # --- HG23 non-ideal H-He correction (CMS only) ---
