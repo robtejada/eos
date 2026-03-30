@@ -95,6 +95,7 @@ class Fe_EOS_Ichikawa2014_Liquid:
     M_molar_kg_per_mol: float = 55.845e-3  # Fe
     erg_to_kbbar: float = (u.erg/u.Kelvin/u.gram).to(k_B/amu)
     dyn_to_Pa: float = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
+    dyn_to_GPa: float = (u.dyn/u.cm**2).to('GPa') # dyn/cm² to GPa conversion
     L: float = 1.2e6 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of Fe-Si alloy in erg/g (Anderson & Duba 1997)
     kb: float = k_B.to('erg/K') # ergs/K
 
