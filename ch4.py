@@ -208,7 +208,65 @@ def entropy_dft(rho, T):
 
 
 # ---------------------------------------------------------------------
-# Rho-T Combined CH4 EOS
+# P-T table smoothing
+# ---------------------------------------------------------------------
+
+def smooth_pt_tables(logrho, s, u, logT, logP):
+    """Smooth high-P discontinuities in the CH4 P-T table.
+
+    Targets the region where the analytic EOS breaks down (negative
+    entropy at low T / high P) and the DFT blending boundary.
+
+    Parameters
+    ----------
+    logrho, s, u : 2D arrays shaped (n_T, n_P)
+    logT, logP : 1D coordinate arrays
+
+    Returns
+    -------
+    logrho_s, s_s, u_s : smoothed 2D arrays
+    """
+    from scipy.ndimage import gaussian_filter
+
+    logrho_s = logrho.copy()
+    s_s = s.copy()
+    u_s = u.copy()
+
+    # Step 1: fix negative / extreme entropy by interpolating from
+    # valid pressure neighbors along each isotherm
+    for arr in [s_s, u_s, logrho_s]:
+        for ti in range(arr.shape[0]):
+            row = arr[ti, :]
+            bad = ~np.isfinite(row)
+            if arr is s_s:
+                bad |= (row < 0)
+            if not bad.any():
+                continue
+            valid = ~bad
+            if valid.sum() < 2:
+                continue
+            arr[ti, bad] = np.interp(
+                np.where(bad)[0], np.where(valid)[0], row[valid])
+
+    # Step 2: targeted 2D Gaussian in the low-T / high-P blending region
+    logT_2d = logT[:, np.newaxis]
+    logP_2d = logP[np.newaxis, :]
+
+    # Soft mask: strongest at low T, high P (where artifacts live)
+    mask_t = 0.5 * (1.0 - np.tanh((logT_2d - 3.0) / 0.3))
+    mask_p = 0.5 * (1.0 + np.tanh((logP_2d - 9.0) / 1.0))
+    mask = mask_t * mask_p
+
+    for arr in [logrho_s, s_s, u_s]:
+        smoothed = gaussian_filter(arr.astype(float),
+                                   sigma=[2.0, 3.0], mode='nearest')
+        arr[:] = (1.0 - mask) * arr + mask * smoothed
+
+    return logrho_s, s_s, u_s
+
+
+# ---------------------------------------------------------------------
+# P-T Combined CH4 EOS
 # ---------------------------------------------------------------------
 
 data_methane = np.load('eos/methane_ammonia/methane_eos_pt_extended.npz')

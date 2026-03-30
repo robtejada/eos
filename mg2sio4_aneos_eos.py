@@ -20,12 +20,97 @@ import warnings
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator as RGI
 from scipy.optimize import newton, brentq, least_squares, root_scalar
+from scipy.ndimage import gaussian_filter
 
 from astropy.constants import k_B
 from astropy.constants import u as amu
 from astropy import units as u
 
 ArrayLike = Union[float, int, np.ndarray]
+
+
+# ---------------------------------------------------------------------
+# P-T table smoothing
+# ---------------------------------------------------------------------
+
+def smooth_mg2sio4_pt(rho, s, u, logP_cgs, logT):
+    """Smooth discontinuities in the Mg2SiO4 ANEOS P-T table.
+
+    Targets:
+      1. Negative / NaN entropy at low-P / low-T (solid phase artifacts)
+      2. Sharp melt/vaporization boundary (diagonal kink)
+      3. Low-P boundary artifacts
+
+    Parameters
+    ----------
+    rho, s, u : 2D arrays shaped (n_P, n_T) — rho in g/cm³,
+                s in erg/g/K, u in erg/g
+    logP_cgs  : 1D array, log10(P in dyn/cm²)
+    logT      : 1D array, log10(T in K)
+
+    Returns
+    -------
+    rho_s, s_s, u_s : smoothed 2D arrays
+    """
+    rho_s = rho.copy()
+    s_s = s.copy()
+    u_s = u.copy()
+
+    # Step 1: fix negative / NaN entropy and energy by interpolating
+    # from valid neighbors along each isobar
+    for arr in [s_s, u_s]:
+        for pi in range(arr.shape[0]):
+            row = arr[pi, :]
+            bad = ~np.isfinite(row)
+            if arr is s_s:
+                bad |= (row < 0)
+            if not bad.any():
+                continue
+            valid = ~bad
+            if valid.sum() < 2:
+                continue
+            arr[pi, bad] = np.interp(
+                np.where(bad)[0], np.where(valid)[0], row[valid])
+
+    # Also fix any NaN/negative density
+    for pi in range(rho_s.shape[0]):
+        row = rho_s[pi, :]
+        bad = ~np.isfinite(row) | (row <= 0)
+        if not bad.any():
+            continue
+        valid = ~bad
+        if valid.sum() < 2:
+            continue
+        rho_s[pi, bad] = np.interp(
+            np.where(bad)[0], np.where(valid)[0], row[valid])
+
+    # Step 2: targeted 2D Gaussian along the melt/vaporization boundary
+    # The boundary runs diagonally; detect it via gradient magnitude
+    # and apply smoothing where the gradient is large
+    logP_2d = logP_cgs[:, np.newaxis]
+    logT_2d = logT[np.newaxis, :]
+
+    for arr in [rho_s, s_s, u_s]:
+        smoothed = gaussian_filter(arr.astype(float),
+                                   sigma=[3.0, 3.0], mode='nearest')
+
+        # Gradient-based mask: smooth where gradients are large
+        grad_p = np.abs(np.diff(arr, axis=0, prepend=arr[:1, :]))
+        grad_t = np.abs(np.diff(arr, axis=1, prepend=arr[:, :1]))
+        scale = np.maximum(np.abs(arr), 1e-10)
+        rel_grad = np.sqrt((grad_p / scale)**2 + (grad_t / scale)**2)
+
+        # Tanh activation: blend = 1 where relative gradient > threshold
+        grad_mask = 0.5 * (1 + np.tanh((rel_grad - 0.3) / 0.1))
+
+        # Also boost smoothing at low-P boundary
+        lowp_mask = 0.5 * (1.0 - np.tanh((logP_2d - 7.0) / 0.5))
+
+        mask = np.clip(grad_mask + lowp_mask, 0, 1)
+        arr[:] = (1.0 - mask) * arr + mask * smoothed
+
+    return rho_s, s_s, u_s
+
 
 @dataclass
 class Domain:

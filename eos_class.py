@@ -9,6 +9,7 @@ from tqdm import tqdm
 from numba import njit
 from eos import ideal_eos, metals_eos, ice_eos
 from eos import ideal_eos, metals_eos, scvh_eos
+from eos.smooth import smooth_eos_table
 from scipy.optimize import root, newton, brentq, brenth, minimize
 from scipy.ndimage import gaussian_filter1d, gaussian_filter
 from astropy.constants import k_B
@@ -34,8 +35,8 @@ MJ_to_erg = (u.MJ/u.kg).to('erg/g')
 
 log10_to_loge = np.log(10)
 
-class hhe:
-    def __init__(self, hhe_eos):
+class hhe_eos:
+    def __init__(self, hhe_eos, smooth_hhe=False):
         self.hhe_eos = hhe_eos
 
         if self.hhe_eos == 'cms':
@@ -55,6 +56,21 @@ class hhe:
         self.svals_he = self.hedata['logs']
         self.logrhovals_he = self.hedata['logrho']
         self.loguvals_he = self.hedata['logu']
+
+        if smooth_hhe:
+            # --- Smooth H tables before RGI creation ---
+            h_grids = {'logrho': self.logrhovals_h, 'logs': self.svals_h, 'logu': self.loguvals_h}
+            h_smooth = smooth_eos_table(h_grids, self.logtvals, self.logpvals)
+            self.svals_h = h_smooth['logs']
+            self.logrhovals_h = h_smooth['logrho']
+            self.loguvals_h = h_smooth['logu']
+
+            # --- Smooth He tables before RGI creation ---
+            he_grids = {'logrho': self.logrhovals_he, 'logs': self.svals_he, 'logu': self.loguvals_he}
+            he_smooth = smooth_eos_table(he_grids, self.logtvals, self.logpvals)
+            self.svals_he = he_smooth['logs']
+            self.logrhovals_he = he_smooth['logrho']
+            self.loguvals_he = he_smooth['logu']
 
         self.data_hc = pd.read_csv(f'{CURR_DIR}/cms/HG23_Vmix_Smix_Umix.csv', delimiter=',')
         self.data_hc = self.data_hc[(self.data_hc['LOGT'] <= 6.0) & (self.data_hc['LOGT'] != 2.8)].copy()
@@ -155,7 +171,299 @@ class hhe:
         return self._interpolate(self.get_logu_he_rgi, _lgp, _lgt)
 
 
-class mixtures(hhe):
+class z_eos:
+    """Reads heavy-element EOS tables directly from raw files.
+
+    Supported species (via `species` parameter):
+      - 'water'    : AQUA water EOS (Haldemann et al. 2020), P-T and rho-T bases
+      - 'methane'  : CH4 EOS (Setzmann + DFT blend), P-T basis only
+      - 'ammonia'  : NH3 EOS (Gao + DFT blend), P-T basis only
+      - 'mg2sio4'  : Mg2SiO4 forsterite ANEOS, P-T basis only
+
+    Units are consistent with hhe_eos:
+      - logp : log10(P) in dyn/cm^2
+      - logt : log10(T) in K
+      - logrho : log10(rho) in g/cm^3
+      - logs : log10(S) in erg/g/K  (NaN where S <= 0)
+      - logu : log10(U) in erg/g
+    """
+
+    # Unit conversions: AQUA raw tables are in SI
+    _Pa_to_dyn = 10.0             # 1 Pa = 10 dyn/cm^2
+    _kgm3_to_gcm3 = 1e-3          # 1 kg/m^3 = 1e-3 g/cm^3
+    _J_kgK_to_erg_gK = 1e4        # 1 J/(kg*K) = 1e4 erg/(g*K)
+    _J_kg_to_erg_g = 1e4          # 1 J/kg = 1e4 erg/g
+    _GPa_to_dyncm2 = 1e10         # 1 GPa = 1e10 dyn/cm^2
+
+    def __init__(self, species='water', smooth_z=False):
+        self.species = species
+
+        if species == 'water':
+            self._load_aqua(smooth_z)
+        elif species == 'methane':
+            self._load_ch4_nh3('methane', smooth_z)
+        elif species == 'ammonia':
+            self._load_ch4_nh3('ammonia', smooth_z)
+        elif species == 'mg2sio4':
+            self._load_mg2sio4(smooth_z)
+        else:
+            raise ValueError(f"Unknown z_eos species '{species}'. "
+                             f"Use 'water', 'methane', 'ammonia', or 'mg2sio4'.")
+
+    # -----------------------------------------------------------------
+    # AQUA loader
+    # -----------------------------------------------------------------
+    def _load_aqua(self, smooth_z):
+        # --- P-T basis ---
+        pt_cols = ['press', 'temp', 'rho', 'grada', 's', 'u',
+                   'c', 'mmw', 'x_ion', 'x_d', 'phase']
+        pt_raw = np.loadtxt(f'{CURR_DIR}/aqua/aqua_eos_pt_v1_0.dat', skiprows=19)
+        pt_df = pd.DataFrame(pt_raw, columns=pt_cols)
+
+        pt_df['logp'] = np.log10(pt_df['press'] * self._Pa_to_dyn)
+        pt_df['logt'] = np.log10(pt_df['temp'])
+        pt_df['logrho'] = np.log10(pt_df['rho'] * self._kgm3_to_gcm3)
+        pt_df['logu'] = np.log10(pt_df['u'] * self._J_kg_to_erg_g)
+
+        s_cgs = pt_df['s'].values * self._J_kgK_to_erg_gK
+        with np.errstate(invalid='ignore', divide='ignore'):
+            pt_df['logs'] = np.where(s_cgs > 0, np.log10(s_cgs), np.nan)
+
+        n_p_pt = pt_df['logp'].nunique()
+        shape_pt = (n_p_pt, -1)
+
+        self.logpvals_pt = np.reshape(pt_df['logp'].values, shape_pt)[:, 0]
+        self.logtvals_pt = np.reshape(pt_df['logt'].values, shape_pt)[0, :]
+
+        self.logrho_pt = np.reshape(pt_df['logrho'].values, shape_pt)
+        self.logs_pt = np.reshape(pt_df['logs'].values, shape_pt)
+        self.logu_pt = np.reshape(pt_df['logu'].values, shape_pt)
+        self.phase_pt = np.reshape(pt_df['phase'].values, shape_pt)
+
+        # --- rho-T basis ---
+        rhot_cols = ['rho', 'temp', 'press', 'grada', 's', 'u',
+                     'c', 'mmw', 'x_ion', 'x_d', 'phase']
+        rhot_raw = np.loadtxt(f'{CURR_DIR}/aqua/aqua_eos_rhot_v1_0.dat', skiprows=21)
+        rhot_df = pd.DataFrame(rhot_raw, columns=rhot_cols)
+
+        rhot_df['logp'] = np.log10(rhot_df['press'] * self._Pa_to_dyn)
+        rhot_df['logt'] = np.log10(rhot_df['temp'])
+        rhot_df['logrho'] = np.log10(rhot_df['rho'] * self._kgm3_to_gcm3)
+        rhot_df['logu'] = np.log10(rhot_df['u'] * self._J_kg_to_erg_g)
+
+        s_cgs_rhot = rhot_df['s'].values * self._J_kgK_to_erg_gK
+        with np.errstate(invalid='ignore', divide='ignore'):
+            rhot_df['logs'] = np.where(s_cgs_rhot > 0, np.log10(s_cgs_rhot), np.nan)
+
+        n_rho_rhot = rhot_df['logrho'].nunique()
+        shape_rhot = (n_rho_rhot, -1)
+
+        self.logrhovals_rhot = np.reshape(rhot_df['logrho'].values, shape_rhot)[:, 0]
+        self.logtvals_rhot = np.reshape(rhot_df['logt'].values, shape_rhot)[0, :]
+
+        self.logp_rhot = np.reshape(rhot_df['logp'].values, shape_rhot)
+        self.logs_rhot = np.reshape(rhot_df['logs'].values, shape_rhot)
+        self.logu_rhot = np.reshape(rhot_df['logu'].values, shape_rhot)
+        self.phase_rhot = np.reshape(rhot_df['phase'].values, shape_rhot)
+
+        if smooth_z:
+            self._smooth_aqua_lowp_lowt()
+
+        # --- Build RGI interpolators (P-T basis) ---
+        self.logrho_pt_rgi = RGI((self.logpvals_pt, self.logtvals_pt),
+                                  self.logrho_pt, method='linear',
+                                  bounds_error=False, fill_value=None)
+        self.logs_pt_rgi = RGI((self.logpvals_pt, self.logtvals_pt),
+                                self.logs_pt, method='linear',
+                                bounds_error=False, fill_value=None)
+        self.logu_pt_rgi = RGI((self.logpvals_pt, self.logtvals_pt),
+                                self.logu_pt, method='linear',
+                                bounds_error=False, fill_value=None)
+
+        # --- Build RGI interpolators (rho-T basis) ---
+        self.logp_rhot_rgi = RGI((self.logrhovals_rhot, self.logtvals_rhot),
+                                  self.logp_rhot, method='linear',
+                                  bounds_error=False, fill_value=None)
+        self.logs_rhot_rgi = RGI((self.logrhovals_rhot, self.logtvals_rhot),
+                                  self.logs_rhot, method='linear',
+                                  bounds_error=False, fill_value=None)
+        self.logu_rhot_rgi = RGI((self.logrhovals_rhot, self.logtvals_rhot),
+                                  self.logu_rhot, method='linear',
+                                  bounds_error=False, fill_value=None)
+
+    # -----------------------------------------------------------------
+    # CH4 / NH3 loader
+    # -----------------------------------------------------------------
+    def _load_ch4_nh3(self, molecule, smooth_z):
+        if molecule == 'methane':
+            data = np.load(f'{CURR_DIR}/methane_ammonia/methane_eos_pt_extended.npz')
+            from eos.ch4 import smooth_pt_tables
+        else:
+            data = np.load(f'{CURR_DIR}/methane_ammonia/ammonia_eos_pt_extended.npz')
+            from eos.nh3 import smooth_pt_tables
+
+        # NPZ keys: logT, logP, logrho, s, u — already in CGS
+        # Grid is (n_T, n_P); logrho is log10(g/cm³),
+        # s is linear erg/(g·K), u is linear erg/g
+        logt_1d = data['logT']
+        logp_1d = data['logP']
+        logrho_raw = data['logrho']
+        s_raw = data['s']
+        u_raw = data['u']
+
+        if smooth_z:
+            logrho_raw, s_raw, u_raw = smooth_pt_tables(
+                logrho_raw, s_raw, u_raw, logt_1d, logp_1d)
+
+        # Convert to log form consistent with hhe_eos
+        with np.errstate(invalid='ignore', divide='ignore'):
+            logs_raw = np.where(s_raw > 0, np.log10(s_raw), np.nan)
+            logu_raw = np.where(u_raw > 0, np.log10(u_raw), np.nan)
+
+        # Store with same attribute names as AQUA, but axes are (logT, logP)
+        self.logtvals_pt = logt_1d
+        self.logpvals_pt = logp_1d
+        self.logrho_pt = logrho_raw     # (n_T, n_P)
+        self.logs_pt = logs_raw
+        self.logu_pt = logu_raw
+
+        # Build RGI interpolators — axes are (logT, logP) for CH4/NH3
+        rgi_kw = dict(method='linear', bounds_error=False, fill_value=None)
+        self.logrho_pt_rgi = RGI((logt_1d, logp_1d), self.logrho_pt, **rgi_kw)
+        self.logs_pt_rgi = RGI((logt_1d, logp_1d), self.logs_pt, **rgi_kw)
+        self.logu_pt_rgi = RGI((logt_1d, logp_1d), self.logu_pt, **rgi_kw)
+
+    # -----------------------------------------------------------------
+    # Mg2SiO4 loader
+    # -----------------------------------------------------------------
+    def _load_mg2sio4(self, smooth_z):
+        from eos.mg2sio4_aneos_eos import smooth_mg2sio4_pt
+
+        data = np.load(f'{CURR_DIR}/rock_eos/mg2sio4_aneos_PT.npz')
+
+        # PT table: P in GPa, T in K, rho in g/cm³,
+        # s in erg/g/K (already CGS), u in erg/g (already CGS)
+        P_GPa = np.asarray(data['pvals_pt'], dtype=float)
+        T_K = np.asarray(data['tvals_pt'], dtype=float)
+        n_P, n_T = P_GPa.size, T_K.size
+
+        rho_raw = np.asarray(data['rho_grid_pt'], dtype=float)
+        s_raw = np.asarray(data['s_grid_pt'], dtype=float)
+        u_raw = np.asarray(data['u_grid_pt'], dtype=float)
+
+        # Ensure shape is (n_P, n_T)
+        if rho_raw.shape == (n_T, n_P):
+            rho_raw, s_raw, u_raw = rho_raw.T, s_raw.T, u_raw.T
+
+        # Convert axes to log CGS
+        logp_cgs = np.log10(P_GPa * self._GPa_to_dyncm2)
+        logt_1d = np.log10(T_K)
+
+        if smooth_z:
+            rho_raw, s_raw, u_raw = smooth_mg2sio4_pt(
+                rho_raw, s_raw, u_raw, logp_cgs, logt_1d)
+
+        # Convert to log form
+        with np.errstate(invalid='ignore', divide='ignore'):
+            logrho_raw = np.where(rho_raw > 0, np.log10(rho_raw), np.nan)
+            logs_raw = np.where(s_raw > 0, np.log10(s_raw), np.nan)
+            logu_raw = np.where(u_raw > 0, np.log10(u_raw), np.nan)
+
+        # Store — grid is (n_P, n_T), axes (logP, logT), same as AQUA
+        self.logpvals_pt = logp_cgs
+        self.logtvals_pt = logt_1d
+        self.logrho_pt = logrho_raw
+        self.logs_pt = logs_raw
+        self.logu_pt = logu_raw
+
+        # RGI axes: (logP, logT) like AQUA
+        rgi_kw = dict(method='linear', bounds_error=False, fill_value=None)
+        self.logrho_pt_rgi = RGI((logp_cgs, logt_1d), self.logrho_pt, **rgi_kw)
+        self.logs_pt_rgi = RGI((logp_cgs, logt_1d), self.logs_pt, **rgi_kw)
+        self.logu_pt_rgi = RGI((logp_cgs, logt_1d), self.logu_pt, **rgi_kw)
+
+    # -----------------------------------------------------------------
+    # AQUA smoothing
+    # -----------------------------------------------------------------
+    def _smooth_aqua_lowp_lowt(self):
+        """Smooth discontinuities at low-P / low-T phase boundaries
+        in the AQUA P-T table using a localized 2D Gaussian filter.
+        """
+        logp = self.logpvals_pt
+        logt = self.logtvals_pt
+
+        for attr in ['logrho_pt', 'logs_pt', 'logu_pt']:
+            grid = getattr(self, attr)
+
+            filled = grid.copy()
+            nan_mask = np.isnan(filled)
+            if nan_mask.any():
+                for i in range(filled.shape[0]):
+                    row = filled[i]
+                    nans = np.isnan(row)
+                    if nans.all():
+                        continue
+                    valid = ~nans
+                    filled[i] = np.interp(np.arange(len(row)),
+                                          np.where(valid)[0], row[valid])
+
+            smoothed_full = gaussian_filter(filled, sigma=[3.0, 3.0],
+                                            mode='nearest')
+
+            logp_2d = logp[:, np.newaxis]
+            logt_2d = logt[np.newaxis, :]
+
+            mask_p = 0.5 * (1.0 - np.tanh((logp_2d - 8.0) / 1.5))
+            mask_t = 0.5 * (1.0 - np.tanh((logt_2d - 3.0) / 0.3))
+            mask = mask_p * mask_t
+
+            blended = (1.0 - mask) * filled + mask * smoothed_full
+            blended[nan_mask] = np.nan
+
+            setattr(self, attr, blended)
+
+    def _interpolate_pt(self, interpolator, _lgp, _lgt):
+        # AQUA/Mg2SiO4 RGI axes: (logP, logT); CH4/NH3 RGI axes: (logT, logP)
+        if self.species in ('water', 'mg2sio4'):
+            args = (_lgp, _lgt)
+        else:
+            args = (_lgt, _lgp)
+        v_args = [np.atleast_1d(arg) for arg in args]
+        pts = np.column_stack(v_args)
+        result = interpolator(pts)
+        if all(np.isscalar(a) for a in (_lgp, _lgt)):
+            return result.item()
+        return result
+
+    def _interpolate_rhot(self, interpolator, _lgrho, _lgt):
+        args = (_lgrho, _lgt)
+        v_args = [np.atleast_1d(arg) for arg in args]
+        pts = np.column_stack(v_args)
+        result = interpolator(pts)
+        if all(np.isscalar(arg) for arg in args):
+            return result.item()
+        return result
+
+    def get_logrho_pt(self, lgp, lgt):
+        return self._interpolate_pt(self.logrho_pt_rgi, lgp, lgt)
+
+    def get_logs_pt(self, lgp, lgt):
+        return self._interpolate_pt(self.logs_pt_rgi, lgp, lgt)
+
+    def get_logu_pt(self, lgp, lgt):
+        return self._interpolate_pt(self.logu_pt_rgi, lgp, lgt)
+
+    def get_logp_rhot(self, lgrho, lgt):
+        return self._interpolate_rhot(self.logp_rhot_rgi, lgrho, lgt)
+
+    def get_logs_rhot(self, lgrho, lgt):
+        return self._interpolate_rhot(self.logs_rhot_rgi, lgrho, lgt)
+
+    def get_logu_rhot(self, lgrho, lgt):
+        return self._interpolate_rhot(self.logu_rhot_rgi, lgrho, lgt)
+
+
+class mixtures(hhe_eos):
     def __init__(self, hhe_eos,
                     z_eos = 'aqua',
                     zmix_eos1 = 'aqua',
@@ -168,10 +476,11 @@ class mixtures(hhe):
                     interp_method='linear',
                     new_z_mix=False,
                     rhot_sp_inv = False,
-                    srho_rhop_inv = False
+                    srho_rhop_inv = False,
+                    smooth_hhe = False
                     ):
         if hhe_eos in ['cms', 'cd']:
-            super().__init__(hhe_eos=hhe_eos)
+            super().__init__(hhe_eos=hhe_eos, smooth_hhe=smooth_hhe)
 
         self.y_prime = y_prime
         self.hg = hg
@@ -3293,10 +3602,11 @@ class total_eos(mixtures):
                  interp_method: str = 'linear',
                  pt_only: bool = False, # for new inversions PT is calculated first to get Rho, T and S, P later
                  srho_table: bool = True, # To obtain S, Rho table, we need Rho, T and S, P tables first or perform a double inversion
-                 new_z_mix: bool = True
+                 new_z_mix: bool = True,
+                 smooth_hhe: bool = False
                     ):
 
-        super().__init__(hhe_eos=hhe_eos, z_eos=z_eos, hg=hg, y_prime=y_prime, interp_method=interp_method, new_z_mix=new_z_mix)
+        super().__init__(hhe_eos=hhe_eos, z_eos=z_eos, hg=hg, y_prime=y_prime, interp_method=interp_method, new_z_mix=new_z_mix, smooth_hhe=smooth_hhe)
 
         self.hhe_eos = hhe_eos
         self.z_eos = z_eos

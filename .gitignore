@@ -64,3 +64,4 @@ mgsio3_JJ_eos.py
 rock_eos/mgsio3_JJ_eos.txt
 rock_eos/mgsio3_JJ_SP.npz
 *.png
+.claude/*
