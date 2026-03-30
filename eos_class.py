@@ -463,6 +463,349 @@ class z_eos:
         return self._interpolate_rhot(self.logu_rhot_rgi, lgrho, lgt)
 
 
+class val_mixtures:
+    """Volume Addition Law (VAL) mixer for H-He-Z compositions.
+
+    Combines hhe_eos (hydrogen + helium) with up to four z_eos species
+    (water, methane, ammonia, mg2sio4) using the linear mixing /
+    volume addition law.
+
+    Metal sub-fractions follow the nested convention used throughout
+    ORCHARD:
+        _zm  : methane fraction within the metal budget
+        _za  : ammonia fraction in the remainder after methane
+        _zr  : rock fraction in the remainder after ammonia
+        Physical mass fractions (within Z):
+            f_water   = (1 - _zm) * (1 - _za) * (1 - _zr)
+            f_methane = _zm * (1 - _za) * (1 - _zr)
+            f_ammonia = _za * (1 - _zr)
+            f_rock    = _zr
+
+    Y_prime = Y / (1 - Z) so that it ranges from 0 to 1.
+
+    HG23 non-ideal corrections (Smix, Vmix, Umix) are only applied
+    when ``hhe_eos_name == 'cms'`` and ``hg=True``.
+    Ideal entropy of mixing is always included.
+
+    All quantities are in CGS:
+        logP   : log10(dyn/cm²)
+        logT   : log10(K)
+        logrho : log10(g/cm³)
+        S      : erg/(g·K)  (linear, not log)
+        U      : erg/g      (linear, not log)
+    """
+
+    # Molecular weights for ideal entropy of mixing
+    _m_h       = 1.0
+    _m_he      = 4.0026
+    _m_water   = 18.015
+    _m_methane = 16.04
+    _m_ammonia = 17.031
+    _m_rock    = 140.6935   # Mg2SiO4 (forsterite)
+
+    def __init__(self, hhe_eos_name='cms', hg=True,
+                 smooth_hhe=False, smooth_z=False,
+                 species_list=None):
+        """
+        Parameters
+        ----------
+        hhe_eos_name : str
+            Which H-He EOS to use ('cms' or 'cd').
+        hg : bool
+            Include HG23 non-ideal mixing corrections (CMS only).
+        smooth_hhe : bool
+            Smooth H-He tables before RGI creation.
+        smooth_z : bool
+            Smooth Z tables before RGI creation.
+        species_list : list of str or None
+            Which Z species to load. Default: all four
+            ['water', 'methane', 'ammonia', 'mg2sio4'].
+        """
+        if species_list is None:
+            species_list = ['water', 'methane', 'ammonia', 'mg2sio4']
+
+        self.hhe_eos_name = hhe_eos_name
+        self.hg = hg
+
+        # H-He EOS
+        self.hhe = hhe_eos(hhe_eos_name, smooth_hhe=smooth_hhe)
+
+        # Z EOS instances — one per species
+        self.z = {}
+        for sp in species_list:
+            self.z[sp] = z_eos(species=sp, smooth_z=smooth_z)
+
+    # =================================================================
+    # helpers
+    # =================================================================
+
+    @staticmethod
+    def _guarded_xlogx(x):
+        """x * ln(x), returning 0 when x == 0."""
+        x = np.asarray(x, dtype=float)
+        out = np.zeros_like(x)
+        pos = x > 0.0
+        out[pos] = x[pos] * np.log(x[pos])
+        return out
+
+    def _metal_fractions(self, _zm, _za, _zr):
+        """Physical mass fractions **within** the metal budget Z."""
+        f_water   = (1.0 - _zm) * (1.0 - _za) * (1.0 - _zr)
+        f_methane = _zm * (1.0 - _za) * (1.0 - _zr)
+        f_ammonia = _za * (1.0 - _zr)
+        f_rock    = _zr
+        return f_water, f_methane, f_ammonia, f_rock
+
+    # -----------------------------------------------------------------
+    # ideal entropy of mixing
+    # -----------------------------------------------------------------
+    def _smix_ideal(self, f_h, f_he, f_water=0.0, f_methane=0.0,
+                    f_ammonia=0.0, f_rock=0.0):
+        """Ideal entropy of mixing  -Σ(x_i ln x_i) / q   [kb/baryon].
+
+        Accepts *physical* mass fractions (must sum to 1).  When the
+        metal fractions are all zero this reduces to the pure H-He
+        ideal entropy of mixing, so a single function handles both
+        the X-Y and the X-Y-Z cases.
+
+        Returns value in units of kb/baryon.  Caller must divide by
+        ``erg_to_kbbar`` to convert to erg/(g·K).
+        """
+        m = self
+        n_h       = f_h       / m._m_h
+        n_he      = f_he      / m._m_he
+        n_water   = f_water   / m._m_water   if f_water   > 0 else 0.0
+        n_methane = f_methane / m._m_methane  if f_methane > 0 else 0.0
+        n_ammonia = f_ammonia / m._m_ammonia  if f_ammonia > 0 else 0.0
+        n_rock    = f_rock    / m._m_rock     if f_rock    > 0 else 0.0
+
+        Ntot = n_h + n_he + n_water + n_methane + n_ammonia + n_rock
+
+        x_h       = n_h       / Ntot
+        x_he      = n_he      / Ntot
+        x_water   = n_water   / Ntot
+        x_methane = n_methane / Ntot
+        x_ammonia = n_ammonia / Ntot
+        x_rock    = n_rock    / Ntot
+
+        q = (m._m_h * x_h + m._m_he * x_he + m._m_water * x_water
+             + m._m_methane * x_methane + m._m_ammonia * x_ammonia
+             + m._m_rock * x_rock)
+
+        s_id = -(self._guarded_xlogx(x_h) + self._guarded_xlogx(x_he)
+                 + self._guarded_xlogx(x_water) + self._guarded_xlogx(x_methane)
+                 + self._guarded_xlogx(x_ammonia) + self._guarded_xlogx(x_rock)) / q
+
+        return s_id
+
+    # -----------------------------------------------------------------
+    # HG23 non-ideal corrections (CMS only)
+    # -----------------------------------------------------------------
+    def _vmix_nonideal(self, _lgp, _lgt, _y_prime):
+        """HG23 volume of mixing (cm³/g). Zero for non-CMS."""
+        if self.hg and self.hhe_eos_name == 'cms':
+            return self.hhe.vmix_interp(_lgp, _lgt) * (1.0 - _y_prime) * _y_prime
+        return 0.0
+
+    def _umix_nonideal(self, _lgp, _lgt, _y_prime):
+        """HG23 internal energy of mixing (erg/g). Zero for non-CMS."""
+        if self.hg and self.hhe_eos_name == 'cms':
+            return self.hhe.umix_interp(_lgp, _lgt) * (1.0 - _y_prime) * _y_prime
+        return 0.0
+
+    # =================================================================
+    # Metal-only mixing (water + methane + ammonia + rock)
+    # =================================================================
+
+    def get_logrho_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Metal-mixture density via VAL (log10 g/cm³)."""
+        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+
+        v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+
+        if f_w > 0 and 'water' in self.z:
+            rho_w = 10.0 ** self.z['water'].get_logrho_pt(_lgp, _lgt)
+            v_mix = v_mix + f_w / rho_w
+        if f_m > 0 and 'methane' in self.z:
+            rho_m = 10.0 ** self.z['methane'].get_logrho_pt(_lgp, _lgt)
+            v_mix = v_mix + f_m / rho_m
+        if f_a > 0 and 'ammonia' in self.z:
+            rho_a = 10.0 ** self.z['ammonia'].get_logrho_pt(_lgp, _lgt)
+            v_mix = v_mix + f_a / rho_a
+        if f_r > 0 and 'mg2sio4' in self.z:
+            rho_r = 10.0 ** self.z['mg2sio4'].get_logrho_pt(_lgp, _lgt)
+            v_mix = v_mix + f_r / rho_r
+
+        result = np.log10(1.0 / v_mix)
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return result.item()
+        return result
+
+    def get_s_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Metal-mixture entropy, mass-weighted (erg/(g·K)).
+
+        NOTE: does NOT include ideal entropy of mixing — that is added
+        at the full H-He-Z level in get_s_pt_val.
+        """
+        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+
+        s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+
+        if f_w > 0 and 'water' in self.z:
+            s_mix = s_mix + f_w * 10.0 ** self.z['water'].get_logs_pt(_lgp, _lgt)
+        if f_m > 0 and 'methane' in self.z:
+            s_mix = s_mix + f_m * 10.0 ** self.z['methane'].get_logs_pt(_lgp, _lgt)
+        if f_a > 0 and 'ammonia' in self.z:
+            s_mix = s_mix + f_a * 10.0 ** self.z['ammonia'].get_logs_pt(_lgp, _lgt)
+        if f_r > 0 and 'mg2sio4' in self.z:
+            s_mix = s_mix + f_r * 10.0 ** self.z['mg2sio4'].get_logs_pt(_lgp, _lgt)
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return s_mix.item()
+        return s_mix
+
+    def get_u_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Metal-mixture internal energy, mass-weighted (erg/g)."""
+        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+
+        u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+
+        if f_w > 0 and 'water' in self.z:
+            u_mix = u_mix + f_w * 10.0 ** self.z['water'].get_logu_pt(_lgp, _lgt)
+        if f_m > 0 and 'methane' in self.z:
+            u_mix = u_mix + f_m * 10.0 ** self.z['methane'].get_logu_pt(_lgp, _lgt)
+        if f_a > 0 and 'ammonia' in self.z:
+            u_mix = u_mix + f_a * 10.0 ** self.z['ammonia'].get_logu_pt(_lgp, _lgt)
+        if f_r > 0 and 'mg2sio4' in self.z:
+            u_mix = u_mix + f_r * 10.0 ** self.z['mg2sio4'].get_logu_pt(_lgp, _lgt)
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return u_mix.item()
+        return u_mix
+
+    # =================================================================
+    # Full H-He-Z mixing
+    # =================================================================
+
+    def get_logrho_pt_val(self, _lgp, _lgt, _y_prime, _z,
+                          _zm=0.0, _za=0.0, _zr=0.0):
+        """Density of H-He-Z mixture via VAL (returns log10 g/cm³).
+
+        Parameters
+        ----------
+        _lgp, _lgt : float or array
+            log10(P [dyn/cm²]), log10(T [K]).
+        _y_prime : float or array
+            Y' = Y/(1-Z), ranges 0..1.
+        _z : float or array
+            Total metal mass fraction.
+        _zm, _za, _zr : float
+            Nested sub-fractions within Z.
+        """
+        # H-He specific volume
+        rho_h  = 10.0 ** self.hhe.get_logrho_h(_lgp, _lgt)
+        rho_he = 10.0 ** self.hhe.get_logrho_he(_lgp, _lgt)
+        vmix   = self._vmix_nonideal(_lgp, _lgt, _y_prime)
+        v_xy   = (1.0 - _y_prime) / rho_h + _y_prime / rho_he + vmix
+
+        # Metal density
+        rho_z = 10.0 ** self.get_logrho_z(_lgp, _lgt, _zm, _za, _zr)
+
+        # VAL
+        v_total = v_xy * (1.0 - _z) + _z / rho_z
+        result = np.log10(1.0 / v_total)
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return np.atleast_1d(result).item()
+        return result
+
+    def get_s_pt_val(self, _lgp, _lgt, _y_prime, _z,
+                     _zm=0.0, _za=0.0, _zr=0.0):
+        """Entropy of H-He-Z mixture via VAL (returns erg/(g·K)).
+
+        Mixing logic
+        ------------
+        1. Start with mass-weighted pure-species entropies:
+               s_xy*(1-Z) + s_z*Z
+        2. For **H-He only** (Z=0):
+               + smix_xy_ideal                             (always)
+               + smix_xy_nonideal                          (CMS + hg only)
+        3. For **H-He-Z** (Z>0):
+               - smix_xy_ideal*(1-Z)   (subtract X-Y ideal that we're replacing)
+               + smix_xyz_ideal        (re-add full X-Y-Z ideal for all species)
+               + smix_xy_nonideal*(1-Z)(HG23 non-ideal for CMS; 0 for CD)
+           where smix_xy_nonideal = HG23_full - smix_xy_ideal.
+
+        When Z=0, smix_xyz_ideal == smix_xy_ideal, so the subtract/add
+        cancels and we recover case 2 identically.
+        """
+        # --- H-He component entropies (stored as log10) ---
+        s_h  = 10.0 ** self.hhe.get_s_h(_lgp, _lgt)
+        s_he = 10.0 ** self.hhe.get_s_he(_lgp, _lgt)
+        s_xy = s_h * (1.0 - _y_prime) + s_he * _y_prime
+
+        # --- Metal entropy (mass-weighted, no mixing terms) ---
+        s_z = self.get_s_z(_lgp, _lgt, _zm, _za, _zr)
+
+        # --- Physical mass fractions ---
+        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+        f_h  = (1.0 - _y_prime) * (1.0 - _z)
+        f_he = _y_prime * (1.0 - _z)
+
+        # --- Ideal entropy of mixing ---
+        # X-Y only (pure H-He)
+        smix_xy_ideal = self._smix_ideal(
+            1.0 - _y_prime, _y_prime
+        ) / erg_to_kbbar
+
+        # X-Y-Z (all species present) — reduces to smix_xy_ideal when Z=0
+        smix_xyz_ideal = self._smix_ideal(
+            f_h, f_he,
+            f_w * _z, f_m * _z, f_a * _z, f_r * _z
+        ) / erg_to_kbbar
+
+        # --- HG23 non-ideal H-He correction (CMS only) ---
+        # smix_xy_nonideal = HG23_total − smix_xy_ideal
+        # For CD (or hg=False): smix_xy_nonideal = 0
+        smix_xy_nonideal = 0.0
+        if self.hg and self.hhe_eos_name == 'cms':
+            smix_hg23 = (self.hhe.smix_interp(_lgp, _lgt)
+                         * (1.0 - _y_prime) * _y_prime)
+            smix_xy_nonideal = smix_hg23 - smix_xy_ideal
+
+        # --- Assemble ---
+        # Subtract X-Y ideal (scaled by 1-Z) and re-add X-Y-Z ideal.
+        # When Z=0 this is a no-op because smix_xyz_ideal == smix_xy_ideal.
+        result = (
+            s_xy * (1.0 - _z)
+            + s_z * _z
+            + smix_xyz_ideal
+            + smix_xy_nonideal * (1.0 - _z)
+        )
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return np.atleast_1d(result).item()
+        return result
+
+    def get_u_pt_val(self, _lgp, _lgt, _y_prime, _z,
+                     _zm=0.0, _za=0.0, _zr=0.0):
+        """Internal energy of H-He-Z mixture via VAL (returns erg/g)."""
+        # H-He component energies (stored as log10)
+        u_h  = 10.0 ** self.hhe.get_logu_h(_lgp, _lgt)
+        u_he = 10.0 ** self.hhe.get_logu_he(_lgp, _lgt)
+        umix = self._umix_nonideal(_lgp, _lgt, _y_prime)
+        u_xy = u_h * (1.0 - _y_prime) + u_he * _y_prime + umix
+
+        # Metal energy
+        u_z = self.get_u_z(_lgp, _lgt, _zm, _za, _zr)
+
+        result = u_xy * (1.0 - _z) + u_z * _z
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return np.atleast_1d(result).item()
+        return result
+
+
 class mixtures(hhe_eos):
     def __init__(self, hhe_eos,
                     z_eos = 'aqua',
