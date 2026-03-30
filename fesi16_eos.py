@@ -12,6 +12,7 @@ import os
 J_K_kg_to_erg_K_g = (u.J / (u.kg * u.K)).to('erg/(K*g)') # specific entropy conversion
 J_kg_to_erg_g = (u.J / u.kg).to('erg/g') # specific energy conversion
 dyn_to_Pa = (u.dyn/u.cm**2).to('Pa') # dyn/cm² to Pa conversion
+dyn_to_GPa = (u.dyn/u.cm**2).to('GPa') # dyn/cm² to GPa conversion
 kb = k_B.to('erg/K') # ergs/K
 erg_to_kbbar = (u.erg/u.Kelvin/u.gram).to(k_B/amu)
 
@@ -21,9 +22,9 @@ L = 1.2e6 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of Fe-Si alloy in er
 
 FeSi_alloy_eos = np.load('eos/zhang_eos/zhang_multiphase/Fe16Si_fischer.npz')
 
-P_grid_Fe = FeSi_alloy_eos['P_grid_Pa']
+P_grid_Fe = FeSi_alloy_eos['P_grid_Pa'] * 1e-9        # Pa → GPa
 T_grid_Fe = FeSi_alloy_eos['T_grid_K']
-rho_grid_Fe = FeSi_alloy_eos['rho_PT_grid_kg_m3']
+rho_grid_Fe = FeSi_alloy_eos['rho_PT_grid_kg_m3'] * 1e-3  # kg/m³ → g/cm³
 s_grid = FeSi_alloy_eos['s_PT_grid_J_K_kg'] * J_K_kg_to_erg_K_g
 u_grid_Fe = FeSi_alloy_eos['eth_PT_grid_J_kg'] * (u.J/u.kg).to('erg/g')
 CP_grid_Fe = FeSi_alloy_eos['cP_PT_grid_J_K_kg'] * J_K_kg_to_erg_K_g
@@ -46,7 +47,7 @@ get_alpha_FeSi = RGI((P_grid_Fe, T_grid_Fe), alpha_grid_Fe, **rgi_kwargs)
 def get_rho_pt(P, T):
     """
     Get the density of Fe-Si alloy at pressure P and temperature T.
-    P in Pa, T in K.
+    P in GPa, T in K. Returns rho in g/cm³.
     """
     scalar = np.isscalar(P) and np.isscalar(T)
     P_arr = np.array(P, ndmin=1)
@@ -60,7 +61,7 @@ def get_rho_pt(P, T):
 def get_s_pt(P, T):
     """
     Get the entropy of Fe-Si alloy at pressure P and temperature T.
-    P in Pa, T in K.
+    P in GPa, T in K.
     """
     scalar = np.isscalar(P) and np.isscalar(T)
     P_arr = np.array(P, ndmin=1)
@@ -74,7 +75,7 @@ def get_s_pt(P, T):
 def get_u_pt(P, T):
     """
     Get the internal energy of Fe-Si alloy at pressure P and temperature T.
-    P in Pa, T in K.
+    P in GPa, T in K.
     """
     scalar = np.isscalar(P) and np.isscalar(T)
     P_arr = np.array(P, ndmin=1)
@@ -88,7 +89,7 @@ def get_u_pt(P, T):
 def get_CP_pt(P, T):
     """
     Get the isobaric heat capacity of Fe-Si alloy at pressure P and temperature T.
-    P in Pa, T in K.
+    P in GPa, T in K.
     """
     scalar = np.isscalar(P) and np.isscalar(T)
     P_arr = np.array(P, ndmin=1)
@@ -102,7 +103,7 @@ def get_CP_pt(P, T):
 def get_CV_pt(P, T):
     """
     Get the isochoric heat capacity of Fe-Si alloy at pressure P and temperature T.
-    P in Pa, T in K.
+    P in GPa, T in K.
     """
     scalar = np.isscalar(P) and np.isscalar(T)
     P_arr = np.array(P, ndmin=1)
@@ -116,7 +117,7 @@ def get_CV_pt(P, T):
 def get_alpha_pt(P, T):
     """
     Get the thermal expansion coefficient of Fe-Si alloy at pressure P and temperature T.
-    P in Pa, T in K.
+    P in GPa, T in K.
     """
     scalar = np.isscalar(P) and np.isscalar(T)
     P_arr = np.array(P, ndmin=1)
@@ -141,7 +142,7 @@ def get_T_sp_inv(_s, _P, xtol=1e-8, maxiter=500):
     _s : float or array_like
         Entropy value(s) in kB/baryon.
     _P : float or array_like
-        Pressure value(s) in Pa.
+        Pressure value(s) in GPa.
     xtol : float, optional
         Tolerance on the temperature root (passed to brentq).
     maxiter : int, optional
@@ -181,7 +182,7 @@ def get_T_sp_inv(_s, _P, xtol=1e-8, maxiter=500):
 sp_data_FeSi = np.load('eos/zhang_eos/zhang_multiphase/Fe16Si_fischer_sp.npz')
 
 svals_sp_FeSi = sp_data_FeSi['s_vals'] # kb/baryon
-pvals_sp_FeSi = sp_data_FeSi['P_grid_Pa'] # Pa
+pvals_sp_FeSi = sp_data_FeSi['P_grid_Pa'] * 1e-9 # Pa → GPa
 
 rho_grid_sp_FeSi = sp_data_FeSi['rho_SP_grid'] # in g/cm^3
 t_grid_sp_FeSi = sp_data_FeSi['T_SP_grid_K'] # in K
@@ -197,7 +198,7 @@ u_rgi_sp_FeSi = RGI((svals_sp_FeSi, pvals_sp_FeSi), u_grid_sp_FeSi, method='line
 def get_rho_sp(S, P):
     """
     Get the density of liquid FeSi at entropy S and pressure P.
-    S in kb/baryon, P in Pa.
+    S in kb/baryon, P in GPa. Returns rho in g/cm³.
     """
 
     scalar = np.isscalar(S) and np.isscalar(P)
@@ -212,7 +213,7 @@ def get_rho_sp(S, P):
 def get_T_sp(S, P):
     """
     Get the temperature of liquid Fe at entropy S and pressure P.
-    S in kb/baryon, P in Pa.
+    S in kb/baryon, P in GPa.
     """
 
     scalar = np.isscalar(S) and np.isscalar(P)
@@ -227,7 +228,7 @@ def get_T_sp(S, P):
 def get_u_sp(S, P):
     """
     Get the internal energy of liquid Fe at entropy S and pressure P.
-    S in kb/baryon, P in Pa.
+    S in kb/baryon, P in GPa.
     """
 
     scalar = np.isscalar(S) and np.isscalar(P)
