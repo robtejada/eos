@@ -2745,6 +2745,685 @@ class hhe_z_mixtures():
         print(f"Saved {path}")
 
     # =================================================================
+    # Thermodynamic derivatives (all from P-T basis)
+    # =================================================================
+
+    @staticmethod
+    def _adaptive_dx(x, dx0=0.01):
+        """Adjust finite-difference step to stay within [0, 1]."""
+        x = np.asarray(x, dtype=float)
+        dx = np.full_like(x, dx0)
+        dx = np.minimum(dx, x)
+        dx = np.minimum(dx, 1.0 - x)
+        dx = np.maximum(dx, 1e-6)
+        if dx.size == 1:
+            return float(dx)
+        return dx
+
+    def _smooth_deriv(self, func, x0, h, n=5):
+        """Savitzky-Golay derivative: fit degree-2 poly through n points.
+
+        Returns df/dx at x0.  For n=5, stencil is
+        [x0-2h, x0-h, x0, x0+h, x0+2h].
+        """
+        xs = np.linspace(x0 - (n // 2) * h, x0 + (n // 2) * h, n)
+        ys = np.array([func(xi) for xi in xs])
+        # Savitzky-Golay first-derivative coefficients for n=5, degree 2:
+        # d/dx at center = (-2y_{-2} - y_{-1} + y_1 + 2y_2) / (10h)
+        if n == 5:
+            return (-2*ys[0] - ys[1] + ys[3] + 2*ys[4]) / (10 * h)
+        # Generic fallback: polyfit
+        coeffs = np.polyfit(xs - x0, ys, 2)
+        return coeffs[1]  # linear coefficient = derivative at center
+
+    def _pt_derivs(self, lgp, lgt, yp, z,
+                   _zm=0.0, _za=0.0, _zr=0.0,
+                   dlogt=1e-2, dlogp=1e-2,
+                   dy=None, dz=None,
+                   smooth=True, composition=False):
+        """Compute all base P-T log-derivatives at a single point.
+
+        Parameters
+        ----------
+        lgp, lgt : float
+            log10 P [dyn/cm²], log10 T [K].
+        yp : float
+            Y' = Y/(1-Z).
+        z : float
+            Total metal mass fraction.
+        dlogt, dlogp : float
+            Step sizes in log space.
+        dy, dz : float or None
+            Step sizes for Y', Z.  None → adaptive.
+        smooth : bool
+            Use 5-point Savitzky-Golay stencil (True) or
+            2-point central difference (False).
+        composition : bool
+            Also compute S_Y, S_Z, ρ_Y, ρ_Z, U_Y, U_Z, U_P, U_T.
+
+        Returns
+        -------
+        d : dict with keys 'a', 'b', 'c', 'd', 'S', 'logrho',
+            and optionally 'S_Y', 'S_Z', 'rho_Y', 'rho_Z',
+            'U_Y', 'U_Z', 'U_P', 'U_T'.
+        """
+        v = self.val
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+
+        # Central value
+        S0 = v.get_s_pt_val(lgp, lgt, yp, z, **kw)
+        logS0 = np.log10(S0) if S0 > 0 else np.nan
+        logrho0 = v.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+
+        def _logS(lgp_i, lgt_i, yp_i, z_i):
+            s = v.get_s_pt_val(lgp_i, lgt_i, yp_i, z_i, **kw)
+            return np.log10(s) if s > 0 else np.nan
+
+        def _logrho(lgp_i, lgt_i, yp_i, z_i):
+            return v.get_logrho_pt_val(lgp_i, lgt_i, yp_i, z_i, **kw)
+
+        if smooth:
+            # a = dlogS/dlogT|_P
+            a = self._smooth_deriv(
+                lambda t: _logS(lgp, t, yp, z), lgt, dlogt)
+            # b = dlogS/dlogP|_T
+            b = self._smooth_deriv(
+                lambda p: _logS(p, lgt, yp, z), lgp, dlogp)
+            # c = dlogrho/dlogT|_P
+            c = self._smooth_deriv(
+                lambda t: _logrho(lgp, t, yp, z), lgt, dlogt)
+            # d = dlogrho/dlogP|_T
+            d = self._smooth_deriv(
+                lambda p: _logrho(p, lgt, yp, z), lgp, dlogp)
+        else:
+            # 2-point central difference
+            logS_Tp = _logS(lgp, lgt + dlogt, yp, z)
+            logS_Tm = _logS(lgp, lgt - dlogt, yp, z)
+            logS_Pp = _logS(lgp + dlogp, lgt, yp, z)
+            logS_Pm = _logS(lgp - dlogp, lgt, yp, z)
+
+            rho_Tp = _logrho(lgp, lgt + dlogt, yp, z)
+            rho_Tm = _logrho(lgp, lgt - dlogt, yp, z)
+            rho_Pp = _logrho(lgp + dlogp, lgt, yp, z)
+            rho_Pm = _logrho(lgp - dlogp, lgt, yp, z)
+
+            a = (logS_Tp - logS_Tm) / (2 * dlogt)
+            b = (logS_Pp - logS_Pm) / (2 * dlogp)
+            c = (rho_Tp - rho_Tm) / (2 * dlogt)
+            d = (rho_Pp - rho_Pm) / (2 * dlogp)
+
+        result = {'a': a, 'b': b, 'c': c, 'd': d,
+                  'S': S0, 'logS': logS0, 'logrho': logrho0,
+                  'lgp': lgp, 'lgt': lgt}
+
+        if composition:
+            if dy is None:
+                dy = self._adaptive_dx(yp)
+            if dz is None:
+                dz = self._adaptive_dx(z)
+
+            S_Yp = v.get_s_pt_val(lgp, lgt, yp + dy, z, **kw)
+            S_Ym = v.get_s_pt_val(lgp, lgt, yp - dy, z, **kw)
+            S_Zp = v.get_s_pt_val(lgp, lgt, yp, z + dz, **kw)
+            S_Zm = v.get_s_pt_val(lgp, lgt, yp, z - dz, **kw)
+
+            rho_Yp = v.get_logrho_pt_val(lgp, lgt, yp + dy, z, **kw)
+            rho_Ym = v.get_logrho_pt_val(lgp, lgt, yp - dy, z, **kw)
+            rho_Zp = v.get_logrho_pt_val(lgp, lgt, yp, z + dz, **kw)
+            rho_Zm = v.get_logrho_pt_val(lgp, lgt, yp, z - dz, **kw)
+
+            U_Yp = v.get_u_pt_val(lgp, lgt, yp + dy, z, **kw)
+            U_Ym = v.get_u_pt_val(lgp, lgt, yp - dy, z, **kw)
+            U_Zp = v.get_u_pt_val(lgp, lgt, yp, z + dz, **kw)
+            U_Zm = v.get_u_pt_val(lgp, lgt, yp, z - dz, **kw)
+
+            U_Pp = v.get_u_pt_val(lgp + dlogp, lgt, yp, z, **kw)
+            U_Pm = v.get_u_pt_val(lgp - dlogp, lgt, yp, z, **kw)
+            U_Tp = v.get_u_pt_val(lgp, lgt + dlogt, yp, z, **kw)
+            U_Tm = v.get_u_pt_val(lgp, lgt - dlogt, yp, z, **kw)
+
+            result['S_Y']   = (S_Yp - S_Ym) / (2 * dy)
+            result['S_Z']   = (S_Zp - S_Zm) / (2 * dz)
+            result['rho_Y'] = (rho_Yp - rho_Ym) / (2 * dy)
+            result['rho_Z'] = (rho_Zp - rho_Zm) / (2 * dz)
+            result['U_Y']   = (U_Yp - U_Ym) / (2 * dy)
+            result['U_Z']   = (U_Zp - U_Zm) / (2 * dz)
+            result['U_P']   = (U_Pp - U_Pm) / (2 * dlogp)
+            result['U_T']   = (U_Tp - U_Tm) / (2 * dlogt)
+
+        return result
+
+    # ----- Vectorized derivative along T with post-smoothing -----
+
+    def deriv_along_t(self, method_name, lgp, logt_arr, yp, z=0.0,
+                      post_smooth_sigma=0, **kw):
+        """Evaluate a derivative method over an array of logT values.
+
+        Parameters
+        ----------
+        method_name : str
+            Name of the getter (e.g. 'get_cp', 'get_nabla_ad',
+            'get_dsdy_rhop').
+        lgp : float
+            log10 P [dyn/cm²] (fixed).
+        logt_arr : 1-D array
+            Array of log10 T values to evaluate at.
+        yp, z : float
+            Composition.
+        post_smooth_sigma : float
+            If > 0, apply a 1-D Gaussian filter with this sigma
+            (in grid points) to the output.  This removes spikes
+            from derivative-ratio singularities (e.g. near H₂
+            dissociation where c→0).
+        **kw :
+            Passed to the derivative method.
+
+        Returns
+        -------
+        result : 1-D array, same length as logt_arr.
+        """
+        func = getattr(self, method_name)
+        out = np.array([func(lgp, lgt, yp, z, **kw) for lgt in logt_arr])
+
+        if post_smooth_sigma > 0:
+            good = np.isfinite(out)
+            if good.sum() > 3:
+                # Fill NaN gaps before smoothing, then restore
+                filled = out.copy()
+                filled[~good] = np.interp(
+                    np.where(~good)[0],
+                    np.where(good)[0], out[good])
+                filled = gaussian_filter1d(filled, sigma=post_smooth_sigma)
+                out[good] = filled[good]
+
+        return out
+
+    # ----- Individual getter methods -----
+    # All accept scalar or array (lgp, lgt). When arrays are passed,
+    # the derivative is computed element-wise.
+    #
+    # method='identity' (default): thermodynamic identity from P-T basis
+    # method='finite_difference': direct FD on the appropriate inverted
+    #   basis (uses pre-computed tables if loaded, otherwise on-the-fly)
+
+    def _vec(self, func, lgp, lgt, *args, **kw):
+        """Vectorize a scalar function over (lgp, lgt)."""
+        if np.isscalar(lgp) and np.isscalar(lgt):
+            return func(lgp, lgt, *args, **kw)
+        lgp_a = np.atleast_1d(lgp)
+        lgt_a = np.atleast_1d(lgt)
+        lgp_a, lgt_a = np.broadcast_arrays(lgp_a, lgt_a)
+        out = np.array([func(float(p), float(t), *args, **kw)
+                         for p, t in zip(lgp_a.ravel(), lgt_a.ravel())])
+        return out.reshape(lgp_a.shape)
+
+    # ---- FD scalar helpers (use inversions) ----
+
+    def _cp_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+        """C_P via direct FD: dS/d(lnT)|_P."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s1 = self.val.get_s_pt_val(lgp, lgt - dt, yp, z, **kw)
+        s2 = self.val.get_s_pt_val(lgp, lgt + dt, yp, z, **kw)
+        return (s2 - s1) / (2 * dt * log10_to_loge)
+
+    def _cv_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+        """C_V via direct FD: dS/d(lnT)|_ρ."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        try:
+            p1 = self.get_logp_rhot(rho0, lgt - dt, yp, z, **kw)
+            p2 = self.get_logp_rhot(rho0, lgt + dt, yp, z, **kw)
+            s1 = self.val.get_s_pt_val(p1, lgt - dt, yp, z, **kw)
+            s2 = self.val.get_s_pt_val(p2, lgt + dt, yp, z, **kw)
+            return (s2 - s1) / (2 * dt * log10_to_loge)
+        except:
+            return np.nan
+
+    def _delta_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+        """δ via direct FD: -dlogρ/dlogT|_P."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        r1 = self.val.get_logrho_pt_val(lgp, lgt - dt, yp, z, **kw)
+        r2 = self.val.get_logrho_pt_val(lgp, lgt + dt, yp, z, **kw)
+        return -(r2 - r1) / (2 * dt)
+
+    def _nabla_ad_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dp=1e-2):
+        """∇_ad via direct FD on S-P inversion: dlogT/dlogP|_S."""
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, _zm, _za, _zr) * erg_to_kbbar
+        t1 = self.get_logt_sp(s_kb, lgp - dp, yp, z, _zm, _za, _zr)
+        t2 = self.get_logt_sp(s_kb, lgp + dp, yp, z, _zm, _za, _zr)
+        if np.isfinite(t1) and np.isfinite(t2):
+            return (t2 - t1) / (2 * dp)
+        return np.nan
+
+    def _gamma1_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dp=1e-2):
+        """Γ₁ via direct FD: dlogP/dlogρ|_S."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        t1 = self.get_logt_sp(s_kb, lgp - dp, yp, z, **kw)
+        t2 = self.get_logt_sp(s_kb, lgp + dp, yp, z, **kw)
+        if np.isfinite(t1) and np.isfinite(t2):
+            r1 = self.val.get_logrho_pt_val(lgp - dp, t1, yp, z, **kw)
+            r2 = self.val.get_logrho_pt_val(lgp + dp, t2, yp, z, **kw)
+            return (2 * dp) / (r2 - r1)
+        return np.nan
+
+    def _chi_T_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+        """χ_T via direct FD on ρ-T inversion: dlogP/dlogT|_ρ."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        p1 = self.get_logp_rhot(rho0, lgt - dt, yp, z, **kw)
+        p2 = self.get_logp_rhot(rho0, lgt + dt, yp, z, **kw)
+        if np.isfinite(p1) and np.isfinite(p2):
+            return (p2 - p1) / (2 * dt)
+        return np.nan
+
+    def _chi_rho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dr=1e-2):
+        """χ_ρ via direct FD on ρ-T inversion: dlogP/dlogρ|_T."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        p1 = self.get_logp_rhot(rho0 - dr, lgt, yp, z, **kw)
+        p2 = self.get_logp_rhot(rho0 + dr, lgt, yp, z, **kw)
+        if np.isfinite(p1) and np.isfinite(p2):
+            return (p2 - p1) / (2 * dr)
+        return np.nan
+
+    def _chi_Y_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
+        """χ_Y via direct FD on ρ-T inversion: dlogP/dY|_{ρ,T}."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        dy = self._adaptive_dx(yp, dy)
+        p1 = self.get_logp_rhot(rho0, lgt, yp - dy, z, **kw)
+        p2 = self.get_logp_rhot(rho0, lgt, yp + dy, z, **kw)
+        if np.isfinite(p1) and np.isfinite(p2):
+            return (p2 - p1) * log10_to_loge / (2 * dy)
+        return np.nan
+
+    def _chi_Z_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
+        """χ_Z via direct FD on ρ-T inversion: dlogP/dZ|_{ρ,T}."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        dz = self._adaptive_dx(z, dz)
+        p1 = self.get_logp_rhot(rho0, lgt, yp, z - dz, **kw)
+        p2 = self.get_logp_rhot(rho0, lgt, yp, z + dz, **kw)
+        if np.isfinite(p1) and np.isfinite(p2):
+            return (p2 - p1) * log10_to_loge / (2 * dz)
+        return np.nan
+
+    def _dtds_sp_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, ds=0.1):
+        """dT/dS|_P via direct FD on S-P inversion."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        t1 = self.get_logt_sp(s_kb - ds, lgp, yp, z, **kw)
+        t2 = self.get_logt_sp(s_kb + ds, lgp, yp, z, **kw)
+        if np.isfinite(t1) and np.isfinite(t2):
+            return (10**t2 - 10**t1) / (2 * ds / erg_to_kbbar)
+        return np.nan
+
+    def _dsdy_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
+        """dS/dY|_{P,T} via direct FD."""
+        dy = self._adaptive_dx(yp, dy)
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s1 = self.val.get_s_pt_val(lgp, lgt, yp - dy, z, **kw)
+        s2 = self.val.get_s_pt_val(lgp, lgt, yp + dy, z, **kw)
+        return (s2 - s1) / (2 * dy)
+
+    def _dsdz_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
+        """dS/dZ|_{P,T} via direct FD."""
+        dz = self._adaptive_dx(z, dz)
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s1 = self.val.get_s_pt_val(lgp, lgt, yp, z - dz, **kw)
+        s2 = self.val.get_s_pt_val(lgp, lgt, yp, z + dz, **kw)
+        return (s2 - s1) / (2 * dz)
+
+    # ---- Identity scalar helpers ----
+
+    def _cp_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return d['S'] * d['a']
+
+    def _cv_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return d['S'] * (d['a'] - d['b'] * d['c'] / d['d'])
+
+    def _delta_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return -d['c']
+
+    def _nabla_ad_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return -d['b'] / d['a']
+
+    def _chi_T_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return -d['c'] / d['d']
+
+    def _chi_rho_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return 1.0 / d['d']
+
+    def _gamma1_id(self, lgp, lgt, yp, z, **kw):
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return 1.0 / (d['d'] - d['c'] * d['b'] / d['a'])
+
+    def _chi_Y_id(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return -d['rho_Y'] / d['d']
+
+    def _chi_Z_id(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return -d['rho_Z'] / d['d']
+
+    def _dtds_sp_id(self, lgp, lgt, yp, z, **kw):
+        # dT/dS|_P = 1/(dS/dT|_P) = T/C_P
+        # since C_P = dS/d(lnT)|_P = S·a, and dS/dT = C_P/T
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        cp = d['S'] * d['a']
+        return 10.0**lgt / cp
+
+    def _dsdy_pt_id(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return d['S_Y']
+
+    def _dsdz_pt_id(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        return d['S_Z']
+
+    # ---- Public getters with method dispatch ----
+
+    def _dispatch(self, name, lgp, lgt, yp, z, method, **kw):
+        """Route to identity or FD scalar, then vectorize."""
+        if method == 'finite_difference':
+            func = getattr(self, f'_{name}_fd')
+        else:
+            func = getattr(self, f'_{name}_id')
+        return self._vec(func, lgp, lgt, yp, z, **kw)
+
+    def get_cp(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """C_P  [erg/(g·K)]."""
+        return self._dispatch('cp', lgp, lgt, yp, z, method, **kw)
+
+    def get_cv(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """C_V  [erg/(g·K)]."""
+        return self._dispatch('cv', lgp, lgt, yp, z, method, **kw)
+
+    def get_delta(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """δ = −(∂logρ/∂logT)|_P  [dimensionless]."""
+        return self._dispatch('delta', lgp, lgt, yp, z, method, **kw)
+
+    def get_nabla_ad(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """∇_ad = dlogT/dlogP|_S  [dimensionless]."""
+        return self._dispatch('nabla_ad', lgp, lgt, yp, z, method, **kw)
+
+    def get_chi_T(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """χ_T = dlogP/dlogT|_ρ  [dimensionless]."""
+        return self._dispatch('chi_T', lgp, lgt, yp, z, method, **kw)
+
+    def get_chi_rho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """χ_ρ = dlogP/dlogρ|_T  [dimensionless]."""
+        return self._dispatch('chi_rho', lgp, lgt, yp, z, method, **kw)
+
+    def get_gamma1(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """Γ₁ = dlogP/dlogρ|_S  [dimensionless]."""
+        return self._dispatch('gamma1', lgp, lgt, yp, z, method, **kw)
+
+    def get_chi_Y(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """χ_Y = dlogP/dY|_{ρ,T}."""
+        return self._dispatch('chi_Y', lgp, lgt, yp, z, method, **kw)
+
+    def get_chi_Z(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """χ_Z = dlogP/dZ|_{ρ,T}."""
+        return self._dispatch('chi_Z', lgp, lgt, yp, z, method, **kw)
+
+    def get_dtds_sp(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dT/dS|_P  [K·g·K/erg]."""
+        return self._dispatch('dtds_sp', lgp, lgt, yp, z, method, **kw)
+
+    def get_dsdy_pt(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dS/dY|_{P,T}  [erg/(g·K) per Y]."""
+        return self._dispatch('dsdy_pt', lgp, lgt, yp, z, method, **kw)
+
+    def get_dsdz_pt(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dS/dZ|_{P,T}  [erg/(g·K) per Z]."""
+        return self._dispatch('dsdz_pt', lgp, lgt, yp, z, method, **kw)
+
+    def _ledoux_dsdy_fd(self, lgp, lgt, yp, z, _zm, _za, _zr, dy):
+        """Direct finite-difference fallback for dS/dY|_{ρ,P}.
+
+        Finds T(Y±dY) at constant (P, ρ) via brentq, then
+        differentiates S.
+        """
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
+        if dy is None:
+            dy = self._adaptive_dx(yp)
+
+        def get_t(yp_i):
+            def err(lgt_i):
+                return self.val.get_logrho_pt_val(
+                    lgp, lgt_i, yp_i, z, _zm, _za, _zr) - rho0
+            return brentq(err, self.logt_min, self.logt_max, xtol=1e-8)
+
+        try:
+            lgt_p = get_t(yp + dy)
+            lgt_m = get_t(yp - dy)
+            return (self.val.get_s_pt_val(lgp, lgt_p, yp + dy, z, _zm, _za, _zr) -
+                    self.val.get_s_pt_val(lgp, lgt_m, yp - dy, z, _zm, _za, _zr)) / (2 * dy)
+        except (ValueError, RuntimeError):
+            return np.nan
+
+    def _ledoux_dsdz_fd(self, lgp, lgt, yp, z, _zm, _za, _zr, dz):
+        """Direct finite-difference fallback for dS/dZ|_{ρ,P}."""
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
+        if dz is None:
+            dz = self._adaptive_dx(z)
+
+        def get_t(z_i):
+            def err(lgt_i):
+                return self.val.get_logrho_pt_val(
+                    lgp, lgt_i, yp, z_i, _zm, _za, _zr) - rho0
+            return brentq(err, self.logt_min, self.logt_max, xtol=1e-8)
+
+        try:
+            lgt_p = get_t(z + dz)
+            lgt_m = get_t(z - dz)
+            return (self.val.get_s_pt_val(lgp, lgt_p, yp, z + dz, _zm, _za, _zr) -
+                    self.val.get_s_pt_val(lgp, lgt_m, yp, z - dz, _zm, _za, _zr)) / (2 * dz)
+        except (ValueError, RuntimeError):
+            return np.nan
+
+    def _dsdy_rhop_scalar(self, lgp, lgt, yp, z=0.0,
+                          _zm=0.0, _za=0.0, _zr=0.0, c_guard=0.02, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, _zm=_zm, _za=_za, _zr=_zr, **kw)
+        if abs(d['c']) > c_guard:
+            return d['S_Y'] - d['S'] * d['a'] * log10_to_loge * d['rho_Y'] / d['c']
+        return self._ledoux_dsdy_fd(lgp, lgt, yp, z, _zm, _za, _zr,
+                                     dy=kw.get('dy', None))
+
+    def get_dsdy_rhop(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """Ledoux: dS/dY|_{ρ,P}  [erg/(g·K) per Y].
+
+        method='identity': S_Y − S·a·ln(10)·ρ_Y / c (with c_guard fallback)
+        method='finite_difference': direct constrained FD at constant (ρ,P)
+        """
+        if method == 'finite_difference':
+            return self._vec(lambda p, t, yp, z, **k:
+                self._ledoux_dsdy_fd(p, t, yp, z,
+                    k.get('_zm', 0.), k.get('_za', 0.), k.get('_zr', 0.),
+                    k.get('dy', None)),
+                lgp, lgt, yp, z, **kw)
+        return self._vec(self._dsdy_rhop_scalar, lgp, lgt, yp, z, **kw)
+
+    def _dsdz_rhop_scalar(self, lgp, lgt, yp, z=0.0,
+                          _zm=0.0, _za=0.0, _zr=0.0, c_guard=0.02, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, _zm=_zm, _za=_za, _zr=_zr, **kw)
+        if abs(d['c']) > c_guard:
+            return d['S_Z'] - d['S'] * d['a'] * log10_to_loge * d['rho_Z'] / d['c']
+        return self._ledoux_dsdz_fd(lgp, lgt, yp, z, _zm, _za, _zr,
+                                     dz=kw.get('dz', None))
+
+    def get_dsdz_rhop(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """Ledoux: dS/dZ|_{ρ,P}  [erg/(g·K) per Z].
+
+        method='identity': S_Z − S·a·ln(10)·ρ_Z / c (with c_guard fallback)
+        method='finite_difference': direct constrained FD at constant (ρ,P)
+        """
+        if method == 'finite_difference':
+            return self._vec(lambda p, t, yp, z, **k:
+                self._ledoux_dsdz_fd(p, t, yp, z,
+                    k.get('_zm', 0.), k.get('_za', 0.), k.get('_zr', 0.),
+                    k.get('dz', None)),
+                lgp, lgt, yp, z, **kw)
+        return self._vec(self._dsdz_rhop_scalar, lgp, lgt, yp, z, **kw)
+
+    def _dtdy_srho_scalar(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        T = 10.0 ** lgt
+        det = d['b'] * d['c'] - d['a'] * d['d']
+        return T * (d['d'] * d['S_Y']
+                    - d['S'] * d['b'] * log10_to_loge * d['rho_Y']) \
+               / (d['S'] * det)
+
+    def _dtdy_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
+        """dT/dY|_{S,ρ} via 2D S-ρ inversion."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        dy = self._adaptive_dx(yp, dy)
+        _, t1 = self.get_logp_logt_srho(s_kb, rho0, yp - dy, z, **kw)
+        _, t2 = self.get_logp_logt_srho(s_kb, rho0, yp + dy, z, **kw)
+        if np.isfinite(t1) and np.isfinite(t2):
+            return (10**t2 - 10**t1) / (2 * dy)
+        return np.nan
+
+    def _dtdz_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
+        """dT/dZ|_{S,ρ} via 2D S-ρ inversion."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        dz = self._adaptive_dx(z, dz)
+        _, t1 = self.get_logp_logt_srho(s_kb, rho0, yp, z - dz, **kw)
+        _, t2 = self.get_logp_logt_srho(s_kb, rho0, yp, z + dz, **kw)
+        if np.isfinite(t1) and np.isfinite(t2):
+            return (10**t2 - 10**t1) / (2 * dz)
+        return np.nan
+
+    def _dudy_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
+        """dU/dY|_{S,ρ} via 2D S-ρ inversion."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        dy = self._adaptive_dx(yp, dy)
+        p1, t1 = self.get_logp_logt_srho(s_kb, rho0, yp - dy, z, **kw)
+        p2, t2 = self.get_logp_logt_srho(s_kb, rho0, yp + dy, z, **kw)
+        if np.isfinite(p1) and np.isfinite(p2):
+            u1 = self.val.get_u_pt_val(p1, t1, yp - dy, z, **kw)
+            u2 = self.val.get_u_pt_val(p2, t2, yp + dy, z, **kw)
+            return (u2 - u1) / (2 * dy)
+        return np.nan
+
+    def _dudz_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
+        """dU/dZ|_{S,ρ} via 2D S-ρ inversion."""
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        dz = self._adaptive_dx(z, dz)
+        p1, t1 = self.get_logp_logt_srho(s_kb, rho0, yp, z - dz, **kw)
+        p2, t2 = self.get_logp_logt_srho(s_kb, rho0, yp, z + dz, **kw)
+        if np.isfinite(p1) and np.isfinite(p2):
+            u1 = self.val.get_u_pt_val(p1, t1, yp, z - dz, **kw)
+            u2 = self.val.get_u_pt_val(p2, t2, yp, z + dz, **kw)
+            return (u2 - u1) / (2 * dz)
+        return np.nan
+
+    def get_dtdy_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dT/dY|_{S,ρ}  [K per Y].
+
+        method='identity': 2×2 implicit function theorem from P-T basis
+        method='finite_difference': direct FD via 2D S-ρ inversion
+        """
+        if method == 'finite_difference':
+            return self._vec(self._dtdy_srho_fd, lgp, lgt, yp, z, **kw)
+        return self._vec(self._dtdy_srho_scalar, lgp, lgt, yp, z, **kw)
+
+    def _dtdz_srho_scalar(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        T = 10.0 ** lgt
+        det = d['b'] * d['c'] - d['a'] * d['d']
+        return T * (d['d'] * d['S_Z']
+                    - d['S'] * d['b'] * log10_to_loge * d['rho_Z']) \
+               / (d['S'] * det)
+
+    def get_dtdz_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dT/dZ|_{S,ρ}  [K per Z].
+
+        method='identity': 2×2 implicit function theorem from P-T basis
+        method='finite_difference': direct FD via 2D S-ρ inversion
+        """
+        if method == 'finite_difference':
+            return self._vec(self._dtdz_srho_fd, lgp, lgt, yp, z, **kw)
+        return self._vec(self._dtdz_srho_scalar, lgp, lgt, yp, z, **kw)
+
+    def _dudy_srho_scalar(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        T = 10.0 ** lgt
+        P = 10.0 ** lgp
+        ln10 = log10_to_loge
+        det = d['b'] * d['c'] - d['a'] * d['d']
+        dTdY = T * (d['d'] * d['S_Y']
+                    - d['S'] * d['b'] * ln10 * d['rho_Y']) \
+               / (d['S'] * det)
+        dPdY = P * (d['S'] * d['a'] * ln10 * d['rho_Y']
+                    - d['c'] * d['S_Y']) \
+               / (d['S'] * det)
+        dlogPdY = dPdY / (P * ln10)
+        dlogTdY = dTdY / (T * ln10)
+        return d['U_P'] * dlogPdY + d['U_T'] * dlogTdY + d['U_Y']
+
+    def get_dudy_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dU/dY|_{S,ρ}  [erg/g per Y].
+
+        Chain rule:
+          dU/dY = (dU/dlogP)·(dlogP/dY) + (dU/dlogT)·(dlogT/dY) + U_Y
+        """
+        if method == 'finite_difference':
+            return self._vec(self._dudy_srho_fd, lgp, lgt, yp, z, **kw)
+        return self._vec(self._dudy_srho_scalar, lgp, lgt, yp, z, **kw)
+
+    def _dudz_srho_scalar(self, lgp, lgt, yp, z, **kw):
+        kw['composition'] = True
+        d = self._pt_derivs(lgp, lgt, yp, z, **kw)
+        T = 10.0 ** lgt
+        P = 10.0 ** lgp
+        ln10 = log10_to_loge
+        det = d['b'] * d['c'] - d['a'] * d['d']
+        dTdZ = T * (d['d'] * d['S_Z']
+                    - d['S'] * d['b'] * ln10 * d['rho_Z']) \
+               / (d['S'] * det)
+        dPdZ = P * (d['S'] * d['a'] * ln10 * d['rho_Z']
+                    - d['c'] * d['S_Z']) \
+               / (d['S'] * det)
+        dlogPdZ = dPdZ / (P * ln10)
+        dlogTdZ = dTdZ / (T * ln10)
+        return d['U_P'] * dlogPdZ + d['U_T'] * dlogTdZ + d['U_Z']
+
+    def get_dudz_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+        """dU/dZ|_{S,ρ}  [erg/g per Z].
+
+        Same chain rule as get_dudy_srho with Z replacing Y.
+        """
+        if method == 'finite_difference':
+            return self._vec(self._dudz_srho_fd, lgp, lgt, yp, z, **kw)
+        return self._vec(self._dudz_srho_scalar, lgp, lgt, yp, z, **kw)
+
+    # =================================================================
     # Convenience: rhomboid plotting / diagnostics
     # =================================================================
 
