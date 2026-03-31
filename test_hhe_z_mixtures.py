@@ -168,7 +168,6 @@ def test_table_builds_successfully():
     """Table build must converge on >95% of cells."""
     eos = _get_eos_with_table()
     assert eos._logt_sp_rgi is not None, "Table RGI not set"
-    assert eos._logrho_sp_rgi is not None, "logrho RGI not set"
 
 
 def test_table_vs_inversion_accuracy():
@@ -256,7 +255,6 @@ def test_table_save_load_roundtrip():
             'yvals': eos_tab._yvals,
             'zvals': eos_tab._zvals,
             'logt_sp': eos_tab._logt_sp_rgi.values,
-            'logrho_sp': eos_tab._logrho_sp_rgi.values,
             's_lo': eos_tab._s_lo,
             's_hi': eos_tab._s_hi,
             'logt_min': eos_tab.logt_min,
@@ -291,13 +289,9 @@ def test_table_zero_nans():
     """Built table must have zero NaN cells after interpolation."""
     eos = _get_eos_with_table()
     logt_data = eos._logt_sp_rgi.values
-    logrho_data = eos._logrho_sp_rgi.values
     n_nan_logt = np.isnan(logt_data).sum()
-    n_nan_logrho = np.isnan(logrho_data).sum()
     assert n_nan_logt == 0, (
         f"logt_sp has {n_nan_logt} NaNs (must be 0)")
-    assert n_nan_logrho == 0, (
-        f"logrho_sp has {n_nan_logrho} NaNs (must be 0)")
 
 
 # =====================================================================

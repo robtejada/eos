@@ -917,13 +917,61 @@ class hhe_z_mixtures():
         Number of normalised entropy grid points.
     """
 
+    # Table naming convention: {hhe_eos}/{hhe_eos}_{z_eos}_sp_adaptive.npz
+    # Auto-discovered relative to CURR_DIR (eos/ directory).
+    _TABLE_BASES = {
+        'sp':   '{hhe}_{z}_sp_adaptive.npz',
+        'rhot': '{hhe}_{z}_rhot_adaptive.npz',
+        # Future table types:
+        # 'srho': '{hhe}_{z}_srho_adaptive.npz',
+    }
+
     def __init__(self, hhe_eos_name='cd', hg=True,
                  smooth_hhe=True, smooth_z=True,
                  mu_h_vary=True,
                  species_list=None,
+                 z_eos='water',
+                 tab=True,
                  logp_range=(5.0, 15.0), logp_step=0.05,
                  logt_range=(2.0, 6.0),
+                 logrho_range=(-8.0, 2.0), logrho_step=0.05,
                  n_xi=100):
+        """
+        Parameters
+        ----------
+        hhe_eos_name : str
+            'cms' or 'cd'.
+        hg : bool
+            Include HG23 non-ideal mixing corrections (CMS only).
+        smooth_hhe, smooth_z : bool
+            Smooth H-He / Z tables before RGI creation.
+        mu_h_vary : bool
+            P-T dependent hydrogen molecular weight.
+        species_list : list of str or None
+            Z species for val_mixtures.
+        z_eos : str
+            Label used in table filenames (e.g. 'water', 'ice_mixture').
+        tab : bool
+            If True (default), auto-load pre-computed tables from
+            ``eos/{hhe_eos_name}/`` when they exist.  Set False to
+            always use on-the-fly root-finding inversions.
+        logp_range : tuple (lo, hi)
+            log10 P [dyn/cm²] bounds for the S-P grid.
+        logp_step : float
+            Step in logP.
+        logt_range : tuple (lo, hi)
+            log10 T [K] bounds of the underlying P-T table.
+        logrho_range : tuple (lo, hi)
+            log10 ρ [g/cm³] bounds for the ρ-T grid.
+        logrho_step : float
+            Step in logrho.
+        n_xi : int
+            Number of normalised entropy grid points.
+        """
+
+        self.hhe_eos_name = hhe_eos_name
+        self.z_eos_label = z_eos
+        self.tab = tab
 
         # --- Forward-model mixer ---
         self.val = val_mixtures(
@@ -941,15 +989,47 @@ class hhe_z_mixtures():
         self.n_xi = n_xi
         self.xi_vals = np.linspace(0.0, 1.0, n_xi)
 
+        self.logrho_vals = np.arange(logrho_range[0],
+                                      logrho_range[1] + logrho_step * 0.1,
+                                      logrho_step)
+        self.logt_vals = np.arange(logt_range[0], logt_range[1] + 0.01,
+                                    logp_step)  # same step as logP
+
         # Placeholders — populated by compute_s_bounds()
         self._s_lo = None      # (nP,) or (nP, nY, nZ)
         self._s_hi = None
         self._s_lo_rgi = None  # RGI for interpolating bounds
         self._s_hi_rgi = None
 
-        # Pre-computed S-P table (None until build_sp_table or load_sp_table)
+        # Pre-computed tables (None until loaded)
         self._logt_sp_rgi = None
-        self._logrho_sp_rgi = None
+        self._logp_rhot_rgi = None
+
+        # --- Auto-load tables if tab=True and files exist ---
+        if self.tab:
+            self._auto_load_tables()
+
+    # =================================================================
+    # Auto-loading
+    # =================================================================
+
+    def _table_path(self, table_type):
+        """Return the expected file path for a given table type."""
+        fname = self._TABLE_BASES[table_type].format(
+            hhe=self.hhe_eos_name, z=self.z_eos_label)
+        return os.path.join(CURR_DIR, self.hhe_eos_name, fname)
+
+    def _auto_load_tables(self):
+        """Try to load all available pre-computed tables from disk."""
+        # S-P table
+        sp_path = self._table_path('sp')
+        if os.path.isfile(sp_path):
+            self.load_sp_table(sp_path)
+
+        # rho-T table
+        rhot_path = self._table_path('rhot')
+        if os.path.isfile(rhot_path):
+            self.load_rhot_table(rhot_path)
 
     # =================================================================
     # S-bound computation
@@ -1028,8 +1108,14 @@ class hhe_z_mixtures():
         s_lo_3d = np.empty((nP, nY, nZ))
         s_hi_3d = np.empty((nP, nY, nZ))
 
+        pbar = tqdm(total=nY * nZ,
+                     desc="Computing S bounds",
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
         for iy, yp in enumerate(yvals):
             for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
                 for ip, lgp in enumerate(self.logp_vals):
                     s_cold = self.val.get_s_pt_val(
                         lgp, self.logt_min, yp, zv, _zm, _za, _zr)
@@ -1039,6 +1125,7 @@ class hhe_z_mixtures():
                     s_hot  *= erg_to_kbbar
                     s_lo_3d[ip, iy, iz] = min(s_cold, s_hot)
                     s_hi_3d[ip, iy, iz] = max(s_cold, s_hot)
+        pbar.close()
 
         self._s_lo = s_lo_3d
         self._s_hi = s_hi_3d
@@ -1227,39 +1314,39 @@ class hhe_z_mixtures():
             return out.item()
         return out
 
+    def _load_from_arrays(self, xi_vals, logp, yvals, zvals,
+                          logt_sp, s_lo, s_hi):
+        """Build RGI interpolators from arrays (shared by load and build)."""
+        self.xi_vals = xi_vals
+        self.logp_vals = logp
+        self._yvals = yvals
+        self._zvals = zvals
+        self._s_lo = s_lo
+        self._s_hi = s_hi
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logt_sp_rgi = RGI((xi_vals, logp, yvals, zvals),
+                                 logt_sp, **rgi_kw)
+        self._s_lo_rgi = RGI((logp, yvals, zvals), s_lo, **rgi_kw)
+        self._s_hi_rgi = RGI((logp, yvals, zvals), s_hi, **rgi_kw)
+
     def load_sp_table(self, path):
         """Load a pre-computed adaptive S-P table from NPZ.
 
         Expected keys: xi_vals, logpvals, yvals, zvals,
-                        logt_sp, logrho_sp, s_lo, s_hi,
-                        logt_min, logt_max.
+                        logt_sp, s_lo, s_hi, logt_min, logt_max.
+
+        logrho is not stored — it is computed on-the-fly from the
+        forward model via ``get_logrho_sp``.
         """
         data = np.load(path)
-        xi = data['xi_vals']
-        logp = data['logpvals']
-        yv = data['yvals']
-        zv = data['zvals']
-
-        rgi_kw = dict(method='linear', bounds_error=False,
-                      fill_value=None)
-
-        self._logt_sp_rgi = RGI((xi, logp, yv, zv),
-                                 data['logt_sp'], **rgi_kw)
-        self._logrho_sp_rgi = RGI((xi, logp, yv, zv),
-                                   data['logrho_sp'], **rgi_kw)
-
-        # Update bounds
-        self._s_lo = data['s_lo']
-        self._s_hi = data['s_hi']
-        self._yvals = yv
-        self._zvals = zv
-        self.logp_vals = logp
-        self.xi_vals = xi
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
-
-        self._s_lo_rgi = RGI((logp, yv, zv), data['s_lo'], **rgi_kw)
-        self._s_hi_rgi = RGI((logp, yv, zv), data['s_hi'], **rgi_kw)
+        self._load_from_arrays(
+            data['xi_vals'], data['logpvals'],
+            data['yvals'], data['zvals'],
+            data['logt_sp'], data['s_lo'], data['s_hi'])
 
     # =================================================================
     # NaN repair for tables
@@ -1394,26 +1481,50 @@ class hhe_z_mixtures():
 
         # --- Step 1: compute S bounds ---
         if verbose:
-            print(f"Computing S bounds: {nP} P × {nY} Y × {nZ} Z ...")
+            print(f"Building S-P table: n_xi={n_xi}, "
+                  f"logP=[{logp[0]:.2f}, {logp[-1]:.2f}] "
+                  f"(dlogP={logp[1]-logp[0]:.2f}, {nP} pts), "
+                  f"logT=[{self.logt_min:.1f}, {self.logt_max:.1f}]")
+            print(f"  Y' grid: {nY} pts [{yvals[0]:.3f} .. {yvals[-1]:.3f}], "
+                  f"Z grid: {nZ} pts [{zvals[0]:.3f} .. {zvals[-1]:.3f}]")
+            print(f"  Total cells: {n_xi}×{nP}×{nY}×{nZ} = "
+                  f"{n_xi*nP*nY*nZ:,}")
         self.compute_s_bounds_grid(yvals, zvals, _zm, _za, _zr)
         s_lo = self._s_lo   # (nP, nY, nZ)
         s_hi = self._s_hi
 
         # --- Step 2: invert at each (ξ, P, Y', Z) ---
-        logt_sp   = np.full((n_xi, nP, nY, nZ), np.nan, dtype=float)
-        logrho_sp = np.full((n_xi, nP, nY, nZ), np.nan, dtype=float)
+        # Only store logT; logrho is computed on-the-fly from
+        # val.get_logrho_pt_val(P, T, Y', Z) to halve memory.
+        logt_sp = np.full((n_xi, nP, nY, nZ), np.nan, dtype=float)
 
         total = nY * nZ
-        count = 0
-        for iy, yp in enumerate(yvals):
-            for iz, zv in enumerate(zvals):
-                count += 1
-                if verbose:
-                    print(f"  [{count}/{total}] Y'={yp:.3f}, Z={zv:.3f} ...",
-                          flush=True)
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T → S,P",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
 
-                # Previous-T guess for continuity along P
-                prev_logt = None
+        # Solver strategy:
+        #   - At the START of each (Y', Z) composition (iz==0):
+        #     use brentq to get reliable initial solutions.
+        #   - For subsequent Z steps: use newton warm-started from
+        #     the previous Z solution (small composition step → fast
+        #     convergence).  Fall back to brentq on newton failure.
+        #   - prev_logt[ixi, ip] caches the last converged logT at
+        #     each (ξ, P) cell across Z steps within the same Y'.
+        prev_logt = np.full((n_xi, nP), np.nan)
+        lmin, lmax = self.logt_min, self.logt_max
+
+        for iy, yp in enumerate(yvals):
+            # Reset cache when Y' changes (Z wraps from 1→0)
+            prev_logt[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                use_newton = iz > 0  # first Z uses brentq only
 
                 for ip in range(nP):
                     lgp_i = logp[ip]
@@ -1426,7 +1537,6 @@ class hhe_z_mixtures():
                         continue
 
                     for ixi in range(n_xi):
-                        # Physical S at this (ξ, P, Y', Z)
                         s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
 
                         def err(lgt):
@@ -1434,17 +1544,36 @@ class hhe_z_mixtures():
                                 lgp_i, lgt, yp, zv, _zm, _za, _zr)
                             return s_test * erg_to_kbbar - s_phys
 
-                        try:
-                            lgt_sol = brentq(err,
-                                             self.logt_min, self.logt_max,
-                                             xtol=1e-8, maxiter=100)
-                            logt_sp[ixi, ip, iy, iz] = lgt_sol
-                            logrho_sp[ixi, ip, iy, iz] = \
-                                self.val.get_logrho_pt_val(
-                                    lgp_i, lgt_sol, yp, zv,
-                                    _zm, _za, _zr)
-                        except (ValueError, RuntimeError):
-                            pass  # NaN stays
+                        solved = False
+
+                        # Newton from previous solution (fast path)
+                        if use_newton:
+                            guess = prev_logt[ixi, ip]
+                            if np.isfinite(guess):
+                                try:
+                                    lgt_sol = newton(
+                                        err, x0=guess,
+                                        tol=1e-8, maxiter=50)
+                                    if lmin <= lgt_sol <= lmax:
+                                        logt_sp[ixi, ip, iy, iz] = lgt_sol
+                                        prev_logt[ixi, ip] = lgt_sol
+                                        solved = True
+                                except (ValueError, RuntimeError,
+                                        OverflowError):
+                                    pass
+
+                        # Brentq fallback (guaranteed bracket)
+                        if not solved:
+                            try:
+                                lgt_sol = brentq(
+                                    err, lmin, lmax,
+                                    xtol=1e-8, maxiter=100)
+                                logt_sp[ixi, ip, iy, iz] = lgt_sol
+                                prev_logt[ixi, ip] = lgt_sol
+                            except (ValueError, RuntimeError):
+                                pass  # NaN stays
+
+        pbar.close()
 
         # --- Step 3: fill any remaining NaNs by interpolation ---
         n_nan_before = np.isnan(logt_sp).sum()
@@ -1452,38 +1581,37 @@ class hhe_z_mixtures():
             if verbose:
                 print(f"Filling {n_nan_before} NaN cells by "
                       f"interpolation ...")
-            logt_sp   = self._fill_table_nans(logt_sp)
-            logrho_sp = self._fill_table_nans(logrho_sp)
+            logt_sp = self._fill_table_nans(logt_sp)
             n_nan_after = np.isnan(logt_sp).sum()
             if verbose and n_nan_after > 0:
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # --- Step 4: package result ---
+        # --- Step 4: cast to float32 to halve memory ---
+        logt_sp_f32 = logt_sp.astype(np.float32)
+        s_lo_f32    = s_lo.astype(np.float32)
+        s_hi_f32    = s_hi.astype(np.float32)
+
+        if verbose:
+            mem_mb = logt_sp_f32.nbytes / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32)")
+
+        # --- Step 5: package result ---
         result = {
             'xi_vals':   xi_vals,
             'logpvals':  logp,
             'yvals':     yvals,
             'zvals':     zvals,
-            'logt_sp':   logt_sp,
-            'logrho_sp': logrho_sp,
-            's_lo':      s_lo,
-            's_hi':      s_hi,
+            'logt_sp':   logt_sp_f32,
+            's_lo':      s_lo_f32,
+            's_hi':      s_hi_f32,
             'logt_min':  self.logt_min,
             'logt_max':  self.logt_max,
         }
 
-        # --- Step 5: load into this instance ---
-        self.xi_vals = xi_vals
-        self._yvals = yvals
-        self._zvals = zvals
-
-        rgi_kw = dict(method='linear', bounds_error=False,
-                      fill_value=None)
-        self._logt_sp_rgi = RGI((xi_vals, logp, yvals, zvals),
-                                 logt_sp, **rgi_kw)
-        self._logrho_sp_rgi = RGI((xi_vals, logp, yvals, zvals),
-                                   logrho_sp, **rgi_kw)
+        # --- Step 6: load into this instance ---
+        self._load_from_arrays(xi_vals, logp, yvals, zvals,
+                               logt_sp_f32, s_lo_f32, s_hi_f32)
 
         if verbose:
             n_total = logt_sp.size
@@ -1494,9 +1622,270 @@ class hhe_z_mixtures():
 
         return result
 
-    @staticmethod
-    def save_sp_table(result, path):
-        """Save a table dict (from ``build_sp_table``) to NPZ."""
+    def save_sp_table(self, result, path=None):
+        """Save a table dict (from ``build_sp_table``) to NPZ.
+
+        Parameters
+        ----------
+        result : dict
+            Output of ``build_sp_table``.
+        path : str or None
+            File path.  If None, uses the default auto-load path:
+            ``eos/{hhe_eos}/{hhe_eos}_{z_eos}_sp_adaptive.npz``.
+        """
+        if path is None:
+            path = self._table_path('sp')
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, **result)
+        print(f"Saved {path}")
+
+    # =================================================================
+    # rho-T inversion: P(rho, T, Y', Z)
+    # =================================================================
+
+    def get_logp_rhot(self, _lgrho, _lgt, _yp, _z=0.0,
+                      _zm=0.0, _za=0.0, _zr=0.0):
+        """Pressure from (rho, T) via root-finding or pre-computed table.
+
+        Inverts rho(P, T, Y', Z) = 10^_lgrho to find logP.
+
+        Parameters
+        ----------
+        _lgrho : float or array
+            log10 ρ [g/cm³].
+        _lgt : float or array
+            log10 T [K].
+        _yp : float
+            Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction (default 0).
+        _zm, _za, _zr : float
+            Nested metal sub-fractions.
+
+        Returns
+        -------
+        logp : float or array
+            log10 P [dyn/cm²].  NaN where no solution exists.
+        """
+        # --- Fast path: pre-computed table ---
+        if self._logp_rhot_rgi is not None:
+            return self._lookup_rhot_table(
+                _lgrho, _lgt, _yp, _z)
+
+        # --- Slow path: per-point root-finding ---
+        scalar_input = np.isscalar(_lgrho) and np.isscalar(_lgt)
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgt   = np.atleast_1d(np.asarray(_lgt, dtype=float))
+        _lgrho, _lgt = np.broadcast_arrays(_lgrho, _lgt)
+        out = np.full_like(_lgrho, np.nan, dtype=float)
+
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+
+        for idx in np.ndindex(_lgrho.shape):
+            rho_i = _lgrho[idx]
+            lgt_i = _lgt[idx]
+
+            def err(lgp):
+                rho_test = self.val.get_logrho_pt_val(
+                    lgp, lgt_i, _yp, _z, _zm, _za, _zr)
+                return rho_test - rho_i
+
+            try:
+                lgp_sol = brentq(err, lgp_lo, lgp_hi,
+                                 xtol=1e-8, maxiter=100)
+                out[idx] = lgp_sol
+            except (ValueError, RuntimeError):
+                pass
+
+        if scalar_input:
+            return out.item()
+        return out
+
+    def _lookup_rhot_table(self, _lgrho, _lgt, _yp, _z):
+        """Query the pre-computed (logrho, logT, Y', Z) RGI."""
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgt   = np.atleast_1d(np.asarray(_lgt, dtype=float))
+        _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a   = np.atleast_1d(np.asarray(_z, dtype=float))
+        _lgrho, _lgt, _yp_a, _z_a = np.broadcast_arrays(
+            _lgrho, _lgt, _yp_a, _z_a)
+
+        pts = np.column_stack((_lgrho.ravel(), _lgt.ravel(),
+                                _yp_a.ravel(), _z_a.ravel()))
+        out = self._logp_rhot_rgi(pts).reshape(_lgrho.shape)
+
+        if out.size == 1:
+            return out.item()
+        return out
+
+    def load_rhot_table(self, path):
+        """Load a pre-computed ρ-T → P table from NPZ.
+
+        Expected keys: logrhovals, logtvals, yvals, zvals,
+                        logp_rhot, logt_min, logt_max.
+        """
+        data = np.load(path)
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logp_rhot_rgi = RGI(
+            (data['logrhovals'], data['logtvals'],
+             data['yvals'], data['zvals']),
+            data['logp_rhot'], **rgi_kw)
+        self.logrho_vals = data['logrhovals']
+        self.logt_vals = data['logtvals']
+
+    def build_rhot_table(self, yvals, zvals,
+                         _zm=0.0, _za=0.0, _zr=0.0,
+                         verbose=True):
+        """Build the logP(logrho, logT, Y', Z) table.
+
+        At each (logrho, logT, Y', Z) grid point, inverts
+        logrho_pt_val(P, T, Y', Z) = logrho to find logP.
+
+        Parameters
+        ----------
+        yvals, zvals : array_like
+            1-D grids of Y' and Z values.
+        _zm, _za, _zr : float
+            Fixed nested metal sub-fractions.
+        verbose : bool
+            Print progress.
+
+        Returns
+        -------
+        result : dict
+            Keys: logrhovals, logtvals, yvals, zvals,
+                  logp_rhot (nRho, nT, nY, nZ) float32,
+                  logt_min, logt_max.
+        """
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        logrho = self.logrho_vals
+        logt   = self.logt_vals
+
+        nR, nT, nY, nZ = len(logrho), len(logt), len(yvals), len(zvals)
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+
+        if verbose:
+            print(f"Building rho-T table: "
+                  f"logrho=[{logrho[0]:.2f}, {logrho[-1]:.2f}] "
+                  f"(d={logrho[1]-logrho[0]:.2f}, {nR} pts), "
+                  f"logT=[{logt[0]:.2f}, {logt[-1]:.2f}] "
+                  f"({nT} pts)")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {nR}×{nT}×{nY}×{nZ} = "
+                  f"{nR*nT*nY*nZ:,}")
+
+        logp_rhot = np.full((nR, nT, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T → ρ,T",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        prev_logp = np.full((nR, nT), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_logp[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                use_newton = iz > 0
+
+                for it in range(nT):
+                    lgt_i = logt[it]
+
+                    for ir in range(nR):
+                        rho_i = logrho[ir]
+
+                        def err(lgp):
+                            rho_test = self.val.get_logrho_pt_val(
+                                lgp, lgt_i, yp, zv, _zm, _za, _zr)
+                            return rho_test - rho_i
+
+                        solved = False
+
+                        if use_newton:
+                            guess = prev_logp[ir, it]
+                            if np.isfinite(guess):
+                                try:
+                                    lgp_sol = newton(
+                                        err, x0=guess,
+                                        tol=1e-8, maxiter=50)
+                                    if lgp_lo <= lgp_sol <= lgp_hi:
+                                        logp_rhot[ir, it, iy, iz] = lgp_sol
+                                        prev_logp[ir, it] = lgp_sol
+                                        solved = True
+                                except (ValueError, RuntimeError,
+                                        OverflowError):
+                                    pass
+
+                        if not solved:
+                            try:
+                                lgp_sol = brentq(
+                                    err, lgp_lo, lgp_hi,
+                                    xtol=1e-8, maxiter=100)
+                                logp_rhot[ir, it, iy, iz] = lgp_sol
+                                prev_logp[ir, it] = lgp_sol
+                            except (ValueError, RuntimeError):
+                                pass
+
+        pbar.close()
+
+        # Fill NaNs
+        n_nan = np.isnan(logp_rhot).sum()
+        if n_nan > 0:
+            if verbose:
+                print(f"Filling {n_nan} NaN cells by interpolation ...")
+            logp_rhot = self._fill_table_nans(logp_rhot)
+            n_after = np.isnan(logp_rhot).sum()
+            if verbose and n_after > 0:
+                print(f"  WARNING: {n_after} NaNs remain")
+
+        logp_f32 = logp_rhot.astype(np.float32)
+
+        if verbose:
+            mem_mb = logp_f32.nbytes / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32)")
+
+        result = {
+            'logrhovals': logrho,
+            'logtvals':   logt,
+            'yvals':      yvals,
+            'zvals':      zvals,
+            'logp_rhot':  logp_f32,
+            'logt_min':   self.logt_min,
+            'logt_max':   self.logt_max,
+        }
+
+        # Load into this instance
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logp_rhot_rgi = RGI(
+            (logrho, logt, yvals, zvals), logp_f32, **rgi_kw)
+
+        if verbose:
+            n_total = logp_rhot.size
+            n_good = np.isfinite(logp_rhot).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan} were interpolated")
+
+        return result
+
+    def save_rhot_table(self, result, path=None):
+        """Save a ρ-T table dict to NPZ.
+
+        If path is None, uses the default auto-load path.
+        """
+        if path is None:
+            path = self._table_path('rhot')
+            os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **result)
         print(f"Saved {path}")
 
