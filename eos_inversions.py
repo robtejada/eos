@@ -185,9 +185,9 @@ def main():
         bounds_cells = nP * nY * nZ * 2   # s_lo + s_hi
     elif args.basis == 'rhot':
         nT = len(np.arange(args.logt_lo, args.logt_hi + 0.01, args.logp_step))
-        n_cells = nR * nT * nY * nZ
+        n_cells = nxi * nT * nY * nZ
         n_arrays = 1   # logp_rhot only
-        bounds_cells = 0
+        bounds_cells = nT * nY * nZ * 2  # rho_lo + rho_hi
     elif args.basis == 'rhop':
         n_cells = nxi * nP * nY * nZ
         n_arrays = 1   # logt_rhop only
@@ -229,7 +229,7 @@ def main():
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
-        result = eos.build_rhot_table(yvals, zvals)
+        result = eos.build_rhot_table(yvals, zvals, n_xi=args.n_xi)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':

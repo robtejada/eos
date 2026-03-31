@@ -1668,31 +1668,13 @@ class hhe_z_mixtures():
         """Pressure from (rho, T) via root-finding or pre-computed table.
 
         Inverts rho(P, T, Y', Z) = 10^_lgrho to find logP.
-
-        Parameters
-        ----------
-        _lgrho : float or array
-            log10 ρ [g/cm³].
-        _lgt : float or array
-            log10 T [K].
-        _yp : float
-            Y' = Y/(1-Z).
-        _z : float
-            Total metal mass fraction (default 0).
-        _zm, _za, _zr : float
-            Nested metal sub-fractions.
-
-        Returns
-        -------
-        logp : float or array
-            log10 P [dyn/cm²].  NaN where no solution exists.
         """
-        # --- Fast path: pre-computed table ---
+        # --- Fast path: ξ-mapped table ---
         if self._logp_rhot_rgi is not None:
             return self._lookup_rhot_table(
                 _lgrho, _lgt, _yp, _z)
 
-        # --- Slow path: per-point root-finding ---
+        # --- Slow path: per-point brentq ---
         scalar_input = np.isscalar(_lgrho) and np.isscalar(_lgt)
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
         _lgt   = np.atleast_1d(np.asarray(_lgt, dtype=float))
@@ -1706,9 +1688,12 @@ class hhe_z_mixtures():
             lgt_i = _lgt[idx]
 
             def err(lgp):
-                rho_test = self.val.get_logrho_pt_val(
-                    lgp, lgt_i, _yp, _z, _zm, _za, _zr)
-                return rho_test - rho_i
+                try:
+                    rho_test = self.val.get_logrho_pt_val(
+                        lgp, lgt_i, _yp, _z, _zm, _za, _zr)
+                    return rho_test - rho_i
+                except (ZeroDivisionError, FloatingPointError):
+                    return 1e30
 
             try:
                 lgp_sol = brentq(err, lgp_lo, lgp_hi,
@@ -1721,8 +1706,68 @@ class hhe_z_mixtures():
             return out.item()
         return out
 
+    def compute_rho_bounds_rhot(self, yvals, zvals,
+                                _zm=0.0, _za=0.0, _zr=0.0):
+        """Compute physical logrho bounds at each (logT, Y', Z).
+
+        At each temperature, the accessible density range is
+        [rho(P_min, T), rho(P_max, T)].
+
+        Stores ``self._rho_lo_rhot`` and ``self._rho_hi_rhot``
+        as 3-D arrays (nT, nY, nZ).
+        """
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        logt = self.logt_vals
+        nT, nY, nZ = len(logt), len(yvals), len(zvals)
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+
+        rho_lo = np.full((nT, nY, nZ), np.nan)
+        rho_hi = np.full((nT, nY, nZ), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            for iz, zv in enumerate(zvals):
+                for it, lgt in enumerate(logt):
+                    try:
+                        r_plo = self.val.get_logrho_pt_val(
+                            lgp_lo, lgt, yp, zv, _zm, _za, _zr)
+                        r_phi = self.val.get_logrho_pt_val(
+                            lgp_hi, lgt, yp, zv, _zm, _za, _zr)
+                    except (ZeroDivisionError, FloatingPointError):
+                        continue
+                    if np.isfinite(r_plo) and np.isfinite(r_phi):
+                        rho_lo[it, iy, iz] = min(r_plo, r_phi)
+                        rho_hi[it, iy, iz] = max(r_plo, r_phi)
+
+        self._rho_lo_rhot = rho_lo.astype(np.float32)
+        self._rho_hi_rhot = rho_hi.astype(np.float32)
+        self._yvals_rhot = yvals
+        self._zvals_rhot = zvals
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._rho_lo_rhot_rgi = RGI(
+            (logt, yvals, zvals), self._rho_lo_rhot, **rgi_kw)
+        self._rho_hi_rhot_rgi = RGI(
+            (logt, yvals, zvals), self._rho_hi_rhot, **rgi_kw)
+
+    def rho_to_xi_rhot(self, _lgrho, _lgt, _yp, _z):
+        """Convert logrho → ξ in the ρ-T rhomboid."""
+        pts = np.column_stack((
+            np.atleast_1d(_lgt).ravel(),
+            np.atleast_1d(_yp).ravel(),
+            np.atleast_1d(_z).ravel()))
+        rlo = self._rho_lo_rhot_rgi(pts).reshape(np.atleast_1d(_lgt).shape)
+        rhi = self._rho_hi_rhot_rgi(pts).reshape(np.atleast_1d(_lgt).shape)
+        denom = rhi - rlo
+        denom = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
+        xi = (np.atleast_1d(_lgrho) - rlo) / denom
+        if np.isscalar(_lgrho) and np.isscalar(_lgt):
+            return float(xi.ravel()[0])
+        return xi
+
     def _lookup_rhot_table(self, _lgrho, _lgt, _yp, _z):
-        """Query the pre-computed (logrho, logT, Y', Z) RGI."""
+        """Query the pre-computed ξ-mapped (ξ, logT, Y', Z) RGI."""
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
         _lgt   = np.atleast_1d(np.asarray(_lgt, dtype=float))
         _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
@@ -1730,73 +1775,76 @@ class hhe_z_mixtures():
         _lgrho, _lgt, _yp_a, _z_a = np.broadcast_arrays(
             _lgrho, _lgt, _yp_a, _z_a)
 
-        pts = np.column_stack((_lgrho.ravel(), _lgt.ravel(),
-                                _yp_a.ravel(), _z_a.ravel()))
-        out = self._logp_rhot_rgi(pts).reshape(_lgrho.shape)
+        xi = self.rho_to_xi_rhot(_lgrho, _lgt, _yp_a, _z_a)
+        out = np.full_like(xi, np.nan, dtype=float)
+        good = (xi >= 0.0) & (xi <= 1.0) & np.isfinite(xi)
+        if good.any():
+            pts = np.column_stack((xi[good], _lgt[good],
+                                   _yp_a[good], _z_a[good]))
+            out[good] = self._logp_rhot_rgi(pts)
 
         if out.size == 1:
             return out.item()
         return out
 
     def load_rhot_table(self, path):
-        """Load a pre-computed ρ-T → P table from NPZ.
-
-        Expected keys: logrhovals, logtvals, yvals, zvals,
-                        logp_rhot, logt_min, logt_max.
-        """
+        """Load a pre-computed ξ-mapped ρ-T → P table from NPZ."""
         data = np.load(path)
         rgi_kw = dict(method='linear', bounds_error=False,
                       fill_value=None)
+        xi = data['xi_vals']
+        logt = data['logtvals']
+        yv = data['yvals']
+        zv = data['zvals']
+
         self._logp_rhot_rgi = RGI(
-            (data['logrhovals'], data['logtvals'],
-             data['yvals'], data['zvals']),
-            data['logp_rhot'], **rgi_kw)
-        self.logrho_vals = data['logrhovals']
-        self.logt_vals = data['logtvals']
+            (xi, logt, yv, zv), data['logp_rhot'], **rgi_kw)
+        self.logt_vals = logt
+        self._rho_lo_rhot = data['rho_lo_rhot']
+        self._rho_hi_rhot = data['rho_hi_rhot']
+        self._yvals_rhot = yv
+        self._zvals_rhot = zv
+        self._rho_lo_rhot_rgi = RGI(
+            (logt, yv, zv), self._rho_lo_rhot, **rgi_kw)
+        self._rho_hi_rhot_rgi = RGI(
+            (logt, yv, zv), self._rho_hi_rhot, **rgi_kw)
 
     def build_rhot_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         verbose=True):
-        """Build the logP(logrho, logT, Y', Z) table.
+                         n_xi=None, verbose=True):
+        """Build logP(ξ_ρ, logT, Y', Z) table with ξ-mapping on ρ.
 
-        At each (logrho, logT, Y', Z) grid point, inverts
-        logrho_pt_val(P, T, Y', Z) = logrho to find logP.
-
-        Parameters
-        ----------
-        yvals, zvals : array_like
-            1-D grids of Y' and Z values.
-        _zm, _za, _zr : float
-            Fixed nested metal sub-fractions.
-        verbose : bool
-            Print progress.
-
-        Returns
-        -------
-        result : dict
-            Keys: logrhovals, logtvals, yvals, zvals,
-                  logp_rhot (nRho, nT, nY, nZ) float32,
-                  logt_min, logt_max.
+        At each (logT, Y', Z), the density range [ρ_lo, ρ_hi] comes
+        from evaluating ρ(P_min, T) and ρ(P_max, T).  ``n_xi`` evenly
+        spaced ξ values map this range to [0, 1].
         """
+        if n_xi is None:
+            n_xi = self.n_xi
+
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
-        logrho = self.logrho_vals
-        logt   = self.logt_vals
-
-        nR, nT, nY, nZ = len(logrho), len(logt), len(yvals), len(zvals)
+        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        logt = self.logt_vals
+        nT, nY, nZ = len(logt), len(yvals), len(zvals)
         lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
 
         if verbose:
-            print(f"Building rho-T table: "
-                  f"logrho=[{logrho[0]:.2f}, {logrho[-1]:.2f}] "
-                  f"(d={logrho[1]-logrho[0]:.2f}, {nR} pts), "
-                  f"logT=[{logt[0]:.2f}, {logt[-1]:.2f}] "
-                  f"({nT} pts)")
+            print(f"Building ρ-T table (ξ-mapped): n_xi={n_xi}, "
+                  f"logT=[{logt[0]:.2f}, {logt[-1]:.2f}] ({nT} pts), "
+                  f"logP=[{lgp_lo:.1f}, {lgp_hi:.1f}]")
             print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
-            print(f"  Total cells: {nR}×{nT}×{nY}×{nZ} = "
-                  f"{nR*nT*nY*nZ:,}")
+            print(f"  Total cells: {n_xi}×{nT}×{nY}×{nZ} = "
+                  f"{n_xi*nT*nY*nZ:,}")
 
-        logp_rhot = np.full((nR, nT, nY, nZ), np.nan, dtype=float)
+        # Step 1: compute ρ bounds
+        if verbose:
+            print("Computing ρ bounds at each (T, Y', Z) ...")
+        self.compute_rho_bounds_rhot(yvals, zvals, _zm, _za, _zr)
+        rho_lo = self._rho_lo_rhot  # (nT, nY, nZ)
+        rho_hi = self._rho_hi_rhot
+
+        # Step 2: invert
+        logp_tab = np.full((n_xi, nT, nY, nZ), np.nan, dtype=float)
 
         total = nY * nZ
         pbar = tqdm(total=total,
@@ -1805,7 +1853,7 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        prev_logp = np.full((nR, nT), np.nan)
+        prev_logp = np.full((n_xi, nT), np.nan)
 
         for iy, yp in enumerate(yvals):
             prev_logp[:] = np.nan
@@ -1818,30 +1866,42 @@ class hhe_z_mixtures():
 
                 for it in range(nT):
                     lgt_i = logt[it]
+                    rlo_i = rho_lo[it, iy, iz]
+                    rhi_i = rho_hi[it, iy, iz]
 
-                    for ir in range(nR):
-                        rho_i = logrho[ir]
+                    if (not np.isfinite(rlo_i)) or (not np.isfinite(rhi_i)):
+                        continue
+                    if rhi_i <= rlo_i:
+                        continue
+
+                    for ixi in range(n_xi):
+                        rho_phys = rlo_i + xi_vals[ixi] * (rhi_i - rlo_i)
 
                         def err(lgp):
-                            rho_test = self.val.get_logrho_pt_val(
-                                lgp, lgt_i, yp, zv, _zm, _za, _zr)
-                            return rho_test - rho_i
+                            try:
+                                rho_test = self.val.get_logrho_pt_val(
+                                    lgp, lgt_i, yp, zv, _zm, _za, _zr)
+                                return rho_test - rho_phys
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return 1e30
 
                         solved = False
 
                         if use_newton:
-                            guess = prev_logp[ir, it]
+                            guess = prev_logp[ixi, it]
                             if np.isfinite(guess):
                                 try:
                                     lgp_sol = newton(
                                         err, x0=guess,
                                         tol=1e-8, maxiter=50)
                                     if lgp_lo <= lgp_sol <= lgp_hi:
-                                        logp_rhot[ir, it, iy, iz] = lgp_sol
-                                        prev_logp[ir, it] = lgp_sol
+                                        logp_tab[ixi, it, iy, iz] = lgp_sol
+                                        prev_logp[ixi, it] = lgp_sol
                                         solved = True
                                 except (ValueError, RuntimeError,
-                                        OverflowError):
+                                        OverflowError,
+                                        ZeroDivisionError):
                                     pass
 
                         if not solved:
@@ -1849,48 +1909,48 @@ class hhe_z_mixtures():
                                 lgp_sol = brentq(
                                     err, lgp_lo, lgp_hi,
                                     xtol=1e-8, maxiter=100)
-                                logp_rhot[ir, it, iy, iz] = lgp_sol
-                                prev_logp[ir, it] = lgp_sol
-                            except (ValueError, RuntimeError):
+                                logp_tab[ixi, it, iy, iz] = lgp_sol
+                                prev_logp[ixi, it] = lgp_sol
+                            except (ValueError, RuntimeError,
+                                    ZeroDivisionError):
                                 pass
 
         pbar.close()
 
-        # Fill NaNs
-        n_nan = np.isnan(logp_rhot).sum()
+        # Step 3: fill NaNs
+        n_nan = np.isnan(logp_tab).sum()
         if n_nan > 0:
             if verbose:
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
-            logp_rhot = self._fill_table_nans(logp_rhot)
-            n_after = np.isnan(logp_rhot).sum()
-            if verbose and n_after > 0:
-                print(f"  WARNING: {n_after} NaNs remain")
+            logp_tab = self._fill_table_nans(logp_tab)
 
-        logp_f32 = logp_rhot.astype(np.float32)
+        logp_f32 = logp_tab.astype(np.float32)
 
         if verbose:
             mem_mb = logp_f32.nbytes / 1e6
             print(f"Table size: {mem_mb:.1f} MB (float32)")
 
         result = {
-            'logrhovals': logrho,
-            'logtvals':   logt,
-            'yvals':      yvals,
-            'zvals':      zvals,
-            'logp_rhot':  logp_f32,
-            'logt_min':   self.logt_min,
-            'logt_max':   self.logt_max,
+            'xi_vals':      xi_vals,
+            'logtvals':     logt,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logp_rhot':    logp_f32,
+            'rho_lo_rhot':  rho_lo.astype(np.float32),
+            'rho_hi_rhot':  rho_hi.astype(np.float32),
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
         }
 
         # Load into this instance
         rgi_kw = dict(method='linear', bounds_error=False,
                       fill_value=None)
         self._logp_rhot_rgi = RGI(
-            (logrho, logt, yvals, zvals), logp_f32, **rgi_kw)
+            (xi_vals, logt, yvals, zvals), logp_f32, **rgi_kw)
 
         if verbose:
-            n_total = logp_rhot.size
-            n_good = np.isfinite(logp_rhot).sum()
+            n_total = logp_tab.size
+            n_good = np.isfinite(logp_tab).sum()
             print(f"Done. {n_good}/{n_total} cells finite "
                   f"({100*n_good/n_total:.1f}%), "
                   f"{n_nan} were interpolated")
@@ -1898,10 +1958,7 @@ class hhe_z_mixtures():
         return result
 
     def save_rhot_table(self, result, path=None):
-        """Save a ρ-T table dict to NPZ.
-
-        If path is None, uses the default auto-load path.
-        """
+        """Save a ρ-T table dict to NPZ."""
         if path is None:
             path = self._table_path('rhot')
             os.makedirs(os.path.dirname(path), exist_ok=True)
