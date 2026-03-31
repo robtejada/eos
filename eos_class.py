@@ -932,6 +932,7 @@ class hhe_z_mixtures():
                  species_list=None,
                  z_eos='water',
                  tab=True,
+                 y_prime=True,
                  logp_range=(5.0, 15.0), logp_step=0.05,
                  logt_range=(2.0, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
@@ -972,6 +973,7 @@ class hhe_z_mixtures():
         self.hhe_eos_name = hhe_eos_name
         self.z_eos_label = z_eos
         self.tab = tab
+        self.y_prime = y_prime
 
         # --- Forward-model mixer ---
         self.val = val_mixtures(
@@ -1051,6 +1053,22 @@ class hhe_z_mixtures():
             self.load_srho_table(srho_path)
 
     # =================================================================
+    # Y → Y' conversion
+    # =================================================================
+
+    def _to_yprime(self, _y, _z):
+        """Convert absolute Y to Y' = Y/(1-Z) if y_prime=False.
+
+        When self.y_prime=True, _y is already Y' and is returned as-is.
+        When self.y_prime=False, _y is absolute Y and is divided by (1-Z).
+        Works for scalar and array inputs.
+        """
+        if self.y_prime:
+            return _y
+        _z_arr = np.asarray(_z, dtype=float)
+        return np.asarray(_y, dtype=float) / (1.0 - _z_arr + 1e-6)
+
+    # =================================================================
     # S-bound computation
     # =================================================================
 
@@ -1076,6 +1094,7 @@ class hhe_z_mixtures():
         self._s_lo, self._s_hi : 1-D arrays of shape (nP,) in kb/baryon
         self._s_lo_rgi, self._s_hi_rgi : interp1d callables
         """
+        _y_prime = self._to_yprime(_y_prime, _z)
         nP = len(self.logp_vals)
 
         s_at_tmin = np.empty(nP)
@@ -1213,6 +1232,7 @@ class hhe_z_mixtures():
 
         Uses the forward model directly — no pre-computed bounds needed.
         """
+        _yp = self._to_yprime(_yp, _z)
         s_cold = (self.val.get_s_pt_val(lgp_i, self.logt_min,
                                          _yp, _z, _zm, _za, _zr)
                   * erg_to_kbbar)
@@ -1248,6 +1268,7 @@ class hhe_z_mixtures():
         logt : float or array
             log10 T [K].  NaN where S is outside the physical rhomboid.
         """
+        _yp = self._to_yprime(_yp, _z)
         # --- Fast path: pre-computed table ---
         if self._logt_sp_rgi is not None:
             return self._lookup_sp_table(
@@ -1291,6 +1312,7 @@ class hhe_z_mixtures():
     def get_logrho_sp(self, _s_kb, _lgp, _yp, _z=0.0,
                       _zm=0.0, _za=0.0, _zr=0.0):
         """Density from (S, P) — calls get_logt_sp then forward model."""
+        _yp = self._to_yprime(_yp, _z)
         logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm, _za, _zr)
         logt_arr = np.atleast_1d(logt)
         _lgp_arr = np.atleast_1d(_lgp)
@@ -1674,6 +1696,7 @@ class hhe_z_mixtures():
             return self._lookup_rhot_table(
                 _lgrho, _lgt, _yp, _z)
 
+        _yp = self._to_yprime(_yp, _z)
         # --- Slow path: per-point brentq ---
         scalar_input = np.isscalar(_lgrho) and np.isscalar(_lgt)
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
@@ -2056,6 +2079,7 @@ class hhe_z_mixtures():
         logt : float or array
             log10 T [K].  NaN where no solution.
         """
+        _yp = self._to_yprime(_yp, _z)
         # Fast path: pre-computed table
         if self._logt_rhop_rgi is not None:
             return self._lookup_rhop_table(_lgrho, _lgp, _yp, _z)
@@ -2414,6 +2438,7 @@ class hhe_z_mixtures():
             log10 P [dyn/cm²] and log10 T [K].
             NaN where the solver fails.
         """
+        _yp = self._to_yprime(_yp, _z)
         # --- Fast path: pre-computed table ---
         if self._srho_rgi_p is not None:
             return self._lookup_srho_table(_s_kb, _lgrho, _yp, _z)
@@ -2807,6 +2832,7 @@ class hhe_z_mixtures():
             and optionally 'S_Y', 'S_Z', 'rho_Y', 'rho_Z',
             'U_Y', 'U_Z', 'U_P', 'U_T'.
         """
+        yp = self._to_yprime(yp, z)  # convert Y→Y' if needed
         v = self.val
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
 
@@ -2947,7 +2973,21 @@ class hhe_z_mixtures():
     #   basis (uses pre-computed tables if loaded, otherwise on-the-fly)
 
     def _vec(self, func, lgp, lgt, *args, **kw):
-        """Vectorize a scalar function over (lgp, lgt)."""
+        """Vectorize a scalar function over (lgp, lgt).
+
+        Parameters
+        ----------
+        post_smooth : bool (keyword, extracted from **kw)
+            If True, apply a 1-D Gaussian filter to the output
+            array to remove spikes from derivative-ratio
+            singularities (e.g. near H₂ dissociation).
+        post_smooth_sigma : float (keyword, extracted from **kw)
+            Sigma for the Gaussian filter (in grid points).
+        """
+        # Extract smoothing params so they don't reach scalar funcs
+        post_smooth = kw.pop('post_smooth', False)
+        post_smooth_sigma = kw.pop('post_smooth_sigma', 3)
+
         if np.isscalar(lgp) and np.isscalar(lgt):
             return func(lgp, lgt, *args, **kw)
         lgp_a = np.atleast_1d(lgp)
@@ -2955,7 +2995,23 @@ class hhe_z_mixtures():
         lgp_a, lgt_a = np.broadcast_arrays(lgp_a, lgt_a)
         out = np.array([func(float(p), float(t), *args, **kw)
                          for p, t in zip(lgp_a.ravel(), lgt_a.ravel())])
-        return out.reshape(lgp_a.shape)
+        out = out.reshape(lgp_a.shape)
+
+        if post_smooth and out.ndim >= 1 and out.size > 3:
+            good = np.isfinite(out.ravel())
+            if good.sum() > 3:
+                flat = out.ravel().copy()
+                bad = ~np.isfinite(flat)
+                if bad.any():
+                    flat[bad] = np.interp(
+                        np.where(bad)[0],
+                        np.where(~bad)[0], flat[~bad])
+                flat = gaussian_filter1d(flat, sigma=post_smooth_sigma)
+                out_flat = out.ravel()
+                out_flat[good] = flat[good]
+                out = out_flat.reshape(lgp_a.shape)
+
+        return out
 
     # ---- FD scalar helpers (use inversions) ----
 
@@ -3136,6 +3192,7 @@ class hhe_z_mixtures():
 
     def _dispatch(self, name, lgp, lgt, yp, z, method, **kw):
         """Route to identity or FD scalar, then vectorize."""
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             func = getattr(self, f'_{name}_fd')
         else:
@@ -3249,6 +3306,7 @@ class hhe_z_mixtures():
         method='identity': S_Y − S·a·ln(10)·ρ_Y / c (with c_guard fallback)
         method='finite_difference': direct constrained FD at constant (ρ,P)
         """
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             return self._vec(lambda p, t, yp, z, **k:
                 self._ledoux_dsdy_fd(p, t, yp, z,
@@ -3272,6 +3330,7 @@ class hhe_z_mixtures():
         method='identity': S_Z − S·a·ln(10)·ρ_Z / c (with c_guard fallback)
         method='finite_difference': direct constrained FD at constant (ρ,P)
         """
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             return self._vec(lambda p, t, yp, z, **k:
                 self._ledoux_dsdz_fd(p, t, yp, z,
@@ -3347,6 +3406,7 @@ class hhe_z_mixtures():
         method='identity': 2×2 implicit function theorem from P-T basis
         method='finite_difference': direct FD via 2D S-ρ inversion
         """
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             return self._vec(self._dtdy_srho_fd, lgp, lgt, yp, z, **kw)
         return self._vec(self._dtdy_srho_scalar, lgp, lgt, yp, z, **kw)
@@ -3366,6 +3426,7 @@ class hhe_z_mixtures():
         method='identity': 2×2 implicit function theorem from P-T basis
         method='finite_difference': direct FD via 2D S-ρ inversion
         """
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             return self._vec(self._dtdz_srho_fd, lgp, lgt, yp, z, **kw)
         return self._vec(self._dtdz_srho_scalar, lgp, lgt, yp, z, **kw)
@@ -3393,6 +3454,7 @@ class hhe_z_mixtures():
         Chain rule:
           dU/dY = (dU/dlogP)·(dlogP/dY) + (dU/dlogT)·(dlogT/dY) + U_Y
         """
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             return self._vec(self._dudy_srho_fd, lgp, lgt, yp, z, **kw)
         return self._vec(self._dudy_srho_scalar, lgp, lgt, yp, z, **kw)
@@ -3419,6 +3481,7 @@ class hhe_z_mixtures():
 
         Same chain rule as get_dudy_srho with Z replacing Y.
         """
+        yp = self._to_yprime(yp, z)
         if method == 'finite_difference':
             return self._vec(self._dudz_srho_fd, lgp, lgt, yp, z, **kw)
         return self._vec(self._dudz_srho_scalar, lgp, lgt, yp, z, **kw)
