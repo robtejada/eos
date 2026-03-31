@@ -754,7 +754,7 @@ class val_mixtures:
     # Full H-He-Z mixing
     # =================================================================
 
-    def get_logrho_pt_val(self, _lgp, _lgt, _y_prime, _z,
+    def get_logrho_pt_val(self, _lgp, _lgt, _y_prime, _z=0.0,
                           _zm=0.0, _za=0.0, _zr=0.0):
         """Density of H-He-Z mixture via VAL (returns log10 g/cm³).
 
@@ -786,7 +786,7 @@ class val_mixtures:
             return np.atleast_1d(result).item()
         return result
 
-    def get_s_pt_val(self, _lgp, _lgt, _y_prime, _z,
+    def get_s_pt_val(self, _lgp, _lgt, _y_prime, _z=0.0,
                      _zm=0.0, _za=0.0, _zr=0.0):
         """Entropy of H-He-Z mixture via VAL (returns erg/(g·K)).
 
@@ -858,7 +858,7 @@ class val_mixtures:
             return np.atleast_1d(result).item()
         return result
 
-    def get_u_pt_val(self, _lgp, _lgt, _y_prime, _z,
+    def get_u_pt_val(self, _lgp, _lgt, _y_prime, _z=0.0,
                      _zm=0.0, _za=0.0, _zr=0.0):
         """Internal energy of H-He-Z mixture via VAL (returns erg/g)."""
         # H-He component energies (stored as log10)
@@ -875,6 +875,638 @@ class val_mixtures:
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return np.atleast_1d(result).item()
         return result
+
+
+class hhe_z_mixtures():
+    """H-He-Z EOS with rhomboid S-P inversion support.
+
+    Wraps ``val_mixtures`` (smoothed H-He + Z species via VAL) and
+    provides infrastructure to map the non-rectangular physical
+    entropy domain onto a rectangular grid using a normalised entropy
+    coordinate xi in [0, 1].
+
+    At each (P, Y', Z, metal fractions), the physical entropy spans
+    [S_lo(P), S_hi(P)] where the bounds come from evaluating
+    ``val_mixtures.get_s_pt_val`` at the temperature boundaries of
+    the underlying P-T table.  A normalised coordinate
+
+        xi = (S - S_lo) / (S_hi - S_lo)
+
+    maps this rhomboid into a rectangle suitable for
+    ``RegularGridInterpolator``.
+
+    Parameters
+    ----------
+    hhe_eos_name : str
+        'cms' or 'cd'.
+    hg : bool
+        Include HG23 non-ideal mixing (CMS only).
+    smooth_hhe, smooth_z : bool
+        Smooth H-He / Z tables before RGI creation.
+    mu_h_vary : bool
+        P-T dependent hydrogen molecular weight.
+    species_list : list of str or None
+        Z species for val_mixtures.
+    logp_range : tuple (lo, hi)
+        log10 P [dyn/cm²] bounds for the S-P grid.
+    logp_step : float
+        Step in logP.
+    logt_range : tuple (lo, hi)
+        log10 T [K] bounds of the underlying P-T table.
+    n_xi : int
+        Number of normalised entropy grid points.
+    """
+
+    def __init__(self, hhe_eos_name='cd', hg=True,
+                 smooth_hhe=True, smooth_z=True,
+                 mu_h_vary=True,
+                 species_list=None,
+                 logp_range=(5.0, 15.0), logp_step=0.05,
+                 logt_range=(2.0, 6.0),
+                 n_xi=100):
+
+        # --- Forward-model mixer ---
+        self.val = val_mixtures(
+            hhe_eos_name=hhe_eos_name, hg=hg,
+            smooth_hhe=smooth_hhe, smooth_z=smooth_z,
+            mu_h_vary=mu_h_vary,
+            species_list=species_list)
+
+        # --- Grid parameters ---
+        self.logp_vals = np.arange(logp_range[0],
+                                   logp_range[1] + logp_step * 0.1,
+                                   logp_step)
+        self.logt_min = logt_range[0]
+        self.logt_max = logt_range[1]
+        self.n_xi = n_xi
+        self.xi_vals = np.linspace(0.0, 1.0, n_xi)
+
+        # Placeholders — populated by compute_s_bounds()
+        self._s_lo = None      # (nP,) or (nP, nY, nZ)
+        self._s_hi = None
+        self._s_lo_rgi = None  # RGI for interpolating bounds
+        self._s_hi_rgi = None
+
+        # Pre-computed S-P table (None until build_sp_table or load_sp_table)
+        self._logt_sp_rgi = None
+        self._logrho_sp_rgi = None
+
+    # =================================================================
+    # S-bound computation
+    # =================================================================
+
+    def compute_s_bounds(self, _y_prime, _z,
+                         _zm=0.0, _za=0.0, _zr=0.0):
+        """Compute the physical entropy bounds at each pressure.
+
+        Evaluates S(P, T_min) and S(P, T_max) via val_mixtures for
+        a single composition (Y', Z, metal fractions) and stores
+        the min/max as 1-D arrays over pressure.
+
+        Parameters
+        ----------
+        _y_prime : float
+            Helium fraction Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction.
+        _zm, _za, _zr : float
+            Nested metal sub-fractions.
+
+        Sets
+        ----
+        self._s_lo, self._s_hi : 1-D arrays of shape (nP,) in kb/baryon
+        self._s_lo_rgi, self._s_hi_rgi : interp1d callables
+        """
+        nP = len(self.logp_vals)
+
+        s_at_tmin = np.empty(nP)
+        s_at_tmax = np.empty(nP)
+
+        for ip, lgp in enumerate(self.logp_vals):
+            s_at_tmin[ip] = self.val.get_s_pt_val(
+                lgp, self.logt_min, _y_prime, _z, _zm, _za, _zr)
+            s_at_tmax[ip] = self.val.get_s_pt_val(
+                lgp, self.logt_max, _y_prime, _z, _zm, _za, _zr)
+
+        # Convert erg/(g·K) → kb/baryon
+        s_at_tmin *= erg_to_kbbar
+        s_at_tmax *= erg_to_kbbar
+
+        # S_lo = min, S_hi = max (ordering can flip with P)
+        self._s_lo = np.minimum(s_at_tmin, s_at_tmax)
+        self._s_hi = np.maximum(s_at_tmin, s_at_tmax)
+
+        # 1-D interpolators for the bounds
+        self._s_lo_rgi = interp1d(self.logp_vals, self._s_lo,
+                                   kind='linear', bounds_error=False,
+                                   fill_value='extrapolate')
+        self._s_hi_rgi = interp1d(self.logp_vals, self._s_hi,
+                                   kind='linear', bounds_error=False,
+                                   fill_value='extrapolate')
+
+    def compute_s_bounds_grid(self, yvals, zvals,
+                              _zm=0.0, _za=0.0, _zr=0.0):
+        """Compute S bounds over a grid of (P, Y', Z).
+
+        Like ``compute_s_bounds`` but for arrays of Y' and Z values.
+        Stores 3-D arrays and builds RGI interpolators over
+        (logP, Y', Z).
+
+        Parameters
+        ----------
+        yvals : 1-D array of Y' values
+        zvals : 1-D array of Z values
+        _zm, _za, _zr : float  (fixed for all Y', Z)
+        """
+        nP = len(self.logp_vals)
+        nY = len(yvals)
+        nZ = len(zvals)
+
+        self._yvals = np.asarray(yvals, dtype=float)
+        self._zvals = np.asarray(zvals, dtype=float)
+
+        s_lo_3d = np.empty((nP, nY, nZ))
+        s_hi_3d = np.empty((nP, nY, nZ))
+
+        for iy, yp in enumerate(yvals):
+            for iz, zv in enumerate(zvals):
+                for ip, lgp in enumerate(self.logp_vals):
+                    s_cold = self.val.get_s_pt_val(
+                        lgp, self.logt_min, yp, zv, _zm, _za, _zr)
+                    s_hot = self.val.get_s_pt_val(
+                        lgp, self.logt_max, yp, zv, _zm, _za, _zr)
+                    s_cold *= erg_to_kbbar
+                    s_hot  *= erg_to_kbbar
+                    s_lo_3d[ip, iy, iz] = min(s_cold, s_hot)
+                    s_hi_3d[ip, iy, iz] = max(s_cold, s_hot)
+
+        self._s_lo = s_lo_3d
+        self._s_hi = s_hi_3d
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._s_lo_rgi = RGI((self.logp_vals, self._yvals, self._zvals),
+                              s_lo_3d, **rgi_kw)
+        self._s_hi_rgi = RGI((self.logp_vals, self._yvals, self._zvals),
+                              s_hi_3d, **rgi_kw)
+
+    # =================================================================
+    # Coordinate transforms
+    # =================================================================
+
+    def s_to_xi(self, _s_kb, _lgp, _yp=None, _z=None):
+        """Convert physical entropy (kb/baryon) → normalised ξ ∈ [0,1].
+
+        Uses the stored S bounds.  Works for scalar or array inputs.
+        """
+        s_lo, s_hi = self._get_bounds(_lgp, _yp, _z)
+        denom = s_hi - s_lo
+        # Guard against zero-width range
+        denom = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
+        return (_s_kb - s_lo) / denom
+
+    def xi_to_s(self, _xi, _lgp, _yp=None, _z=None):
+        """Convert normalised ξ → physical entropy (kb/baryon)."""
+        s_lo, s_hi = self._get_bounds(_lgp, _yp, _z)
+        return s_lo + _xi * (s_hi - s_lo)
+
+    def _get_bounds(self, _lgp, _yp=None, _z=None):
+        """Interpolate S_lo and S_hi at the requested (P, [Y', Z])."""
+        if self._s_lo_rgi is None:
+            raise RuntimeError("Call compute_s_bounds() or "
+                               "compute_s_bounds_grid() first.")
+
+        _lgp_arr = np.atleast_1d(_lgp)
+
+        if isinstance(self._s_lo_rgi, RGI):
+            # 3-D bounds (P, Y', Z)
+            _yp_arr = np.atleast_1d(_yp)
+            _z_arr  = np.atleast_1d(_z)
+            _lgp_arr, _yp_arr, _z_arr = np.broadcast_arrays(
+                _lgp_arr, _yp_arr, _z_arr)
+            pts = np.column_stack((_lgp_arr.ravel(),
+                                   _yp_arr.ravel(),
+                                   _z_arr.ravel()))
+            s_lo = self._s_lo_rgi(pts).reshape(_lgp_arr.shape)
+            s_hi = self._s_hi_rgi(pts).reshape(_lgp_arr.shape)
+        else:
+            # 1-D bounds (P only) — interp1d callable
+            s_lo = self._s_lo_rgi(_lgp_arr)
+            s_hi = self._s_hi_rgi(_lgp_arr)
+
+        if np.isscalar(_lgp):
+            return float(s_lo), float(s_hi)
+        return s_lo, s_hi
+
+    # =================================================================
+    # On-the-fly S-P inversion (root-finding)
+    # =================================================================
+
+    def _s_bounds_at_point(self, lgp_i, _yp, _z, _zm, _za, _zr):
+        """Compute S_lo, S_hi (kb/baryon) at a single P for given composition.
+
+        Uses the forward model directly — no pre-computed bounds needed.
+        """
+        s_cold = (self.val.get_s_pt_val(lgp_i, self.logt_min,
+                                         _yp, _z, _zm, _za, _zr)
+                  * erg_to_kbbar)
+        s_hot  = (self.val.get_s_pt_val(lgp_i, self.logt_max,
+                                         _yp, _z, _zm, _za, _zr)
+                  * erg_to_kbbar)
+        return min(s_cold, s_hot), max(s_cold, s_hot)
+
+    def get_logt_sp(self, _s_kb, _lgp, _yp, _z=0.0,
+                    _zm=0.0, _za=0.0, _zr=0.0):
+        """Temperature from (S, P) via root-finding on the forward model.
+
+        Works immediately — no need to call ``compute_s_bounds`` first.
+        The physical S bounds are evaluated on-the-fly from the
+        underlying P-T table edges.  If a pre-computed S-P table has
+        been loaded (via ``load_sp_table``), the RGI is used instead.
+
+        Parameters
+        ----------
+        _s_kb : float or array
+            Entropy in kb/baryon.
+        _lgp : float or array
+            log10 P [dyn/cm²].
+        _yp : float
+            Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction (default 0).
+        _zm, _za, _zr : float
+            Nested metal sub-fractions.
+
+        Returns
+        -------
+        logt : float or array
+            log10 T [K].  NaN where S is outside the physical rhomboid.
+        """
+        # --- Fast path: pre-computed table ---
+        if self._logt_sp_rgi is not None:
+            return self._lookup_sp_table(
+                _s_kb, _lgp, _yp, _z, self._logt_sp_rgi)
+
+        # --- Slow path: per-point root-finding ---
+        # No rhomboid bounds check here — brentq tries the full
+        # [logt_min, logt_max] bracket.  The forward model can
+        # extrapolate beyond the strict P-T table edges (RGI with
+        # fill_value=None), so the root-finder is allowed to
+        # converge on those extrapolated values.  NaN is returned
+        # only when brentq genuinely cannot find a sign change.
+        scalar_input = np.isscalar(_s_kb) and np.isscalar(_lgp)
+        _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgp  = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _s_kb, _lgp = np.broadcast_arrays(_s_kb, _lgp)
+        out = np.full_like(_s_kb, np.nan, dtype=float)
+
+        for idx in np.ndindex(_s_kb.shape):
+            s_i   = _s_kb[idx]
+            lgp_i = _lgp[idx]
+
+            # Target: find logT such that
+            #   val.get_s_pt_val(P, T, Y', Z) * erg_to_kbbar = s_i
+            def err(lgt):
+                s_test = self.val.get_s_pt_val(
+                    lgp_i, lgt, _yp, _z, _zm, _za, _zr)
+                return s_test * erg_to_kbbar - s_i
+
+            try:
+                logt_sol = brentq(err, self.logt_min, self.logt_max,
+                                  xtol=1e-6, maxiter=100)
+                out[idx] = logt_sol
+            except (ValueError, RuntimeError):
+                pass  # no sign change in bracket → NaN
+
+        if scalar_input:
+            return out.item()
+        return out
+
+    def get_logrho_sp(self, _s_kb, _lgp, _yp, _z=0.0,
+                      _zm=0.0, _za=0.0, _zr=0.0):
+        """Density from (S, P) — calls get_logt_sp then forward model."""
+        logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm, _za, _zr)
+        logt_arr = np.atleast_1d(logt)
+        _lgp_arr = np.atleast_1d(_lgp)
+        logt_arr, _lgp_arr = np.broadcast_arrays(logt_arr, _lgp_arr)
+
+        out = np.full_like(logt_arr, np.nan, dtype=float)
+        good = np.isfinite(logt_arr)
+        if good.any():
+            out[good] = self.val.get_logrho_pt_val(
+                _lgp_arr[good], logt_arr[good], _yp, _z, _zm, _za, _zr)
+
+        if out.size == 1:
+            return out.item()
+        return out
+
+    # =================================================================
+    # Pre-computed table lookup
+    # =================================================================
+
+    def _lookup_sp_table(self, _s_kb, _lgp, _yp, _z, rgi):
+        """Query a pre-computed (ξ, logP, Y', Z) RGI table."""
+        _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgp  = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _yp_a = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a  = np.atleast_1d(np.asarray(_z, dtype=float))
+        _s_kb, _lgp, _yp_a, _z_a = np.broadcast_arrays(
+            _s_kb, _lgp, _yp_a, _z_a)
+
+        xi = self.s_to_xi(_s_kb, _lgp, _yp_a, _z_a)
+
+        # Mask out-of-bounds
+        out = np.full_like(xi, np.nan, dtype=float)
+        good = (xi >= 0.0) & (xi <= 1.0) & np.isfinite(xi)
+        if good.any():
+            pts = np.column_stack((xi[good], _lgp[good],
+                                   _yp_a[good], _z_a[good]))
+            out[good] = rgi(pts)
+
+        if out.size == 1:
+            return out.item()
+        return out
+
+    def load_sp_table(self, path):
+        """Load a pre-computed adaptive S-P table from NPZ.
+
+        Expected keys: xi_vals, logpvals, yvals, zvals,
+                        logt_sp, logrho_sp, s_lo, s_hi,
+                        logt_min, logt_max.
+        """
+        data = np.load(path)
+        xi = data['xi_vals']
+        logp = data['logpvals']
+        yv = data['yvals']
+        zv = data['zvals']
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+
+        self._logt_sp_rgi = RGI((xi, logp, yv, zv),
+                                 data['logt_sp'], **rgi_kw)
+        self._logrho_sp_rgi = RGI((xi, logp, yv, zv),
+                                   data['logrho_sp'], **rgi_kw)
+
+        # Update bounds
+        self._s_lo = data['s_lo']
+        self._s_hi = data['s_hi']
+        self._yvals = yv
+        self._zvals = zv
+        self.logp_vals = logp
+        self.xi_vals = xi
+        self.logt_min = float(data['logt_min'])
+        self.logt_max = float(data['logt_max'])
+
+        self._s_lo_rgi = RGI((logp, yv, zv), data['s_lo'], **rgi_kw)
+        self._s_hi_rgi = RGI((logp, yv, zv), data['s_hi'], **rgi_kw)
+
+    # =================================================================
+    # NaN repair for tables
+    # =================================================================
+
+    @staticmethod
+    def _fill_table_nans(table):
+        """Interpolate over NaN cells in a 4-D (ξ, P, Y', Z) table.
+
+        Strategy (applied in order of priority):
+        1. Along the ξ axis (axis 0) — interpolate from valid
+           neighbours at the same (P, Y', Z).  This is the most
+           physically meaningful direction since ξ maps linearly
+           to entropy.
+        2. Along the P axis (axis 1) — for entire ξ-columns that
+           are NaN (e.g. at extreme P), interpolate from
+           neighbouring pressures.
+        3. Any cells still NaN after both passes are filled by
+           nearest-neighbour extrapolation along ξ.
+
+        Returns a copy; the original is not modified.
+        """
+        out = table.copy()
+        n_xi, nP, nY, nZ = out.shape
+
+        # --- Pass 1: interpolate along ξ (axis 0) ---
+        for ip in range(nP):
+            for iy in range(nY):
+                for iz in range(nZ):
+                    col = out[:, ip, iy, iz]
+                    bad = np.isnan(col)
+                    if not bad.any():
+                        continue
+                    good = ~bad
+                    if good.sum() < 2:
+                        continue  # not enough data — leave for pass 2
+                    col[bad] = np.interp(
+                        np.where(bad)[0],
+                        np.where(good)[0],
+                        col[good])
+                    out[:, ip, iy, iz] = col
+
+        # --- Pass 2: interpolate along P (axis 1) ---
+        for ixi in range(n_xi):
+            for iy in range(nY):
+                for iz in range(nZ):
+                    row = out[ixi, :, iy, iz]
+                    bad = np.isnan(row)
+                    if not bad.any():
+                        continue
+                    good = ~bad
+                    if good.sum() < 2:
+                        continue
+                    row[bad] = np.interp(
+                        np.where(bad)[0],
+                        np.where(good)[0],
+                        row[good])
+                    out[ixi, :, iy, iz] = row
+
+        # --- Pass 3: nearest-neighbour extrapolation along ξ ---
+        for ip in range(nP):
+            for iy in range(nY):
+                for iz in range(nZ):
+                    col = out[:, ip, iy, iz]
+                    bad = np.isnan(col)
+                    if not bad.any():
+                        continue
+                    good = ~bad
+                    if not good.any():
+                        continue  # entire column NaN — nothing to do
+                    # Forward-fill then back-fill
+                    good_idx = np.where(good)[0]
+                    for bi in np.where(bad)[0]:
+                        nearest = good_idx[np.argmin(np.abs(good_idx - bi))]
+                        col[bi] = col[nearest]
+                    out[:, ip, iy, iz] = col
+
+        return out
+
+    # =================================================================
+    # Table generation
+    # =================================================================
+
+    def build_sp_table(self, yvals, zvals,
+                       _zm=0.0, _za=0.0, _zr=0.0,
+                       n_xi=None, verbose=True):
+        """Build the full logT(ξ, P, Y', Z) and logrho(ξ, P, Y', Z) tables.
+
+        For each (P, Y', Z) grid point the physical entropy range
+        [S_lo, S_hi] is computed from the T boundaries of the P-T
+        table.  ``n_xi`` evenly spaced ξ values in [0, 1] are then
+        mapped to physical S values within that range and inverted
+        via ``brentq`` to obtain logT.  logrho is computed from the
+        forward model at (P, T).
+
+        Parameters
+        ----------
+        yvals : array_like
+            1-D array of Y' values.
+        zvals : array_like
+            1-D array of Z values.
+        _zm, _za, _zr : float
+            Fixed nested metal sub-fractions.
+        n_xi : int or None
+            Number of ξ grid points (default: ``self.n_xi``).
+        verbose : bool
+            Print progress.
+
+        Returns
+        -------
+        result : dict
+            Keys: xi_vals, logpvals, yvals, zvals,
+                  logt_sp  (n_xi, nP, nY, nZ),
+                  logrho_sp (n_xi, nP, nY, nZ),
+                  s_lo (nP, nY, nZ),
+                  s_hi (nP, nY, nZ),
+                  logt_min, logt_max.
+
+        Also loads the table into this instance (sets the RGI
+        interpolators so ``get_logt_sp`` / ``get_logrho_sp`` use
+        the fast table path).
+        """
+        if n_xi is None:
+            n_xi = self.n_xi
+
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        logp = self.logp_vals
+
+        nP, nY, nZ = len(logp), len(yvals), len(zvals)
+
+        # --- Step 1: compute S bounds ---
+        if verbose:
+            print(f"Computing S bounds: {nP} P × {nY} Y × {nZ} Z ...")
+        self.compute_s_bounds_grid(yvals, zvals, _zm, _za, _zr)
+        s_lo = self._s_lo   # (nP, nY, nZ)
+        s_hi = self._s_hi
+
+        # --- Step 2: invert at each (ξ, P, Y', Z) ---
+        logt_sp   = np.full((n_xi, nP, nY, nZ), np.nan, dtype=float)
+        logrho_sp = np.full((n_xi, nP, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        count = 0
+        for iy, yp in enumerate(yvals):
+            for iz, zv in enumerate(zvals):
+                count += 1
+                if verbose:
+                    print(f"  [{count}/{total}] Y'={yp:.3f}, Z={zv:.3f} ...",
+                          flush=True)
+
+                # Previous-T guess for continuity along P
+                prev_logt = None
+
+                for ip in range(nP):
+                    lgp_i = logp[ip]
+                    slo_i = s_lo[ip, iy, iz]
+                    shi_i = s_hi[ip, iy, iz]
+
+                    if (not np.isfinite(slo_i)) or (not np.isfinite(shi_i)):
+                        continue
+                    if shi_i <= slo_i:
+                        continue
+
+                    for ixi in range(n_xi):
+                        # Physical S at this (ξ, P, Y', Z)
+                        s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
+
+                        def err(lgt):
+                            s_test = self.val.get_s_pt_val(
+                                lgp_i, lgt, yp, zv, _zm, _za, _zr)
+                            return s_test * erg_to_kbbar - s_phys
+
+                        try:
+                            lgt_sol = brentq(err,
+                                             self.logt_min, self.logt_max,
+                                             xtol=1e-8, maxiter=100)
+                            logt_sp[ixi, ip, iy, iz] = lgt_sol
+                            logrho_sp[ixi, ip, iy, iz] = \
+                                self.val.get_logrho_pt_val(
+                                    lgp_i, lgt_sol, yp, zv,
+                                    _zm, _za, _zr)
+                        except (ValueError, RuntimeError):
+                            pass  # NaN stays
+
+        # --- Step 3: fill any remaining NaNs by interpolation ---
+        n_nan_before = np.isnan(logt_sp).sum()
+        if n_nan_before > 0:
+            if verbose:
+                print(f"Filling {n_nan_before} NaN cells by "
+                      f"interpolation ...")
+            logt_sp   = self._fill_table_nans(logt_sp)
+            logrho_sp = self._fill_table_nans(logrho_sp)
+            n_nan_after = np.isnan(logt_sp).sum()
+            if verbose and n_nan_after > 0:
+                print(f"  WARNING: {n_nan_after} NaNs remain after "
+                      f"interpolation")
+
+        # --- Step 4: package result ---
+        result = {
+            'xi_vals':   xi_vals,
+            'logpvals':  logp,
+            'yvals':     yvals,
+            'zvals':     zvals,
+            'logt_sp':   logt_sp,
+            'logrho_sp': logrho_sp,
+            's_lo':      s_lo,
+            's_hi':      s_hi,
+            'logt_min':  self.logt_min,
+            'logt_max':  self.logt_max,
+        }
+
+        # --- Step 5: load into this instance ---
+        self.xi_vals = xi_vals
+        self._yvals = yvals
+        self._zvals = zvals
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logt_sp_rgi = RGI((xi_vals, logp, yvals, zvals),
+                                 logt_sp, **rgi_kw)
+        self._logrho_sp_rgi = RGI((xi_vals, logp, yvals, zvals),
+                                   logrho_sp, **rgi_kw)
+
+        if verbose:
+            n_total = logt_sp.size
+            n_good = np.isfinite(logt_sp).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan_before} were interpolated")
+
+        return result
+
+    @staticmethod
+    def save_sp_table(result, path):
+        """Save a table dict (from ``build_sp_table``) to NPZ."""
+        np.savez_compressed(path, **result)
+        print(f"Saved {path}")
+
+    # =================================================================
+    # Convenience: rhomboid plotting / diagnostics
+    # =================================================================
+
+    def get_s_bounds_at(self, _lgp):
+        """Return (S_lo, S_hi) in kb/baryon at the given logP."""
+        return self._get_bounds(_lgp)
 
 
 class mixtures(hhe_eos):
