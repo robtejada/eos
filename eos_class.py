@@ -10,7 +10,7 @@ from numba import njit
 from eos import ideal_eos, metals_eos, ice_eos
 from eos import ideal_eos, metals_eos, scvh_eos
 from eos.smooth import smooth_eos_table
-from scipy.optimize import root, newton, brentq, brenth, minimize
+from scipy.optimize import root, newton, brentq, brenth, minimize, least_squares
 from scipy.ndimage import gaussian_filter1d, gaussian_filter
 from astropy.constants import k_B
 from astropy.constants import u as amu
@@ -922,8 +922,8 @@ class hhe_z_mixtures():
     _TABLE_BASES = {
         'sp':   '{hhe}_{z}_sp_adaptive.npz',
         'rhot': '{hhe}_{z}_rhot_adaptive.npz',
-        # Future table types:
-        # 'srho': '{hhe}_{z}_srho_adaptive.npz',
+        'rhop': '{hhe}_{z}_rhop_adaptive.npz',
+        'srho': '{hhe}_{z}_srho_adaptive.npz',
     }
 
     def __init__(self, hhe_eos_name='cd', hg=True,
@@ -1004,6 +1004,15 @@ class hhe_z_mixtures():
         # Pre-computed tables (None until loaded)
         self._logt_sp_rgi = None
         self._logp_rhot_rgi = None
+        self._logt_rhop_rgi = None
+        self._rho_lo_rhop_rgi = None
+        self._rho_hi_rhop_rgi = None
+        self._srho_rgi_p = None
+        self._srho_rgi_t = None
+        self._s_lo_srho = None
+        self._s_hi_srho = None
+        self._s_lo_srho_rgi = None
+        self._s_hi_srho_rgi = None
 
         # --- Auto-load tables if tab=True and files exist ---
         if self.tab:
@@ -1030,6 +1039,16 @@ class hhe_z_mixtures():
         rhot_path = self._table_path('rhot')
         if os.path.isfile(rhot_path):
             self.load_rhot_table(rhot_path)
+
+        # rho-P table
+        rhop_path = self._table_path('rhop')
+        if os.path.isfile(rhop_path):
+            self.load_rhop_table(rhop_path)
+
+        # S-rho table
+        srho_path = self._table_path('srho')
+        if os.path.isfile(srho_path):
+            self.load_srho_table(srho_path)
 
     # =================================================================
     # S-bound computation
@@ -1885,6 +1904,785 @@ class hhe_z_mixtures():
         """
         if path is None:
             path = self._table_path('rhot')
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, **result)
+        print(f"Saved {path}")
+
+    # =================================================================
+    # ρ-P inversion: T(ρ, P, Y', Z) — 1-D with ξ-mapping on ρ axis
+    # =================================================================
+
+    def compute_rho_bounds_rhop(self, yvals, zvals,
+                                _zm=0.0, _za=0.0, _zr=0.0):
+        """Compute the physical logrho bounds at each (logP, Y', Z).
+
+        At each pressure, rho ranges from rho(P, T_max) (hot, low ρ)
+        to rho(P, T_min) (cold, high ρ).
+
+        Stores ``self._rho_lo_rhop`` and ``self._rho_hi_rhop`` as
+        3-D arrays (nP, nY, nZ).
+        """
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        nP, nY, nZ = len(self.logp_vals), len(yvals), len(zvals)
+
+        rho_lo = np.full((nP, nY, nZ), np.nan)
+        rho_hi = np.full((nP, nY, nZ), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            for iz, zv in enumerate(zvals):
+                for ip, lgp in enumerate(self.logp_vals):
+                    r_hot = self.val.get_logrho_pt_val(
+                        lgp, self.logt_max, yp, zv, _zm, _za, _zr)
+                    r_cold = self.val.get_logrho_pt_val(
+                        lgp, self.logt_min, yp, zv, _zm, _za, _zr)
+                    if np.isfinite(r_hot) and np.isfinite(r_cold):
+                        rho_lo[ip, iy, iz] = min(r_hot, r_cold)
+                        rho_hi[ip, iy, iz] = max(r_hot, r_cold)
+
+        self._rho_lo_rhop = rho_lo.astype(np.float32)
+        self._rho_hi_rhop = rho_hi.astype(np.float32)
+        self._yvals_rhop = yvals
+        self._zvals_rhop = zvals
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._rho_lo_rhop_rgi = RGI(
+            (self.logp_vals, yvals, zvals), self._rho_lo_rhop, **rgi_kw)
+        self._rho_hi_rhop_rgi = RGI(
+            (self.logp_vals, yvals, zvals), self._rho_hi_rhop, **rgi_kw)
+
+    def rho_to_xi_rhop(self, _lgrho, _lgp, _yp, _z):
+        """Convert logrho → ξ in the ρ-P rhomboid."""
+        pts = np.column_stack((
+            np.atleast_1d(_lgp).ravel(),
+            np.atleast_1d(_yp).ravel(),
+            np.atleast_1d(_z).ravel()))
+        rlo = self._rho_lo_rhop_rgi(pts).reshape(np.atleast_1d(_lgp).shape)
+        rhi = self._rho_hi_rhop_rgi(pts).reshape(np.atleast_1d(_lgp).shape)
+        denom = rhi - rlo
+        denom = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
+        xi = (np.atleast_1d(_lgrho) - rlo) / denom
+        if np.isscalar(_lgrho) and np.isscalar(_lgp):
+            return float(xi.ravel()[0])
+        return xi
+
+    def xi_to_rho_rhop(self, _xi, _lgp, _yp, _z):
+        """Convert ξ → logrho in the ρ-P rhomboid."""
+        pts = np.column_stack((
+            np.atleast_1d(_lgp).ravel(),
+            np.atleast_1d(_yp).ravel(),
+            np.atleast_1d(_z).ravel()))
+        rlo = self._rho_lo_rhop_rgi(pts).reshape(np.atleast_1d(_lgp).shape)
+        rhi = self._rho_hi_rhop_rgi(pts).reshape(np.atleast_1d(_lgp).shape)
+        return rlo + np.atleast_1d(_xi) * (rhi - rlo)
+
+    def get_logt_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
+                      _zm=0.0, _za=0.0, _zr=0.0):
+        """Temperature from (ρ, P) via 1-D root-finding or table.
+
+        Inverts ρ(P, T, Y', Z) = 10^logrho to find logT.
+
+        Parameters
+        ----------
+        _lgrho : float or array
+            log10 ρ [g/cm³].
+        _lgp : float or array
+            log10 P [dyn/cm²].
+        _yp : float
+            Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction.
+
+        Returns
+        -------
+        logt : float or array
+            log10 T [K].  NaN where no solution.
+        """
+        # Fast path: pre-computed table
+        if self._logt_rhop_rgi is not None:
+            return self._lookup_rhop_table(_lgrho, _lgp, _yp, _z)
+
+        # Slow path: 1-D brentq per point
+        scalar = np.isscalar(_lgrho) and np.isscalar(_lgp)
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgp   = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _lgrho, _lgp = np.broadcast_arrays(_lgrho, _lgp)
+        out = np.full_like(_lgrho, np.nan, dtype=float)
+
+        for idx in np.ndindex(_lgrho.shape):
+            rho_i = _lgrho[idx]
+            lgp_i = _lgp[idx]
+
+            def err(lgt):
+                return (self.val.get_logrho_pt_val(
+                    lgp_i, lgt, _yp, _z, _zm, _za, _zr) - rho_i)
+
+            try:
+                out[idx] = brentq(err, self.logt_min, self.logt_max,
+                                  xtol=1e-6, maxiter=100)
+            except (ValueError, RuntimeError):
+                pass
+
+        if scalar:
+            return out.item()
+        return out
+
+    def _lookup_rhop_table(self, _lgrho, _lgp, _yp, _z):
+        """Query the pre-computed (ξ, logP, Y', Z) ρ-P RGI."""
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgp   = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a   = np.atleast_1d(np.asarray(_z, dtype=float))
+        _lgrho, _lgp, _yp_a, _z_a = np.broadcast_arrays(
+            _lgrho, _lgp, _yp_a, _z_a)
+
+        xi = self.rho_to_xi_rhop(_lgrho, _lgp, _yp_a, _z_a)
+        out = np.full_like(xi, np.nan, dtype=float)
+        good = (xi >= 0.0) & (xi <= 1.0) & np.isfinite(xi)
+        if good.any():
+            pts = np.column_stack((xi[good], _lgp[good],
+                                   _yp_a[good], _z_a[good]))
+            out[good] = self._logt_rhop_rgi(pts)
+
+        if out.size == 1:
+            return out.item()
+        return out
+
+    def build_rhop_table(self, yvals, zvals,
+                         _zm=0.0, _za=0.0, _zr=0.0,
+                         n_xi=None, verbose=True):
+        """Build logT(ξ_ρ, logP, Y', Z) table with ξ-mapping on ρ.
+
+        At each (logP, Y', Z), the density range [ρ_lo, ρ_hi] is
+        computed from the T boundaries.  ``n_xi`` evenly spaced ξ
+        values map this range to [0, 1].
+        """
+        if n_xi is None:
+            n_xi = self.n_xi
+
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        logp = self.logp_vals
+        nP, nY, nZ = len(logp), len(yvals), len(zvals)
+
+        if verbose:
+            print(f"Building ρ-P table: n_xi={n_xi}, "
+                  f"logP=[{logp[0]:.2f}, {logp[-1]:.2f}] "
+                  f"(dlogP={logp[1]-logp[0]:.2f}, {nP} pts), "
+                  f"logT=[{self.logt_min:.1f}, {self.logt_max:.1f}]")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {n_xi}×{nP}×{nY}×{nZ} = "
+                  f"{n_xi*nP*nY*nZ:,}")
+
+        # Step 1: compute rho bounds
+        self.compute_rho_bounds_rhop(yvals, zvals, _zm, _za, _zr)
+        rho_lo = self._rho_lo_rhop  # (nP, nY, nZ)
+        rho_hi = self._rho_hi_rhop
+
+        # Step 2: invert
+        logt_tab = np.full((n_xi, nP, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T → ρ,P",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        prev_logt = np.full((n_xi, nP), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_logt[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                use_newton = iz > 0
+
+                for ip in range(nP):
+                    lgp_i = logp[ip]
+                    rlo_i = rho_lo[ip, iy, iz]
+                    rhi_i = rho_hi[ip, iy, iz]
+
+                    if (not np.isfinite(rlo_i)) or (not np.isfinite(rhi_i)):
+                        continue
+                    if rhi_i <= rlo_i:
+                        continue
+
+                    for ixi in range(n_xi):
+                        rho_phys = rlo_i + xi_vals[ixi] * (rhi_i - rlo_i)
+
+                        def err(lgt):
+                            return (self.val.get_logrho_pt_val(
+                                lgp_i, lgt, yp, zv, _zm, _za, _zr)
+                                - rho_phys)
+
+                        solved = False
+
+                        if use_newton:
+                            guess = prev_logt[ixi, ip]
+                            if np.isfinite(guess):
+                                try:
+                                    lgt_sol = newton(
+                                        err, x0=guess,
+                                        tol=1e-8, maxiter=50)
+                                    if (self.logt_min <= lgt_sol
+                                            <= self.logt_max):
+                                        logt_tab[ixi, ip, iy, iz] = lgt_sol
+                                        prev_logt[ixi, ip] = lgt_sol
+                                        solved = True
+                                except (ValueError, RuntimeError,
+                                        OverflowError):
+                                    pass
+
+                        if not solved:
+                            try:
+                                lgt_sol = brentq(
+                                    err, self.logt_min, self.logt_max,
+                                    xtol=1e-8, maxiter=100)
+                                logt_tab[ixi, ip, iy, iz] = lgt_sol
+                                prev_logt[ixi, ip] = lgt_sol
+                            except (ValueError, RuntimeError):
+                                pass
+
+        pbar.close()
+
+        # Step 3: fill NaNs
+        n_nan = np.isnan(logt_tab).sum()
+        if n_nan > 0:
+            if verbose:
+                print(f"Filling {n_nan} NaN cells by interpolation ...")
+            logt_tab = self._fill_table_nans(logt_tab)
+
+        logt_f32 = logt_tab.astype(np.float32)
+        rho_lo_f32 = rho_lo.astype(np.float32)
+        rho_hi_f32 = rho_hi.astype(np.float32)
+
+        if verbose:
+            mem_mb = logt_f32.nbytes / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32)")
+
+        result = {
+            'xi_vals':     xi_vals,
+            'logpvals':    logp,
+            'yvals':       yvals,
+            'zvals':       zvals,
+            'logt_rhop':   logt_f32,
+            'rho_lo_rhop': rho_lo_f32,
+            'rho_hi_rhop': rho_hi_f32,
+            'logt_min':    self.logt_min,
+            'logt_max':    self.logt_max,
+        }
+
+        # Load into this instance
+        self._load_rhop_from_arrays(
+            xi_vals, logp, yvals, zvals,
+            logt_f32, rho_lo_f32, rho_hi_f32)
+
+        if verbose:
+            n_total = logt_tab.size
+            n_good = np.isfinite(logt_tab).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan} were interpolated")
+
+        return result
+
+    def _load_rhop_from_arrays(self, xi_vals, logp, yvals, zvals,
+                                logt, rho_lo, rho_hi):
+        """Build ρ-P RGI interpolators."""
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logt_rhop_rgi = RGI((xi_vals, logp, yvals, zvals),
+                                   logt, **rgi_kw)
+        self._rho_lo_rhop = rho_lo
+        self._rho_hi_rhop = rho_hi
+        self._yvals_rhop = yvals
+        self._zvals_rhop = zvals
+        self._rho_lo_rhop_rgi = RGI((logp, yvals, zvals), rho_lo, **rgi_kw)
+        self._rho_hi_rhop_rgi = RGI((logp, yvals, zvals), rho_hi, **rgi_kw)
+
+    def load_rhop_table(self, path):
+        """Load a ρ-P → T table from NPZ."""
+        data = np.load(path)
+        self.logt_min = float(data['logt_min'])
+        self.logt_max = float(data['logt_max'])
+        self._load_rhop_from_arrays(
+            data['xi_vals'], data['logpvals'],
+            data['yvals'], data['zvals'],
+            data['logt_rhop'], data['rho_lo_rhop'], data['rho_hi_rhop'])
+
+    def save_rhop_table(self, result, path=None):
+        """Save a ρ-P table to NPZ."""
+        if path is None:
+            path = self._table_path('rhop')
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, **result)
+        print(f"Saved {path}")
+
+    # =================================================================
+    # S-ρ inversion: P,T(S, ρ, Y', Z) — 2-D least-squares
+    # =================================================================
+
+    def compute_s_bounds_srho(self, yvals, zvals,
+                              _zm=0.0, _za=0.0, _zr=0.0,
+                              n_t_sweep=20, verbose=True):
+        """Compute physical S bounds at each (logrho, Y', Z).
+
+        At each (logrho, Y', Z), sweeps logT from logt_min to logt_max,
+        inverts for logP via 1-D brentq (``get_logp_rhot``), evaluates
+        S(P, T), and records the min/max over T.
+
+        Stores ``self._s_lo_srho``, ``self._s_hi_srho`` as 3-D arrays
+        of shape (nRho, nY, nZ) in kb/baryon.
+        """
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        logrho = self.logrho_vals
+        nR, nY, nZ = len(logrho), len(yvals), len(zvals)
+
+        logt_sweep = np.linspace(self.logt_min, self.logt_max, n_t_sweep)
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+
+        s_lo = np.full((nR, nY, nZ), np.inf)
+        s_hi = np.full((nR, nY, nZ), -np.inf)
+
+        pbar = tqdm(total=nY * nZ,
+                     desc="S bounds (S-ρ)",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        for iy, yp in enumerate(yvals):
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                for ir in range(nR):
+                    rho_target = logrho[ir]
+
+                    for lgt in logt_sweep:
+                        # Find P that gives this (rho, T)
+                        def err_p(lgp):
+                            return (self.val.get_logrho_pt_val(
+                                lgp, lgt, yp, zv, _zm, _za, _zr)
+                                - rho_target)
+                        try:
+                            lgp = brentq(err_p, lgp_lo, lgp_hi,
+                                         xtol=1e-6, maxiter=60)
+                        except (ValueError, RuntimeError):
+                            continue
+
+                        s_val = (self.val.get_s_pt_val(
+                            lgp, lgt, yp, zv, _zm, _za, _zr)
+                            * erg_to_kbbar)
+
+                        if np.isfinite(s_val):
+                            s_lo[ir, iy, iz] = min(s_lo[ir, iy, iz], s_val)
+                            s_hi[ir, iy, iz] = max(s_hi[ir, iy, iz], s_val)
+
+        pbar.close()
+
+        # Replace inf with NaN (cells with no valid T sweep)
+        s_lo[~np.isfinite(s_lo)] = np.nan
+        s_hi[~np.isfinite(s_hi)] = np.nan
+
+        self._s_lo_srho = s_lo.astype(np.float32)
+        self._s_hi_srho = s_hi.astype(np.float32)
+        self._yvals_srho = yvals
+        self._zvals_srho = zvals
+
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._s_lo_srho_rgi = RGI((logrho, yvals, zvals),
+                                   self._s_lo_srho, **rgi_kw)
+        self._s_hi_srho_rgi = RGI((logrho, yvals, zvals),
+                                   self._s_hi_srho, **rgi_kw)
+
+    def s_to_xi_srho(self, _s_kb, _lgrho, _yp, _z):
+        """Convert physical S → normalised ξ in the S-ρ rhomboid."""
+        _lgrho_a = np.atleast_1d(_lgrho)
+        _yp_a = np.atleast_1d(_yp)
+        _z_a = np.atleast_1d(_z)
+        _lgrho_a, _yp_a, _z_a = np.broadcast_arrays(
+            _lgrho_a, _yp_a, _z_a)
+        pts = np.column_stack((_lgrho_a.ravel(), _yp_a.ravel(),
+                                _z_a.ravel()))
+        s_lo = self._s_lo_srho_rgi(pts).reshape(_lgrho_a.shape)
+        s_hi = self._s_hi_srho_rgi(pts).reshape(_lgrho_a.shape)
+        denom = s_hi - s_lo
+        denom = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
+        xi = (_s_kb - s_lo) / denom
+        if np.isscalar(_lgrho) and np.isscalar(_s_kb):
+            return float(xi.ravel()[0])
+        return xi
+
+    def xi_to_s_srho(self, _xi, _lgrho, _yp, _z):
+        """Convert normalised ξ → physical S in the S-ρ rhomboid."""
+        _lgrho_a = np.atleast_1d(_lgrho)
+        _yp_a = np.atleast_1d(_yp)
+        _z_a = np.atleast_1d(_z)
+        _lgrho_a, _yp_a, _z_a = np.broadcast_arrays(
+            _lgrho_a, _yp_a, _z_a)
+        pts = np.column_stack((_lgrho_a.ravel(), _yp_a.ravel(),
+                                _z_a.ravel()))
+        s_lo = self._s_lo_srho_rgi(pts).reshape(_lgrho_a.shape)
+        s_hi = self._s_hi_srho_rgi(pts).reshape(_lgrho_a.shape)
+        return s_lo + _xi * (s_hi - s_lo)
+
+    def get_logp_logt_srho(self, _s_kb, _lgrho, _yp, _z=0.0,
+                            _zm=0.0, _za=0.0, _zr=0.0):
+        """Pressure and temperature from (S, ρ) via 2-D least-squares.
+
+        If a pre-computed S-ρ table has been loaded, the RGI is
+        used instead.
+
+        Parameters
+        ----------
+        _s_kb : float or array
+            Entropy in kb/baryon.
+        _lgrho : float or array
+            log10 ρ [g/cm³].
+        _yp : float
+            Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction.
+
+        Returns
+        -------
+        logp, logt : float or array
+            log10 P [dyn/cm²] and log10 T [K].
+            NaN where the solver fails.
+        """
+        # --- Fast path: pre-computed table ---
+        if self._srho_rgi_p is not None:
+            return self._lookup_srho_table(_s_kb, _lgrho, _yp, _z)
+
+        # --- Slow path: per-point least_squares ---
+        scalar = np.isscalar(_s_kb) and np.isscalar(_lgrho)
+        _s_kb  = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _s_kb, _lgrho = np.broadcast_arrays(_s_kb, _lgrho)
+
+        lgp_out = np.full_like(_s_kb, np.nan, dtype=float)
+        lgt_out = np.full_like(_s_kb, np.nan, dtype=float)
+
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+        lgt_lo, lgt_hi = self.logt_min, self.logt_max
+        lb = np.array([lgp_lo, lgt_lo])
+        ub = np.array([lgp_hi, lgt_hi])
+
+        # Warm-start: carry forward the last converged solution
+        prev_x = None
+
+        for idx in np.ndindex(_s_kb.shape):
+            s_target = _s_kb[idx]
+            rho_target = _lgrho[idx]
+
+            s_scale = max(abs(s_target), 1.0)
+            rho_scale = max(abs(rho_target), 1.0)
+
+            def residuals(x):
+                lgp, lgt = x
+                s_test = (self.val.get_s_pt_val(
+                    lgp, lgt, _yp, _z, _zm, _za, _zr)
+                    * erg_to_kbbar)
+                rho_test = self.val.get_logrho_pt_val(
+                    lgp, lgt, _yp, _z, _zm, _za, _zr)
+                if not (np.isfinite(s_test) and np.isfinite(rho_test)):
+                    return np.array([1e30, 1e30])
+                return np.array([(s_test - s_target) / s_scale,
+                                 (rho_test - rho_target) / rho_scale])
+
+            # Initial guess
+            if prev_x is not None:
+                x0 = prev_x.copy()
+            else:
+                # Seed: mid-T, then invert for P from rho
+                lgt_seed = 0.5 * (lgt_lo + lgt_hi)
+                try:
+                    def err_p(lgp):
+                        return (self.val.get_logrho_pt_val(
+                            lgp, lgt_seed, _yp, _z, _zm, _za, _zr)
+                            - rho_target)
+                    lgp_seed = brentq(err_p, lgp_lo, lgp_hi,
+                                      xtol=1e-5, maxiter=60)
+                except (ValueError, RuntimeError):
+                    lgp_seed = 0.5 * (lgp_lo + lgp_hi)
+                x0 = np.array([lgp_seed, lgt_seed])
+
+            x0 = np.clip(x0, lb, ub)
+
+            try:
+                sol = least_squares(residuals, x0,
+                                     bounds=(lb, ub),
+                                     method='trf',
+                                     xtol=1e-10, ftol=1e-10,
+                                     gtol=1e-10, max_nfev=200)
+                if sol.success and np.all(np.isfinite(sol.x)):
+                    lgp_out[idx] = sol.x[0]
+                    lgt_out[idx] = sol.x[1]
+                    prev_x = sol.x.copy()
+            except Exception:
+                pass
+
+        if scalar:
+            return lgp_out.item(), lgt_out.item()
+        return lgp_out, lgt_out
+
+    def _lookup_srho_table(self, _s_kb, _lgrho, _yp, _z):
+        """Query the pre-computed (ξ, logrho, Y', Z) S-ρ RGI tables."""
+        _s_kb  = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a   = np.atleast_1d(np.asarray(_z, dtype=float))
+        _s_kb, _lgrho, _yp_a, _z_a = np.broadcast_arrays(
+            _s_kb, _lgrho, _yp_a, _z_a)
+
+        xi = self.s_to_xi_srho(_s_kb, _lgrho, _yp_a, _z_a)
+
+        lgp_out = np.full_like(xi, np.nan, dtype=float)
+        lgt_out = np.full_like(xi, np.nan, dtype=float)
+        good = (xi >= 0.0) & (xi <= 1.0) & np.isfinite(xi)
+
+        if good.any():
+            pts = np.column_stack((xi[good], _lgrho[good],
+                                   _yp_a[good], _z_a[good]))
+            lgp_out[good] = self._srho_rgi_p(pts)
+            lgt_out[good] = self._srho_rgi_t(pts)
+
+        if lgp_out.size == 1:
+            return lgp_out.item(), lgt_out.item()
+        return lgp_out, lgt_out
+
+    def build_srho_table(self, yvals, zvals,
+                         _zm=0.0, _za=0.0, _zr=0.0,
+                         n_xi=None, verbose=True):
+        """Build logP and logT tables on a (ξ, logrho, Y', Z) grid.
+
+        The ξ coordinate normalises the entropy axis at each
+        (logrho, Y', Z) from 0 (S_lo) to 1 (S_hi), matching the
+        S-P rhomboid approach.
+        """
+        if n_xi is None:
+            n_xi = self.n_xi
+
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        logrho = self.logrho_vals
+
+        nR, nY, nZ = len(logrho), len(yvals), len(zvals)
+
+        if verbose:
+            print(f"Building S-ρ table: n_xi={n_xi}, "
+                  f"logrho=[{logrho[0]:.2f}, {logrho[-1]:.2f}] "
+                  f"(d={logrho[1]-logrho[0]:.2f}, {nR} pts), "
+                  f"logT=[{self.logt_min:.1f}, {self.logt_max:.1f}]")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {n_xi}×{nR}×{nY}×{nZ} = "
+                  f"{n_xi*nR*nY*nZ:,}")
+
+        # Step 1: compute S bounds
+        self.compute_s_bounds_srho(yvals, zvals, _zm, _za, _zr,
+                                   verbose=verbose)
+        s_lo = self._s_lo_srho  # (nR, nY, nZ)
+        s_hi = self._s_hi_srho
+
+        # Step 2: invert
+        logp_tab = np.full((n_xi, nR, nY, nZ), np.nan, dtype=float)
+        logt_tab = np.full((n_xi, nR, nY, nZ), np.nan, dtype=float)
+
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+        lgt_lo, lgt_hi = self.logt_min, self.logt_max
+        lb = np.array([lgp_lo, lgt_lo])
+        ub = np.array([lgp_hi, lgt_hi])
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T → S,ρ",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        prev_pt = np.full((n_xi, nR, 2), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_pt[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                use_warm = iz > 0
+
+                for ir in range(nR):
+                    rho_target = logrho[ir]
+                    slo_i = s_lo[ir, iy, iz]
+                    shi_i = s_hi[ir, iy, iz]
+
+                    if (not np.isfinite(slo_i)) or (not np.isfinite(shi_i)):
+                        continue
+                    if shi_i <= slo_i:
+                        continue
+
+                    rho_scale = max(abs(rho_target), 1.0)
+
+                    for ixi in range(n_xi):
+                        s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
+                        s_scale = max(abs(s_phys), 1.0)
+
+                        def residuals(x):
+                            lgp, lgt = x
+                            s_t = (self.val.get_s_pt_val(
+                                lgp, lgt, yp, zv, _zm, _za, _zr)
+                                * erg_to_kbbar)
+                            rho_t = self.val.get_logrho_pt_val(
+                                lgp, lgt, yp, zv, _zm, _za, _zr)
+                            if not (np.isfinite(s_t)
+                                    and np.isfinite(rho_t)):
+                                return np.array([1e30, 1e30])
+                            return np.array([
+                                (s_t - s_phys) / s_scale,
+                                (rho_t - rho_target) / rho_scale])
+
+                        solved = False
+
+                        # Warm-start from previous Z
+                        if use_warm:
+                            guess = prev_pt[ixi, ir]
+                            if np.all(np.isfinite(guess)):
+                                x0 = np.clip(guess, lb, ub)
+                                try:
+                                    sol = least_squares(
+                                        residuals, x0,
+                                        bounds=(lb, ub),
+                                        method='trf',
+                                        xtol=1e-10, ftol=1e-10,
+                                        gtol=1e-10, max_nfev=200)
+                                    if (sol.success
+                                            and np.all(np.isfinite(sol.x))):
+                                        logp_tab[ixi, ir, iy, iz] = sol.x[0]
+                                        logt_tab[ixi, ir, iy, iz] = sol.x[1]
+                                        prev_pt[ixi, ir] = sol.x
+                                        solved = True
+                                except Exception:
+                                    pass
+
+                        # Cold start: seed from mid-T + rho-inversion
+                        if not solved:
+                            lgt_seed = 0.5 * (lgt_lo + lgt_hi)
+                            try:
+                                def err_p(lgp):
+                                    return (self.val.get_logrho_pt_val(
+                                        lgp, lgt_seed, yp, zv,
+                                        _zm, _za, _zr)
+                                        - rho_target)
+                                lgp_seed = brentq(err_p, lgp_lo,
+                                                   lgp_hi,
+                                                   xtol=1e-5,
+                                                   maxiter=60)
+                            except (ValueError, RuntimeError):
+                                lgp_seed = 0.5 * (lgp_lo + lgp_hi)
+
+                            x0 = np.clip(
+                                np.array([lgp_seed, lgt_seed]),
+                                lb, ub)
+
+                            try:
+                                sol = least_squares(
+                                    residuals, x0,
+                                    bounds=(lb, ub),
+                                    method='trf',
+                                    xtol=1e-10, ftol=1e-10,
+                                    gtol=1e-10, max_nfev=200)
+                                if (sol.success
+                                        and np.all(np.isfinite(sol.x))):
+                                    logp_tab[ixi, ir, iy, iz] = sol.x[0]
+                                    logt_tab[ixi, ir, iy, iz] = sol.x[1]
+                                    prev_pt[ixi, ir] = sol.x
+                            except Exception:
+                                pass
+
+        pbar.close()
+
+        # Step 3: fill NaNs
+        n_nan = np.isnan(logp_tab).sum()
+        if n_nan > 0:
+            if verbose:
+                print(f"Filling {n_nan} NaN cells by interpolation ...")
+            logp_tab = self._fill_table_nans(logp_tab)
+            logt_tab = self._fill_table_nans(logt_tab)
+
+        logp_f32 = logp_tab.astype(np.float32)
+        logt_f32 = logt_tab.astype(np.float32)
+
+        if verbose:
+            mem_mb = (logp_f32.nbytes + logt_f32.nbytes) / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32, P+T)")
+
+        result = {
+            'xi_vals':    xi_vals,
+            'logrhovals': logrho,
+            'yvals':      yvals,
+            'zvals':      zvals,
+            'logp_srho':  logp_f32,
+            'logt_srho':  logt_f32,
+            's_lo_srho':  self._s_lo_srho,
+            's_hi_srho':  self._s_hi_srho,
+            'logt_min':   self.logt_min,
+            'logt_max':   self.logt_max,
+        }
+
+        # Load into this instance
+        self._load_srho_from_arrays(
+            xi_vals, logrho, yvals, zvals,
+            logp_f32, logt_f32,
+            self._s_lo_srho, self._s_hi_srho)
+
+        if verbose:
+            n_total = logp_tab.size
+            n_good = np.isfinite(logp_tab).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan} were interpolated")
+
+        return result
+
+    def _load_srho_from_arrays(self, xi_vals, logrho, yvals, zvals,
+                                logp, logt, s_lo, s_hi):
+        """Build S-ρ RGI interpolators from arrays."""
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._srho_rgi_p = RGI((xi_vals, logrho, yvals, zvals),
+                                logp, **rgi_kw)
+        self._srho_rgi_t = RGI((xi_vals, logrho, yvals, zvals),
+                                logt, **rgi_kw)
+        self._s_lo_srho = s_lo
+        self._s_hi_srho = s_hi
+        self._yvals_srho = yvals
+        self._zvals_srho = zvals
+        self._s_lo_srho_rgi = RGI((logrho, yvals, zvals), s_lo, **rgi_kw)
+        self._s_hi_srho_rgi = RGI((logrho, yvals, zvals), s_hi, **rgi_kw)
+
+    def load_srho_table(self, path):
+        """Load a pre-computed S-ρ table from NPZ."""
+        data = np.load(path)
+        self.logt_min = float(data['logt_min'])
+        self.logt_max = float(data['logt_max'])
+        self._load_srho_from_arrays(
+            data['xi_vals'], data['logrhovals'],
+            data['yvals'], data['zvals'],
+            data['logp_srho'], data['logt_srho'],
+            data['s_lo_srho'], data['s_hi_srho'])
+
+    def save_srho_table(self, result, path=None):
+        """Save an S-ρ table to NPZ."""
+        if path is None:
+            path = self._table_path('srho')
             os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **result)
         print(f"Saved {path}")
