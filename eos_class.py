@@ -1294,15 +1294,18 @@ class hhe_z_mixtures():
             # Target: find logT such that
             #   val.get_s_pt_val(P, T, Y', Z) * erg_to_kbbar = s_i
             def err(lgt):
-                s_test = self.val.get_s_pt_val(
-                    lgp_i, lgt, _yp, _z, _zm, _za, _zr)
-                return s_test * erg_to_kbbar - s_i
+                try:
+                    s_test = self.val.get_s_pt_val(
+                        lgp_i, lgt, _yp, _z, _zm, _za, _zr)
+                    return s_test * erg_to_kbbar - s_i
+                except (ZeroDivisionError, FloatingPointError):
+                    return 1e30
 
             try:
                 logt_sol = brentq(err, self.logt_min, self.logt_max,
                                   xtol=1e-6, maxiter=100)
                 out[idx] = logt_sol
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError, ZeroDivisionError):
                 pass  # no sign change in bracket → NaN
 
         if scalar_input:
@@ -1581,9 +1584,12 @@ class hhe_z_mixtures():
                         s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
 
                         def err(lgt):
-                            s_test = self.val.get_s_pt_val(
-                                lgp_i, lgt, yp, zv, _zm, _za, _zr)
-                            return s_test * erg_to_kbbar - s_phys
+                            try:
+                                s_test = self.val.get_s_pt_val(
+                                    lgp_i, lgt, yp, zv, _zm, _za, _zr)
+                                return s_test * erg_to_kbbar - s_phys
+                            except (ZeroDivisionError, FloatingPointError):
+                                return 1e30
 
                         solved = False
 
@@ -1611,7 +1617,7 @@ class hhe_z_mixtures():
                                     xtol=1e-8, maxiter=100)
                                 logt_sp[ixi, ip, iy, iz] = lgt_sol
                                 prev_logt[ixi, ip] = lgt_sol
-                            except (ValueError, RuntimeError):
+                            except (ValueError, RuntimeError, ZeroDivisionError):
                                 pass  # NaN stays
 
         pbar.close()
@@ -1722,7 +1728,7 @@ class hhe_z_mixtures():
                 lgp_sol = brentq(err, lgp_lo, lgp_hi,
                                  xtol=1e-8, maxiter=100)
                 out[idx] = lgp_sol
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError, ZeroDivisionError):
                 pass
 
         if scalar_input:
@@ -2096,13 +2102,16 @@ class hhe_z_mixtures():
             lgp_i = _lgp[idx]
 
             def err(lgt):
-                return (self.val.get_logrho_pt_val(
-                    lgp_i, lgt, _yp, _z, _zm, _za, _zr) - rho_i)
+                try:
+                    return (self.val.get_logrho_pt_val(
+                        lgp_i, lgt, _yp, _z, _zm, _za, _zr) - rho_i)
+                except (ZeroDivisionError, FloatingPointError):
+                    return 1e30
 
             try:
                 out[idx] = brentq(err, self.logt_min, self.logt_max,
                                   xtol=1e-6, maxiter=100)
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError, ZeroDivisionError):
                 pass
 
         if scalar:
@@ -2197,9 +2206,13 @@ class hhe_z_mixtures():
                         rho_phys = rlo_i + xi_vals[ixi] * (rhi_i - rlo_i)
 
                         def err(lgt):
-                            return (self.val.get_logrho_pt_val(
-                                lgp_i, lgt, yp, zv, _zm, _za, _zr)
-                                - rho_phys)
+                            try:
+                                return (self.val.get_logrho_pt_val(
+                                    lgp_i, lgt, yp, zv, _zm, _za, _zr)
+                                    - rho_phys)
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return 1e30
 
                         solved = False
 
@@ -2216,7 +2229,8 @@ class hhe_z_mixtures():
                                         prev_logt[ixi, ip] = lgt_sol
                                         solved = True
                                 except (ValueError, RuntimeError,
-                                        OverflowError):
+                                        OverflowError,
+                                        ZeroDivisionError):
                                     pass
 
                         if not solved:
@@ -2226,7 +2240,8 @@ class hhe_z_mixtures():
                                     xtol=1e-8, maxiter=100)
                                 logt_tab[ixi, ip, iy, iz] = lgt_sol
                                 prev_logt[ixi, ip] = lgt_sol
-                            except (ValueError, RuntimeError):
+                            except (ValueError, RuntimeError,
+                                    ZeroDivisionError):
                                 pass
 
         pbar.close()
@@ -2348,13 +2363,16 @@ class hhe_z_mixtures():
                     for lgt in logt_sweep:
                         # Find P that gives this (rho, T)
                         def err_p(lgp):
-                            return (self.val.get_logrho_pt_val(
-                                lgp, lgt, yp, zv, _zm, _za, _zr)
-                                - rho_target)
+                            try:
+                                return (self.val.get_logrho_pt_val(
+                                    lgp, lgt, yp, zv, _zm, _za, _zr)
+                                    - rho_target)
+                            except (ZeroDivisionError, FloatingPointError):
+                                return 1e30
                         try:
                             lgp = brentq(err_p, lgp_lo, lgp_hi,
                                          xtol=1e-6, maxiter=60)
-                        except (ValueError, RuntimeError):
+                        except (ValueError, RuntimeError, ZeroDivisionError):
                             continue
 
                         s_val = (self.val.get_s_pt_val(
@@ -2492,7 +2510,7 @@ class hhe_z_mixtures():
                             - rho_target)
                     lgp_seed = brentq(err_p, lgp_lo, lgp_hi,
                                       xtol=1e-5, maxiter=60)
-                except (ValueError, RuntimeError):
+                except (ValueError, RuntimeError, ZeroDivisionError):
                     lgp_seed = 0.5 * (lgp_lo + lgp_hi)
                 x0 = np.array([lgp_seed, lgt_seed])
 
@@ -2659,15 +2677,18 @@ class hhe_z_mixtures():
                             lgt_seed = 0.5 * (lgt_lo + lgt_hi)
                             try:
                                 def err_p(lgp):
-                                    return (self.val.get_logrho_pt_val(
-                                        lgp, lgt_seed, yp, zv,
-                                        _zm, _za, _zr)
-                                        - rho_target)
+                                    try:
+                                        return (self.val.get_logrho_pt_val(
+                                            lgp, lgt_seed, yp, zv,
+                                            _zm, _za, _zr)
+                                            - rho_target)
+                                    except (ZeroDivisionError, FloatingPointError):
+                                        return 1e30
                                 lgp_seed = brentq(err_p, lgp_lo,
                                                    lgp_hi,
                                                    xtol=1e-5,
                                                    maxiter=60)
-                            except (ValueError, RuntimeError):
+                            except (ValueError, RuntimeError, ZeroDivisionError):
                                 lgp_seed = 0.5 * (lgp_lo + lgp_hi)
 
                             x0 = np.clip(
@@ -3014,122 +3035,127 @@ class hhe_z_mixtures():
         return out
 
     # ---- FD scalar helpers (use inversions) ----
+    # Each supports smooth=True for 5-point Savitzky-Golay stencil
+    # (same as the identity method's internal smoothing).
+    # When smooth=False, uses the standard 2-point central difference.
 
-    def _cp_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+    def _fd_or_sg(self, func, x0, h, smooth=True):
+        """Compute df/dx: Savitzky-Golay if smooth, else 2-pt central diff."""
+        if smooth:
+            return self._smooth_deriv(func, x0, h)
+        return (func(x0 + h) - func(x0 - h)) / (2 * h)
+
+    def _cp_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+               dt=1e-2, smooth=True):
         """C_P via direct FD: dS/d(lnT)|_P."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s1 = self.val.get_s_pt_val(lgp, lgt - dt, yp, z, **kw)
-        s2 = self.val.get_s_pt_val(lgp, lgt + dt, yp, z, **kw)
-        return (s2 - s1) / (2 * dt * log10_to_loge)
+        f = lambda t: self.val.get_s_pt_val(lgp, t, yp, z, **kw)
+        return self._fd_or_sg(f, lgt, dt, smooth) / log10_to_loge
 
-    def _cv_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+    def _cv_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+               dt=1e-2, smooth=True):
         """C_V via direct FD: dS/d(lnT)|_ρ."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
-        try:
-            p1 = self.get_logp_rhot(rho0, lgt - dt, yp, z, **kw)
-            p2 = self.get_logp_rhot(rho0, lgt + dt, yp, z, **kw)
-            s1 = self.val.get_s_pt_val(p1, lgt - dt, yp, z, **kw)
-            s2 = self.val.get_s_pt_val(p2, lgt + dt, yp, z, **kw)
-            return (s2 - s1) / (2 * dt * log10_to_loge)
-        except:
-            return np.nan
+        def f(t):
+            try:
+                p = self.get_logp_rhot(rho0, t, yp, z, **kw)
+                return self.val.get_s_pt_val(p, t, yp, z, **kw)
+            except:
+                return np.nan
+        return self._fd_or_sg(f, lgt, dt, smooth) / log10_to_loge
 
-    def _delta_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+    def _delta_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                  dt=1e-2, smooth=True):
         """δ via direct FD: -dlogρ/dlogT|_P."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        r1 = self.val.get_logrho_pt_val(lgp, lgt - dt, yp, z, **kw)
-        r2 = self.val.get_logrho_pt_val(lgp, lgt + dt, yp, z, **kw)
-        return -(r2 - r1) / (2 * dt)
+        f = lambda t: self.val.get_logrho_pt_val(lgp, t, yp, z, **kw)
+        return -self._fd_or_sg(f, lgt, dt, smooth)
 
-    def _nabla_ad_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dp=1e-2):
+    def _nabla_ad_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                     dp=1e-2, smooth=True):
         """∇_ad via direct FD on S-P inversion: dlogT/dlogP|_S."""
         s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, _zm, _za, _zr) * erg_to_kbbar
-        t1 = self.get_logt_sp(s_kb, lgp - dp, yp, z, _zm, _za, _zr)
-        t2 = self.get_logt_sp(s_kb, lgp + dp, yp, z, _zm, _za, _zr)
-        if np.isfinite(t1) and np.isfinite(t2):
-            return (t2 - t1) / (2 * dp)
-        return np.nan
+        kw = dict(_zm=_zm, _za=_za, _zr=_zr)
+        f = lambda p: self.get_logt_sp(s_kb, p, yp, z, **kw)
+        result = self._fd_or_sg(f, lgp, dp, smooth)
+        return result if np.isfinite(result) else np.nan
 
-    def _gamma1_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dp=1e-2):
+    def _gamma1_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                   dp=1e-2, smooth=True):
         """Γ₁ via direct FD: dlogP/dlogρ|_S."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
-        t1 = self.get_logt_sp(s_kb, lgp - dp, yp, z, **kw)
-        t2 = self.get_logt_sp(s_kb, lgp + dp, yp, z, **kw)
-        if np.isfinite(t1) and np.isfinite(t2):
-            r1 = self.val.get_logrho_pt_val(lgp - dp, t1, yp, z, **kw)
-            r2 = self.val.get_logrho_pt_val(lgp + dp, t2, yp, z, **kw)
-            return (2 * dp) / (r2 - r1)
+        def f(p):
+            t = self.get_logt_sp(s_kb, p, yp, z, **kw)
+            if np.isfinite(t):
+                return self.val.get_logrho_pt_val(p, t, yp, z, **kw)
+            return np.nan
+        drho_dp = self._fd_or_sg(f, lgp, dp, smooth)
+        if np.isfinite(drho_dp) and abs(drho_dp) > 1e-30:
+            return 1.0 / drho_dp
         return np.nan
 
-    def _chi_T_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dt=1e-2):
+    def _chi_T_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                  dt=1e-2, smooth=True):
         """χ_T via direct FD on ρ-T inversion: dlogP/dlogT|_ρ."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
-        p1 = self.get_logp_rhot(rho0, lgt - dt, yp, z, **kw)
-        p2 = self.get_logp_rhot(rho0, lgt + dt, yp, z, **kw)
-        if np.isfinite(p1) and np.isfinite(p2):
-            return (p2 - p1) / (2 * dt)
-        return np.nan
+        f = lambda t: self.get_logp_rhot(rho0, t, yp, z, **kw)
+        result = self._fd_or_sg(f, lgt, dt, smooth)
+        return result if np.isfinite(result) else np.nan
 
-    def _chi_rho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dr=1e-2):
+    def _chi_rho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                    dr=1e-2, smooth=True):
         """χ_ρ via direct FD on ρ-T inversion: dlogP/dlogρ|_T."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
-        p1 = self.get_logp_rhot(rho0 - dr, lgt, yp, z, **kw)
-        p2 = self.get_logp_rhot(rho0 + dr, lgt, yp, z, **kw)
-        if np.isfinite(p1) and np.isfinite(p2):
-            return (p2 - p1) / (2 * dr)
-        return np.nan
+        f = lambda r: self.get_logp_rhot(r, lgt, yp, z, **kw)
+        result = self._fd_or_sg(f, rho0, dr, smooth)
+        return result if np.isfinite(result) else np.nan
 
-    def _chi_Y_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
+    def _chi_Y_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                  dy=0.01, smooth=True):
         """χ_Y via direct FD on ρ-T inversion: dlogP/dY|_{ρ,T}."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
         dy = self._adaptive_dx(yp, dy)
-        p1 = self.get_logp_rhot(rho0, lgt, yp - dy, z, **kw)
-        p2 = self.get_logp_rhot(rho0, lgt, yp + dy, z, **kw)
-        if np.isfinite(p1) and np.isfinite(p2):
-            return (p2 - p1) * log10_to_loge / (2 * dy)
-        return np.nan
+        f = lambda y: self.get_logp_rhot(rho0, lgt, y, z, **kw)
+        return self._fd_or_sg(f, yp, dy, smooth) * log10_to_loge
 
-    def _chi_Z_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
+    def _chi_Z_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                  dz=0.01, smooth=True):
         """χ_Z via direct FD on ρ-T inversion: dlogP/dZ|_{ρ,T}."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
         dz = self._adaptive_dx(z, dz)
-        p1 = self.get_logp_rhot(rho0, lgt, yp, z - dz, **kw)
-        p2 = self.get_logp_rhot(rho0, lgt, yp, z + dz, **kw)
-        if np.isfinite(p1) and np.isfinite(p2):
-            return (p2 - p1) * log10_to_loge / (2 * dz)
-        return np.nan
+        f = lambda zv: self.get_logp_rhot(rho0, lgt, yp, zv, **kw)
+        return self._fd_or_sg(f, z, dz, smooth) * log10_to_loge
 
-    def _dtds_sp_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, ds=0.1):
+    def _dtds_sp_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                    ds=0.1, smooth=True):
         """dT/dS|_P via direct FD on S-P inversion."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
-        t1 = self.get_logt_sp(s_kb - ds, lgp, yp, z, **kw)
-        t2 = self.get_logt_sp(s_kb + ds, lgp, yp, z, **kw)
-        if np.isfinite(t1) and np.isfinite(t2):
-            return (10**t2 - 10**t1) / (2 * ds / erg_to_kbbar)
-        return np.nan
+        f = lambda s: 10 ** self.get_logt_sp(s, lgp, yp, z, **kw)
+        dTds_kb = self._fd_or_sg(f, s_kb, ds, smooth)
+        return dTds_kb * erg_to_kbbar  # convert from dT/d(S_kb) to dT/d(S_cgs)
 
-    def _dsdy_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
+    def _dsdy_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                    dy=0.01, smooth=True):
         """dS/dY|_{P,T} via direct FD."""
         dy = self._adaptive_dx(yp, dy)
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s1 = self.val.get_s_pt_val(lgp, lgt, yp - dy, z, **kw)
-        s2 = self.val.get_s_pt_val(lgp, lgt, yp + dy, z, **kw)
-        return (s2 - s1) / (2 * dy)
+        f = lambda y: self.val.get_s_pt_val(lgp, lgt, y, z, **kw)
+        return self._fd_or_sg(f, yp, dy, smooth)
 
-    def _dsdz_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
+    def _dsdz_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
+                    dz=0.01, smooth=True):
         """dS/dZ|_{P,T} via direct FD."""
         dz = self._adaptive_dx(z, dz)
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s1 = self.val.get_s_pt_val(lgp, lgt, yp, z - dz, **kw)
-        s2 = self.val.get_s_pt_val(lgp, lgt, yp, z + dz, **kw)
-        return (s2 - s1) / (2 * dz)
+        f = lambda zv: self.val.get_s_pt_val(lgp, lgt, yp, zv, **kw)
+        return self._fd_or_sg(f, z, dz, smooth)
 
     # ---- Identity scalar helpers ----
 
@@ -3199,51 +3225,51 @@ class hhe_z_mixtures():
             func = getattr(self, f'_{name}_id')
         return self._vec(func, lgp, lgt, yp, z, **kw)
 
-    def get_cp(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_cp(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """C_P  [erg/(g·K)]."""
         return self._dispatch('cp', lgp, lgt, yp, z, method, **kw)
 
-    def get_cv(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_cv(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """C_V  [erg/(g·K)]."""
         return self._dispatch('cv', lgp, lgt, yp, z, method, **kw)
 
-    def get_delta(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_delta(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """δ = −(∂logρ/∂logT)|_P  [dimensionless]."""
         return self._dispatch('delta', lgp, lgt, yp, z, method, **kw)
 
-    def get_nabla_ad(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_nabla_ad(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """∇_ad = dlogT/dlogP|_S  [dimensionless]."""
         return self._dispatch('nabla_ad', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_T(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_chi_T(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """χ_T = dlogP/dlogT|_ρ  [dimensionless]."""
         return self._dispatch('chi_T', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_rho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_chi_rho(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """χ_ρ = dlogP/dlogρ|_T  [dimensionless]."""
         return self._dispatch('chi_rho', lgp, lgt, yp, z, method, **kw)
 
-    def get_gamma1(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_gamma1(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """Γ₁ = dlogP/dlogρ|_S  [dimensionless]."""
         return self._dispatch('gamma1', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_Y(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_chi_Y(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """χ_Y = dlogP/dY|_{ρ,T}."""
         return self._dispatch('chi_Y', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_Z(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_chi_Z(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """χ_Z = dlogP/dZ|_{ρ,T}."""
         return self._dispatch('chi_Z', lgp, lgt, yp, z, method, **kw)
 
-    def get_dtds_sp(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dtds_sp(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dT/dS|_P  [K·g·K/erg]."""
         return self._dispatch('dtds_sp', lgp, lgt, yp, z, method, **kw)
 
-    def get_dsdy_pt(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dsdy_pt(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dS/dY|_{P,T}  [erg/(g·K) per Y]."""
         return self._dispatch('dsdy_pt', lgp, lgt, yp, z, method, **kw)
 
-    def get_dsdz_pt(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dsdz_pt(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dS/dZ|_{P,T}  [erg/(g·K) per Z]."""
         return self._dispatch('dsdz_pt', lgp, lgt, yp, z, method, **kw)
 
@@ -3259,8 +3285,11 @@ class hhe_z_mixtures():
 
         def get_t(yp_i):
             def err(lgt_i):
-                return self.val.get_logrho_pt_val(
-                    lgp, lgt_i, yp_i, z, _zm, _za, _zr) - rho0
+                try:
+                    return self.val.get_logrho_pt_val(
+                        lgp, lgt_i, yp_i, z, _zm, _za, _zr) - rho0
+                except (ZeroDivisionError, FloatingPointError):
+                    return 1e30
             return brentq(err, self.logt_min, self.logt_max, xtol=1e-8)
 
         try:
@@ -3268,7 +3297,7 @@ class hhe_z_mixtures():
             lgt_m = get_t(yp - dy)
             return (self.val.get_s_pt_val(lgp, lgt_p, yp + dy, z, _zm, _za, _zr) -
                     self.val.get_s_pt_val(lgp, lgt_m, yp - dy, z, _zm, _za, _zr)) / (2 * dy)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, ZeroDivisionError):
             return np.nan
 
     def _ledoux_dsdz_fd(self, lgp, lgt, yp, z, _zm, _za, _zr, dz):
@@ -3279,8 +3308,11 @@ class hhe_z_mixtures():
 
         def get_t(z_i):
             def err(lgt_i):
-                return self.val.get_logrho_pt_val(
-                    lgp, lgt_i, yp, z_i, _zm, _za, _zr) - rho0
+                try:
+                    return self.val.get_logrho_pt_val(
+                        lgp, lgt_i, yp, z_i, _zm, _za, _zr) - rho0
+                except (ZeroDivisionError, FloatingPointError):
+                    return 1e30
             return brentq(err, self.logt_min, self.logt_max, xtol=1e-8)
 
         try:
@@ -3288,7 +3320,7 @@ class hhe_z_mixtures():
             lgt_m = get_t(z - dz)
             return (self.val.get_s_pt_val(lgp, lgt_p, yp, z + dz, _zm, _za, _zr) -
                     self.val.get_s_pt_val(lgp, lgt_m, yp, z - dz, _zm, _za, _zr)) / (2 * dz)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, ZeroDivisionError):
             return np.nan
 
     def _dsdy_rhop_scalar(self, lgp, lgt, yp, z=0.0,
@@ -3300,7 +3332,7 @@ class hhe_z_mixtures():
         return self._ledoux_dsdy_fd(lgp, lgt, yp, z, _zm, _za, _zr,
                                      dy=kw.get('dy', None))
 
-    def get_dsdy_rhop(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dsdy_rhop(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """Ledoux: dS/dY|_{ρ,P}  [erg/(g·K) per Y].
 
         method='identity': S_Y − S·a·ln(10)·ρ_Y / c (with c_guard fallback)
@@ -3324,7 +3356,7 @@ class hhe_z_mixtures():
         return self._ledoux_dsdz_fd(lgp, lgt, yp, z, _zm, _za, _zr,
                                      dz=kw.get('dz', None))
 
-    def get_dsdz_rhop(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dsdz_rhop(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """Ledoux: dS/dZ|_{ρ,P}  [erg/(g·K) per Z].
 
         method='identity': S_Z − S·a·ln(10)·ρ_Z / c (with c_guard fallback)
@@ -3400,7 +3432,7 @@ class hhe_z_mixtures():
             return (u2 - u1) / (2 * dz)
         return np.nan
 
-    def get_dtdy_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dtdy_srho(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dT/dY|_{S,ρ}  [K per Y].
 
         method='identity': 2×2 implicit function theorem from P-T basis
@@ -3420,7 +3452,7 @@ class hhe_z_mixtures():
                     - d['S'] * d['b'] * log10_to_loge * d['rho_Z']) \
                / (d['S'] * det)
 
-    def get_dtdz_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dtdz_srho(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dT/dZ|_{S,ρ}  [K per Z].
 
         method='identity': 2×2 implicit function theorem from P-T basis
@@ -3448,7 +3480,7 @@ class hhe_z_mixtures():
         dlogTdY = dTdY / (T * ln10)
         return d['U_P'] * dlogPdY + d['U_T'] * dlogTdY + d['U_Y']
 
-    def get_dudy_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dudy_srho(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dU/dY|_{S,ρ}  [erg/g per Y].
 
         Chain rule:
@@ -3476,7 +3508,7 @@ class hhe_z_mixtures():
         dlogTdZ = dTdZ / (T * ln10)
         return d['U_P'] * dlogPdZ + d['U_T'] * dlogTdZ + d['U_Z']
 
-    def get_dudz_srho(self, lgp, lgt, yp, z=0.0, method='identity', **kw):
+    def get_dudz_srho(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
         """dU/dZ|_{S,ρ}  [erg/g per Z].
 
         Same chain rule as get_dudy_srho with Z replacing Y.
