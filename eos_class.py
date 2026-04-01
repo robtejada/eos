@@ -604,9 +604,14 @@ class val_mixtures:
         _lgt_arr = np.atleast_1d(_lgt)
 
         logt_dissoc = self._DISSOC_A + self._DISSOC_B * _lgp_arr
-        mu_h = np.where(_lgt_arr < logt_dissoc,
-                         self._m_h_molecular,    # H2
-                         self._m_h_atomic)        # H / H+
+
+        # Smooth tanh transition over ~0.3 dex in logT to avoid
+        # a step discontinuity in the ideal entropy of mixing
+        # that would cause kinks in T(S,P) inversions.
+        # f = 0 (molecular, μ=2) at low T, f = 1 (atomic, μ=1) at high T
+        width = 0.15  # half-width of transition in dex
+        f = 0.5 * (1.0 + np.tanh((_lgt_arr - logt_dissoc) / width))
+        mu_h = self._m_h_molecular * (1.0 - f) + self._m_h_atomic * f
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return mu_h.item()
