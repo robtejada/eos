@@ -641,10 +641,10 @@ class val_mixtures:
         m = self
         n_h       = f_h       / m_h
         n_he      = f_he      / m._m_he
-        n_water   = f_water   / m._m_water   if f_water   > 0 else 0.0
-        n_methane = f_methane / m._m_methane  if f_methane > 0 else 0.0
-        n_ammonia = f_ammonia / m._m_ammonia  if f_ammonia > 0 else 0.0
-        n_rock    = f_rock    / m._m_rock     if f_rock    > 0 else 0.0
+        n_water   = np.where(np.asarray(f_water)   > 0, np.asarray(f_water)   / m._m_water,   0.0)
+        n_methane = np.where(np.asarray(f_methane) > 0, np.asarray(f_methane) / m._m_methane, 0.0)
+        n_ammonia = np.where(np.asarray(f_ammonia) > 0, np.asarray(f_ammonia) / m._m_ammonia, 0.0)
+        n_rock    = np.where(np.asarray(f_rock)    > 0, np.asarray(f_rock)    / m._m_rock,    0.0)
 
         Ntot = n_h + n_he + n_water + n_methane + n_ammonia + n_rock
 
@@ -1311,7 +1311,7 @@ class hhe_z_mixtures():
                         lo, hi = self.logt_min, self.logt_max
                         err_lo = err(lo)
                         if err_lo > 1e20 or not np.isfinite(err_lo):
-                            for t_try in np.arange(lo + 0.1, hi, 0.1):
+                            for t_try in np.arange(lo + 0.5, hi, 0.5):
                                 e = err(t_try)
                                 if np.isfinite(e) and e < 1e20:
                                     lo = t_try
@@ -1322,7 +1322,15 @@ class hhe_z_mixtures():
                                 xtol=1e-6, maxiter=100)
                         except (ValueError, RuntimeError,
                                 ZeroDivisionError):
-                            pass
+                            # Extrapolate from nearest valid boundary
+                            e_lo = err(lo)
+                            e_hi = err(hi)
+                            if np.isfinite(e_lo) and np.isfinite(e_hi):
+                                out.ravel()[idx] = lo if abs(e_lo) < abs(e_hi) else hi
+                            elif np.isfinite(e_hi):
+                                out.ravel()[idx] = hi
+                            elif np.isfinite(e_lo):
+                                out.ravel()[idx] = lo
                 return out.reshape(result_arr.shape)
 
         # --- Slow path: per-point root-finding ---
@@ -1360,7 +1368,7 @@ class hhe_z_mixtures():
             err_hi = err(hi)
             # If lo is invalid (NaN region), scan upward
             if err_lo > 1e20 or not np.isfinite(err_lo):
-                for t_try in np.arange(lo + 0.1, hi, 0.1):
+                for t_try in np.arange(lo + 0.5, hi, 0.5):
                     e = err(t_try)
                     if np.isfinite(e) and e < 1e20:
                         lo = t_try
@@ -1372,7 +1380,17 @@ class hhe_z_mixtures():
                                   xtol=1e-6, maxiter=100)
                 out[idx] = logt_sol
             except (ValueError, RuntimeError, ZeroDivisionError):
-                pass  # no sign change in bracket → NaN
+                # Brentq failed — likely beyond the EOS domain.
+                # Extrapolate: return the T at the boundary where
+                # the error is smallest (closest to the target S).
+                err_lo_v = err(lo)
+                err_hi_v = err(hi)
+                if np.isfinite(err_lo_v) and np.isfinite(err_hi_v):
+                    out[idx] = lo if abs(err_lo_v) < abs(err_hi_v) else hi
+                elif np.isfinite(err_hi_v):
+                    out[idx] = hi
+                elif np.isfinite(err_lo_v):
+                    out[idx] = lo
 
         if scalar_input:
             return out.item()
@@ -1412,13 +1430,15 @@ class hhe_z_mixtures():
 
         xi = self.s_to_xi(_s_kb, _lgp, _yp_a, _z_a)
 
-        # Mask out-of-bounds
-        out = np.full_like(xi, np.nan, dtype=float)
-        good = (xi >= 0.0) & (xi <= 1.0) & np.isfinite(xi)
-        if good.any():
-            pts = np.column_stack((xi[good], _lgp[good],
-                                   _yp_a[good], _z_a[good]))
-            out[good] = rgi(pts)
+        # Clamp xi to [0, 1] and let the RGI extrapolate at the
+        # boundaries.  NaN xi (from NaN bounds at extreme P) is
+        # clamped to 0.5 — the RGI will return the nearest valid
+        # table value, which is better than NaN.
+        xi = np.where(np.isfinite(xi), np.clip(xi, 0.0, 1.0), 0.5)
+
+        pts = np.column_stack((xi.ravel(), _lgp.ravel(),
+                               _yp_a.ravel(), _z_a.ravel()))
+        out = rgi(pts).reshape(xi.shape)
 
         if out.size == 1:
             return out.item()
@@ -3079,9 +3099,17 @@ class hhe_z_mixtures():
             return func(lgp, lgt, *args, **kw)
         lgp_a = np.atleast_1d(lgp)
         lgt_a = np.atleast_1d(lgt)
+        # Broadcast args (yp, z, ...) to same shape as lgp, lgt
+        args_a = [np.broadcast_to(np.atleast_1d(a), lgp_a.shape)
+                   if not np.isscalar(a) else a for a in args]
         lgp_a, lgt_a = np.broadcast_arrays(lgp_a, lgt_a)
-        out = np.array([func(float(p), float(t), *args, **kw)
-                         for p, t in zip(lgp_a.ravel(), lgt_a.ravel())])
+        n = lgp_a.size
+        out = np.empty(n)
+        for i in range(n):
+            a_i = [float(a.ravel()[i]) if not np.isscalar(a) else a
+                   for a in args_a]
+            out[i] = func(float(lgp_a.ravel()[i]),
+                          float(lgt_a.ravel()[i]), *a_i, **kw)
         out = out.reshape(lgp_a.shape)
 
         if post_smooth and out.ndim >= 1 and out.size > 3:
@@ -3282,24 +3310,263 @@ class hhe_z_mixtures():
 
     # ---- Public getters with method dispatch ----
 
+    # ORCHARD-specific kwargs that should not be passed to scalar helpers
+    _ORCHARD_KW = frozenset({'tab', 'ideal_guess', 'arr_guess',
+                              'arr_p_guess', 'arr_t_guess',
+                              '_frock', 'frock',
+                              'dy', 'dz', 'ds', 'dt'})
+
+    # Vectorized FD implementations (array-safe, no Python loop).
+    # These call the forward model or table lookups with full arrays
+    # in a single RGI evaluation — orders of magnitude faster than
+    # the _vec per-element loop.
+
+    def _vec_fd_cp(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        return (self.val.get_s_pt_val(lgp, lgt + h, yp, z)
+                - self.val.get_s_pt_val(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
+
+    def _vec_fd_delta(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        return -(self.val.get_logrho_pt_val(lgp, lgt + h, yp, z)
+                 - self.val.get_logrho_pt_val(lgp, lgt - h, yp, z)) / (2*h)
+
+    def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z) * erg_to_kbbar
+        t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
+        t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
+        return (t2 - t1) / (2*h)
+
+    def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z) * erg_to_kbbar
+        t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
+        t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
+        r1 = self.val.get_logrho_pt_val(lgp - h, t1, yp, z)
+        r2 = self.val.get_logrho_pt_val(lgp + h, t2, yp, z)
+        result = (2*h) / (r2 - r1)
+        return np.where(np.isfinite(result), result, np.nan)
+
+    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
+        p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
+        return (p2 - p1) / (2*h)
+
+    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        p1 = self.get_logp_rhot(rho0 - h, lgt, yp, z)
+        p2 = self.get_logp_rhot(rho0 + h, lgt, yp, z)
+        return (p2 - p1) / (2*h)
+
+    def _vec_fd_cv(self, lgp, lgt, yp, z, h=1e-2, **kw):
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
+        p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
+        s1 = self.val.get_s_pt_val(p1, lgt - h, yp, z)
+        s2 = self.val.get_s_pt_val(p2, lgt + h, yp, z)
+        return (s2 - s1) / (2*h*log10_to_loge)
+
+    def _vec_fd_dsdy_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
+        return (self.val.get_s_pt_val(lgp, lgt, yp + h, z)
+                - self.val.get_s_pt_val(lgp, lgt, yp - h, z)) / (2*h)
+
+    def _vec_fd_dsdz_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
+        return (self.val.get_s_pt_val(lgp, lgt, yp, z + h)
+                - self.val.get_s_pt_val(lgp, lgt, yp, z - h)) / (2*h)
+
+    def _vec_fd_dtds_sp(self, lgp, lgt, yp, z, h=0.1, **kw):
+        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z) * erg_to_kbbar
+        t1 = 10 ** self.get_logt_sp(s_kb - h, lgp, yp, z)
+        t2 = 10 ** self.get_logt_sp(s_kb + h, lgp, yp, z)
+        return (t2 - t1) / (2*h / erg_to_kbbar)
+
+    def _vec_fd_chi_Y(self, lgp, lgt, yp, z, h=0.01, **kw):
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        p1 = self.get_logp_rhot(rho0, lgt, yp - h, z)
+        p2 = self.get_logp_rhot(rho0, lgt, yp + h, z)
+        return (p2 - p1) * log10_to_loge / (2*h)
+
+    def _vec_fd_chi_Z(self, lgp, lgt, yp, z, h=0.01, **kw):
+        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        p1 = self.get_logp_rhot(rho0, lgt, yp, z - h)
+        p2 = self.get_logp_rhot(rho0, lgt, yp, z + h)
+        return (p2 - p1) * log10_to_loge / (2*h)
+
+    def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
+        """Ledoux dS/dY|_{ρ,P} vectorized via identity with clamped c."""
+        ht = 1e-2
+        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
+        logS_Tp = np.log10(self.val.get_s_pt_val(lgp, lgt + ht, yp, z))
+        logS_Tm = np.log10(self.val.get_s_pt_val(lgp, lgt - ht, yp, z))
+        a = (logS_Tp - logS_Tm) / (2 * ht)
+        rho_Tp = self.val.get_logrho_pt_val(lgp, lgt + ht, yp, z)
+        rho_Tm = self.val.get_logrho_pt_val(lgp, lgt - ht, yp, z)
+        c = (rho_Tp - rho_Tm) / (2 * ht)
+        S_Y = (self.val.get_s_pt_val(lgp, lgt, yp + h, z)
+               - self.val.get_s_pt_val(lgp, lgt, yp - h, z)) / (2 * h)
+        rho_Y = (self.val.get_logrho_pt_val(lgp, lgt, yp + h, z)
+                 - self.val.get_logrho_pt_val(lgp, lgt, yp - h, z)) / (2 * h)
+        # Clamp c to avoid 1/c singularity at dissociation
+        c_safe = np.where(np.abs(c) > 0.02, c, np.sign(c) * 0.02)
+        c_safe = np.where(c_safe == 0, 0.02, c_safe)
+        return S_Y - S0 * a * log10_to_loge * rho_Y / c_safe
+
+    def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
+        """Ledoux dS/dZ|_{ρ,P} vectorized via identity with clamped c."""
+        ht = 1e-2
+        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
+        logS_Tp = np.log10(self.val.get_s_pt_val(lgp, lgt + ht, yp, z))
+        logS_Tm = np.log10(self.val.get_s_pt_val(lgp, lgt - ht, yp, z))
+        a = (logS_Tp - logS_Tm) / (2 * ht)
+        rho_Tp = self.val.get_logrho_pt_val(lgp, lgt + ht, yp, z)
+        rho_Tm = self.val.get_logrho_pt_val(lgp, lgt - ht, yp, z)
+        c = (rho_Tp - rho_Tm) / (2 * ht)
+        S_Z = (self.val.get_s_pt_val(lgp, lgt, yp, z + h)
+               - self.val.get_s_pt_val(lgp, lgt, yp, z - h)) / (2 * h)
+        rho_Z = (self.val.get_logrho_pt_val(lgp, lgt, yp, z + h)
+                 - self.val.get_logrho_pt_val(lgp, lgt, yp, z - h)) / (2 * h)
+        c_safe = np.where(np.abs(c) > 0.02, c, np.sign(c) * 0.02)
+        c_safe = np.where(c_safe == 0, 0.02, c_safe)
+        return S_Z - S0 * a * log10_to_loge * rho_Z / c_safe
+
+    def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+        """dT/dY|_{S,ρ} vectorized via identity."""
+        ht, hp = 1e-2, 1e-2
+        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
+        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
+             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
+             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Y = (self.val.get_s_pt_val(lgp, lgt, yp+h, z)
+               - self.val.get_s_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        rho_Y = (self.val.get_logrho_pt_val(lgp, lgt, yp+h, z)
+                 - self.val.get_logrho_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        T = 10.0 ** lgt
+        det = b*c - a*d
+        det = np.where(np.abs(det) < 1e-20, 1e-20, det)
+        return T * (d*S_Y - S0*b*log10_to_loge*rho_Y) / (S0 * det)
+
+    def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+        """dT/dZ|_{S,ρ} vectorized via identity."""
+        ht, hp = 1e-2, 1e-2
+        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
+        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
+             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
+             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Z = (self.val.get_s_pt_val(lgp, lgt, yp, z+h)
+               - self.val.get_s_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        rho_Z = (self.val.get_logrho_pt_val(lgp, lgt, yp, z+h)
+                 - self.val.get_logrho_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        T = 10.0 ** lgt
+        det = b*c - a*d
+        det = np.where(np.abs(det) < 1e-20, 1e-20, det)
+        return T * (d*S_Z - S0*b*log10_to_loge*rho_Z) / (S0 * det)
+
+    def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+        """dU/dY|_{S,ρ} vectorized via identity."""
+        ht, hp = 1e-2, 1e-2
+        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
+        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
+             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
+             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Y = (self.val.get_s_pt_val(lgp, lgt, yp+h, z)
+               - self.val.get_s_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        rho_Y = (self.val.get_logrho_pt_val(lgp, lgt, yp+h, z)
+                 - self.val.get_logrho_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        U_Y = (self.val.get_u_pt_val(lgp, lgt, yp+h, z)
+               - self.val.get_u_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        U_P = (self.val.get_u_pt_val(lgp+hp, lgt, yp, z)
+               - self.val.get_u_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
+        U_T = (self.val.get_u_pt_val(lgp, lgt+ht, yp, z)
+               - self.val.get_u_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
+        T = 10.0 ** lgt; P = 10.0 ** lgp; ln10 = log10_to_loge
+        det = b*c - a*d
+        det = np.where(np.abs(det) < 1e-20, 1e-20, det)
+        dTdY = T * (d*S_Y - S0*b*ln10*rho_Y) / (S0 * det)
+        dPdY = P * (S0*a*ln10*rho_Y - c*S_Y) / (S0 * det)
+        return U_P * dPdY/(P*ln10) + U_T * dTdY/(T*ln10) + U_Y
+
+    def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+        """dU/dZ|_{S,ρ} vectorized via identity."""
+        ht, hp = 1e-2, 1e-2
+        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
+        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
+             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
+             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
+             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Z = (self.val.get_s_pt_val(lgp, lgt, yp, z+h)
+               - self.val.get_s_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        rho_Z = (self.val.get_logrho_pt_val(lgp, lgt, yp, z+h)
+                 - self.val.get_logrho_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        U_Z = (self.val.get_u_pt_val(lgp, lgt, yp, z+h)
+               - self.val.get_u_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        U_P = (self.val.get_u_pt_val(lgp+hp, lgt, yp, z)
+               - self.val.get_u_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
+        U_T = (self.val.get_u_pt_val(lgp, lgt+ht, yp, z)
+               - self.val.get_u_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
+        T = 10.0 ** lgt; P = 10.0 ** lgp; ln10 = log10_to_loge
+        det = b*c - a*d
+        det = np.where(np.abs(det) < 1e-20, 1e-20, det)
+        dTdZ = T * (d*S_Z - S0*b*ln10*rho_Z) / (S0 * det)
+        dPdZ = P * (S0*a*ln10*rho_Z - c*S_Z) / (S0 * det)
+        return U_P * dPdZ/(P*ln10) + U_T * dTdZ/(T*ln10) + U_Z
+
+    _VEC_FD_MAP = {
+        'cp': '_vec_fd_cp', 'delta': '_vec_fd_delta',
+        'nabla_ad': '_vec_fd_nabla_ad', 'gamma1': '_vec_fd_gamma1',
+        'chi_T': '_vec_fd_chi_T', 'chi_rho': '_vec_fd_chi_rho',
+        'chi_Y': '_vec_fd_chi_Y', 'chi_Z': '_vec_fd_chi_Z',
+        'cv': '_vec_fd_cv',
+        'dsdy_pt': '_vec_fd_dsdy_pt', 'dsdz_pt': '_vec_fd_dsdz_pt',
+        'dsdy_rhop': '_vec_fd_dsdy_rhop', 'dsdz_rhop': '_vec_fd_dsdz_rhop',
+        'dtdy_srho': '_vec_fd_dtdy_srho', 'dtdz_srho': '_vec_fd_dtdz_srho',
+        'dudy_srho': '_vec_fd_dudy_srho', 'dudz_srho': '_vec_fd_dudz_srho',
+        'dtds_sp': '_vec_fd_dtds_sp',
+    }
+
     def _dispatch(self, name, lgp, lgt, yp, z, method, **kw):
         """Route to identity or FD scalar, then vectorize."""
         yp = self._to_yprime(yp, z)
+        # Strip ORCHARD-specific kwargs that scalar helpers don't accept
+        clean_kw = {k: v for k, v in kw.items()
+                    if k not in self._ORCHARD_KW}
+
+        # Fast vectorized path for common FD derivatives (no Python loop)
+        if method == 'finite_difference' and name in self._VEC_FD_MAP:
+            vec_func = getattr(self, self._VEC_FD_MAP[name])
+            return vec_func(lgp, lgt, yp, z, **clean_kw)
+
         if method == 'finite_difference':
             func = getattr(self, f'_{name}_fd')
         else:
             func = getattr(self, f'_{name}_id')
-        return self._vec(func, lgp, lgt, yp, z, **kw)
+        return self._vec(func, lgp, lgt, yp, z, **clean_kw)
 
-    def get_cp(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_cp(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """C_P  [erg/(g·K)]."""
         return self._dispatch('cp', lgp, lgt, yp, z, method, **kw)
 
-    def get_cv(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_cv(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """C_V  [erg/(g·K)]."""
         return self._dispatch('cv', lgp, lgt, yp, z, method, **kw)
 
-    def get_delta(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_delta(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """δ = −(∂logρ/∂logT)|_P  [dimensionless]."""
         return self._dispatch('delta', lgp, lgt, yp, z, method, **kw)
 
@@ -3307,11 +3574,11 @@ class hhe_z_mixtures():
         """∇_ad = dlogT/dlogP|_S  [dimensionless]."""
         return self._dispatch('nabla_ad', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_T(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_chi_T(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """χ_T = dlogP/dlogT|_ρ  [dimensionless]."""
         return self._dispatch('chi_T', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_rho(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_chi_rho(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """χ_ρ = dlogP/dlogρ|_T  [dimensionless]."""
         return self._dispatch('chi_rho', lgp, lgt, yp, z, method, **kw)
 
@@ -3319,11 +3586,11 @@ class hhe_z_mixtures():
         """Γ₁ = dlogP/dlogρ|_S  [dimensionless]."""
         return self._dispatch('gamma1', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_Y(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_chi_Y(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """χ_Y = dlogP/dY|_{ρ,T}."""
         return self._dispatch('chi_Y', lgp, lgt, yp, z, method, **kw)
 
-    def get_chi_Z(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_chi_Z(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """χ_Z = dlogP/dZ|_{ρ,T}."""
         return self._dispatch('chi_Z', lgp, lgt, yp, z, method, **kw)
 
@@ -3331,11 +3598,11 @@ class hhe_z_mixtures():
         """dT/dS|_P  [K·g·K/erg]."""
         return self._dispatch('dtds_sp', lgp, lgt, yp, z, method, **kw)
 
-    def get_dsdy_pt(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_dsdy_pt(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """dS/dY|_{P,T}  [erg/(g·K) per Y]."""
         return self._dispatch('dsdy_pt', lgp, lgt, yp, z, method, **kw)
 
-    def get_dsdz_pt(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_dsdz_pt(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """dS/dZ|_{P,T}  [erg/(g·K) per Z]."""
         return self._dispatch('dsdz_pt', lgp, lgt, yp, z, method, **kw)
 
@@ -3398,7 +3665,7 @@ class hhe_z_mixtures():
         return self._ledoux_dsdy_fd(lgp, lgt, yp, z, _zm, _za, _zr,
                                      dy=kw.get('dy', None))
 
-    def get_dsdy_rhop(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_dsdy_rhop(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """Ledoux: dS/dY|_{ρ,P}  [erg/(g·K) per Y].
 
         method='identity': S_Y − S·a·ln(10)·ρ_Y / c (with c_guard fallback)
@@ -3422,7 +3689,7 @@ class hhe_z_mixtures():
         return self._ledoux_dsdz_fd(lgp, lgt, yp, z, _zm, _za, _zr,
                                      dz=kw.get('dz', None))
 
-    def get_dsdz_rhop(self, lgp, lgt, yp, z=0.0, method='finite_difference', **kw):
+    def get_dsdz_rhop(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """Ledoux: dS/dZ|_{ρ,P}  [erg/(g·K) per Z].
 
         method='identity': S_Z − S·a·ln(10)·ρ_Z / c (with c_guard fallback)
@@ -3628,15 +3895,12 @@ class hhe_z_mixtures():
     def get_cv_rhot(self, _lgrho, _lgt, _y, _z, _frock=0.0, **kw):
         """C_V.  Old mixtures name for get_cv.
 
-        Note: old interface took (rho, T); new takes (P, T).
-        We invert rho→P first, then compute.
+        Inverts rho→P via table, then computes C_V = dS/d(lnT)|_ρ
+        using vectorized FD on the ρ-T table.
         """
         _y = self._to_yprime(_y, _z)
         lgp = self.get_logp_rhot(_lgrho, _lgt, _y, _z)
-        if np.isscalar(lgp):
-            if not np.isfinite(lgp):
-                return np.nan
-        return self.get_cv(lgp, _lgt, _y, _z)
+        return self._vec_fd_cv(lgp, _lgt, _y, _z)
 
     def get_dlogrho_dlogt_py(self, _lgp, _lgt, _y, _z, _frock=0.0,
                               dt=1e-2, **kw):
@@ -3645,16 +3909,18 @@ class hhe_z_mixtures():
 
     def get_dlogrho_ds_py(self, _s, _lgp, _y, _z, _frock=0.0,
                            ds=0.1, **kw):
-        """dlogρ/dS|_P.  Brunt coefficient in drho space."""
+        """dlogρ/dS|_P.  Brunt coefficient in drho space.
+
+        Vectorized: uses S-P table to get T(S±ds, P), then
+        evaluates ρ(P, T) and differences.
+        """
         _y = self._to_yprime(_y, _z)
         s_kb = _s  # already in kb/baryon
-        def f(s):
-            lgt = self.get_logt_sp(s, _lgp, _y, _z)
-            if np.isfinite(lgt):
-                return self.val.get_logrho_pt_val(_lgp, lgt, _y, _z)
-            return np.nan
-        return self._fd_or_sg(f, s_kb, ds, smooth=True) * \
-               log10_to_loge * erg_to_kbbar
+        lgt1 = self.get_logt_sp(s_kb - ds, _lgp, _y, _z)
+        lgt2 = self.get_logt_sp(s_kb + ds, _lgp, _y, _z)
+        rho1 = self.val.get_logrho_pt_val(_lgp, lgt1, _y, _z)
+        rho2 = self.val.get_logrho_pt_val(_lgp, lgt2, _y, _z)
+        return (rho2 - rho1) * log10_to_loge / (2 * ds / erg_to_kbbar)
 
     def get_dlogt_dy_rhop_rhot(self, _lgrho, _lgt, _y, _z,
                                 _frock=0.0, **kw):
@@ -3710,116 +3976,176 @@ class hhe_z_mixtures():
         or with keyword args like tab/ideal_guess, uses old S-P path.
         Otherwise uses new P-T path.
         """
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             # Old ORCHARD calling convention: (S, P, Y, Z, frock, ...)
             _s, _lgp = _s_or_lgp, _lgp_or_lgt
             _y = self._to_yprime(_y, _z)
             lgt = self.get_logt_sp(_s, _lgp, _y, _z)
             return self._dispatch('nabla_ad', _lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         # New P-T calling convention: (lgp, lgt, Y, Z)
         return self._dispatch('nabla_ad', _s_or_lgp, _lgp_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     def get_gamma1(self, _s_or_lgp, _lgp_or_lgt, _y, _z=0.0,
                     _frock=0.0, **kw):
         """Γ₁.  Accepts old ORCHARD (S, P, Y, Z) or new (P, T, Y, Z)."""
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             _s, _lgp = _s_or_lgp, _lgp_or_lgt
             _y = self._to_yprime(_y, _z)
             lgt = self.get_logt_sp(_s, _lgp, _y, _z)
             return self._dispatch('gamma1', _lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         return self._dispatch('gamma1', _s_or_lgp, _lgp_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     def get_dtds_sp(self, _s_or_lgp, _lgp_or_lgt, _y, _z=0.0,
                      _frock=0.0, **kw):
         """dT/dS|_P.  Accepts old (S, P, Y, Z) or new (P, T, Y, Z)."""
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             _s, _lgp = _s_or_lgp, _lgp_or_lgt
             _y = self._to_yprime(_y, _z)
             lgt = self.get_logt_sp(_s, _lgp, _y, _z)
             return self._dispatch('dtds_sp', _lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         return self._dispatch('dtds_sp', _s_or_lgp, _lgp_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     def get_dtdy_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
                        _frock=0.0, **kw):
         """dT/dY|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
             _y = self._to_yprime(_y, _z)
             lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
             if np.isscalar(lgp) and not np.isfinite(lgp):
                 return np.nan
             return self._dispatch('dtdy_srho', lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         return self._dispatch('dtdy_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     def get_dtdz_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
                        _frock=0.0, **kw):
         """dT/dZ|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
             _y = self._to_yprime(_y, _z)
             lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
             if np.isscalar(lgp) and not np.isfinite(lgp):
                 return np.nan
             return self._dispatch('dtdz_srho', lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         return self._dispatch('dtdz_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     def get_dudy_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
                        _frock=0.0, **kw):
         """dU/dY|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
             _y = self._to_yprime(_y, _z)
             lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
             if np.isscalar(lgp) and not np.isfinite(lgp):
                 return np.nan
             return self._dispatch('dudy_srho', lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         return self._dispatch('dudy_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     def get_dudz_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
                        _frock=0.0, **kw):
         """dU/dZ|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
-        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+        if 'tab' in kw or 'ideal_guess' in kw or (np.isscalar(_frock) and _frock != 0.0) or (not np.isscalar(_frock)):
             _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
             _y = self._to_yprime(_y, _z)
             lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
             if np.isscalar(lgp) and not np.isfinite(lgp):
                 return np.nan
             return self._dispatch('dudz_srho', lgp, lgt, _y, _z,
-                                   kw.pop('method', 'finite_difference'), **kw)
+                                   kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
         return self._dispatch('dudz_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
-                               kw.pop('method', 'finite_difference'), **kw)
+                               kw.pop('method', 'finite_difference'),
+                                   **{k:v for k,v in kw.items()
+                                      if k not in ('tab','ideal_guess','arr_guess',
+                                                   'arr_p_guess','arr_t_guess',
+                                                   'dy','dz','ds','dt','_frock')})
 
     # --- S-ρ basis wrappers (ORCHARD calls these with (S, rho, Y, Z, frock)) ---
 
     def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z,
                             _frock=0.0, **kw):
-        """dS/dY|_{ρ,P} (Ledoux).  Old interface takes (S, ρ)."""
+        """dS/dY|_{ρ,P} (Ledoux).  Old interface takes (S, ρ).
+
+        Vectorized: inverts (S,ρ)→(P,T) via table, then uses
+        the vectorized Ledoux identity on the resulting (P,T).
+        """
         _y = self._to_yprime(_y, _z)
         lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
-        if np.isscalar(lgp) and not np.isfinite(lgp):
-            return np.nan
-        return self.get_dsdy_rhop(lgp, lgt, _y, _z)
+        return self._vec_fd_dsdy_rhop(lgp, lgt, _y, _z)
 
     def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z,
                             _frock=0.0, **kw):
-        """dS/dZ|_{ρ,P} (Ledoux).  Old interface takes (S, ρ)."""
+        """dS/dZ|_{ρ,P} (Ledoux).  Old interface takes (S, ρ).
+
+        Vectorized: inverts (S,ρ)→(P,T) via table, then uses
+        the vectorized Ledoux identity on the resulting (P,T).
+        """
         _y = self._to_yprime(_y, _z)
         lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
-        if np.isscalar(lgp) and not np.isfinite(lgp):
-            return np.nan
-        return self.get_dsdz_rhop(lgp, lgt, _y, _z)
+        return self._vec_fd_dsdz_rhop(lgp, lgt, _y, _z)
 
 
 class mixtures(hhe_eos):

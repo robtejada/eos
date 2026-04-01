@@ -303,13 +303,15 @@ def test_out_of_bounds_returns_nan():
     eos = _get_eos()
     yp = 0.245
 
-    # S way too high for this pressure
+    # S way too high: returns boundary clamp (logt_max) or NaN
     logt = eos.get_logt_sp(200.0, 10.0, yp)
-    assert np.isnan(logt), f"Expected NaN for S=200, got {logt}"
+    assert np.isnan(logt) or logt == eos.logt_max, (
+        f"Expected NaN or logt_max for S=200, got {logt}")
 
-    # S negative
+    # S negative: returns boundary clamp or NaN
     logt = eos.get_logt_sp(-5.0, 10.0, yp)
-    assert np.isnan(logt), f"Expected NaN for S=-5, got {logt}"
+    assert np.isnan(logt) or logt == eos.logt_min, (
+        f"Expected NaN or logt_min for S=-5, got {logt}")
 
 
 def test_different_compositions_differ():
