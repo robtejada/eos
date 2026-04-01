@@ -3526,6 +3526,126 @@ class hhe_z_mixtures():
         """Return (S_lo, S_hi) in kb/baryon at the given logP."""
         return self._get_bounds(_lgp)
 
+    # =================================================================
+    # ORCHARD compatibility aliases
+    # =================================================================
+    # The old `mixtures` class uses different method names and passes
+    # extra kwargs (frock, ideal_guess, arr_guess, tab) that are
+    # ignored here. These aliases let ORCHARD call hhe_z_mixtures
+    # as a drop-in replacement.
+
+    def adaptive_dx(self, x, dx0=0.01):
+        """Alias for _adaptive_dx (old mixtures interface)."""
+        return self._adaptive_dx(x, dx0)
+
+    def get_s_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
+        """S(P, T, Y, Z) in erg/(g·K).  Alias for val.get_s_pt_val."""
+        _y = self._to_yprime(_y, _z)
+        return self.val.get_s_pt_val(_lgp, _lgt, _y, _z)
+
+    def get_logrho_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
+        """log10 rho(P, T, Y, Z).  Alias for val.get_logrho_pt_val."""
+        _y = self._to_yprime(_y, _z)
+        return self.val.get_logrho_pt_val(_lgp, _lgt, _y, _z)
+
+    def get_logu_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
+        """log10 U(P, T, Y, Z).  Returns log10(erg/g)."""
+        _y = self._to_yprime(_y, _z)
+        return np.log10(self.val.get_u_pt_val(_lgp, _lgt, _y, _z))
+
+    # --- Derivative aliases (old names → new names) ---
+
+    def get_cp_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
+        """C_P.  Old mixtures name for get_cp."""
+        return self.get_cp(_lgp, _lgt, _y, _z)
+
+    def get_cv_rhot(self, _lgrho, _lgt, _y, _z, _frock=0.0, **kw):
+        """C_V.  Old mixtures name for get_cv.
+
+        Note: old interface took (rho, T); new takes (P, T).
+        We invert rho→P first, then compute.
+        """
+        _y = self._to_yprime(_y, _z)
+        lgp = self.get_logp_rhot(_lgrho, _lgt, _y, _z)
+        if np.isscalar(lgp):
+            if not np.isfinite(lgp):
+                return np.nan
+        return self.get_cv(lgp, _lgt, _y, _z)
+
+    def get_dlogrho_dlogt_py(self, _lgp, _lgt, _y, _z, _frock=0.0,
+                              dt=1e-2, **kw):
+        """dlogρ/dlogT|_P (= −δ).  Old mixtures convention."""
+        return -self.get_delta(_lgp, _lgt, _y, _z)
+
+    def get_dlogrho_ds_py(self, _s, _lgp, _y, _z, _frock=0.0,
+                           ds=0.1, **kw):
+        """dlogρ/dS|_P.  Brunt coefficient in drho space."""
+        _y = self._to_yprime(_y, _z)
+        s_kb = _s  # already in kb/baryon
+        def f(s):
+            lgt = self.get_logt_sp(s, _lgp, _y, _z)
+            if np.isfinite(lgt):
+                return self.val.get_logrho_pt_val(_lgp, lgt, _y, _z)
+            return np.nan
+        return self._fd_or_sg(f, s_kb, ds, smooth=True) * \
+               log10_to_loge * erg_to_kbbar
+
+    def get_dlogt_dy_rhop_rhot(self, _lgrho, _lgt, _y, _z,
+                                _frock=0.0, **kw):
+        """dlogT/dY|_{ρ,P} = χ_Y / χ_T.  Old mixtures interface."""
+        _y = self._to_yprime(_y, _z)
+        lgp = self.get_logp_rhot(_lgrho, _lgt, _y, _z)
+        if np.isscalar(lgp) and not np.isfinite(lgp):
+            return np.nan
+        chi_y = self.get_chi_Y(lgp, _lgt, _y, _z)
+        chi_t = self.get_chi_T(lgp, _lgt, _y, _z)
+        if np.isscalar(chi_t) and abs(chi_t) < 1e-30:
+            return np.nan
+        return chi_y / chi_t
+
+    def get_dlogt_dz_rhop_rhot(self, _lgrho, _lgt, _y, _z,
+                                _frock=0.0, **kw):
+        """dlogT/dZ|_{ρ,P} = χ_Z / χ_T.  Old mixtures interface."""
+        _y = self._to_yprime(_y, _z)
+        lgp = self.get_logp_rhot(_lgrho, _lgt, _y, _z)
+        if np.isscalar(lgp) and not np.isfinite(lgp):
+            return np.nan
+        chi_z = self.get_chi_Z(lgp, _lgt, _y, _z)
+        chi_t = self.get_chi_T(lgp, _lgt, _y, _z)
+        if np.isscalar(chi_t) and abs(chi_t) < 1e-30:
+            return np.nan
+        return chi_z / chi_t
+
+    def get_dpdt_rhot_rhoy(self, _lgrho, _lgt, _y, _z,
+                            _frock=0.0, **kw):
+        """dP/dT|_{ρ,Y} in dyn/cm²/K.  Old mixtures interface."""
+        _y = self._to_yprime(_y, _z)
+        lgp = self.get_logp_rhot(_lgrho, _lgt, _y, _z)
+        if np.isscalar(lgp) and not np.isfinite(lgp):
+            return np.nan
+        chi_t = self.get_chi_T(lgp, _lgt, _y, _z)
+        P = 10.0 ** lgp
+        T = 10.0 ** _lgt
+        return chi_t * P / T
+
+    def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z,
+                            _frock=0.0, **kw):
+        """dS/dY|_{ρ,P} (Ledoux).  Old interface takes (S, ρ)."""
+        _y = self._to_yprime(_y, _z)
+        lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
+        if np.isscalar(lgp) and not np.isfinite(lgp):
+            return np.nan
+        return self.get_dsdy_rhop(lgp, lgt, _y, _z)
+
+    def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z,
+                            _frock=0.0, **kw):
+        """dS/dZ|_{ρ,P} (Ledoux).  Old interface takes (S, ρ)."""
+        _y = self._to_yprime(_y, _z)
+        lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
+        if np.isscalar(lgp) and not np.isfinite(lgp):
+            return np.nan
+        return self.get_dsdz_rhop(lgp, lgt, _y, _z)
+
 
 class mixtures(hhe_eos):
     def __init__(self, hhe_eos,
