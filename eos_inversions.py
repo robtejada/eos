@@ -46,8 +46,8 @@ DEFAULTS = {
     'logp_lo':    5.0, # 0.1 bar
     'logp_hi':    15.0, # 1000 Mbar
     'logp_step':  0.05,
-    'logt_lo':    2.0,
-    'logt_hi':    6.0,
+    'logt_lo':    1.0,
+    'logt_hi':    7.0,
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -8.0,
@@ -179,12 +179,17 @@ def main():
     nxi = args.n_xi
     bytes_per_f32 = 4
 
-    if args.basis == 'sp':
+    nT = len(np.arange(args.logt_lo, args.logt_hi + 0.01, args.logp_step))
+
+    if args.basis == 'pt':
+        n_cells = nP * nT * nY * nZ
+        n_arrays = 3   # s_pt, logrho_pt, logu_pt
+        bounds_cells = 0
+    elif args.basis == 'sp':
         n_cells = nxi * nP * nY * nZ
         n_arrays = 1   # logt_sp only
         bounds_cells = nP * nY * nZ * 2   # s_lo + s_hi
     elif args.basis == 'rhot':
-        nT = len(np.arange(args.logt_lo, args.logt_hi + 0.01, args.logp_step))
         n_cells = nxi * nT * nY * nZ
         n_arrays = 1   # logp_rhot only
         bounds_cells = nT * nY * nZ * 2  # rho_lo + rho_hi

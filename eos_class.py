@@ -9,7 +9,7 @@ from tqdm import tqdm
 from numba import njit
 from eos import ideal_eos, metals_eos, ice_eos
 from eos import ideal_eos, metals_eos, scvh_eos
-from eos.smooth import smooth_eos_table
+from eos.smooth import smooth_eos_table, hampel_filter_1d
 from scipy.optimize import root, newton, brentq, brenth, minimize, least_squares
 from scipy.ndimage import gaussian_filter1d, gaussian_filter
 from astropy.constants import k_B
@@ -890,15 +890,54 @@ class hhe_z_mixtures():
     entropy domain onto a rectangular grid using a normalised entropy
     coordinate xi in [0, 1].
 
-    At each (P, Y', Z, metal fractions), the physical entropy spans
-    [S_lo(P), S_hi(P)] where the bounds come from evaluating
-    ``val_mixtures.get_s_pt_val`` at the temperature boundaries of
-    the underlying P-T table.  A normalised coordinate
+    Pipeline overview
+    -----------------
+    1. **Raw tables** — ``hhe_eos`` and ``z_eos`` load raw EOS data
+       (CD21 or CMS19 for H-He; AQUA, CH4, etc. for Z species).
 
-        xi = (S - S_lo) / (S_hi - S_lo)
+    2. **Per-component smoothing** — If ``smooth_hhe=True`` /
+       ``smooth_z=True``, per-component tables are smoothed
+       *before* combining (see ``eos.smooth.smooth_eos_table``).
+       This is important because the raw CD21/CMS19 and AQUA tables
+       contain non-physical kinks from table construction artifacts.
 
-    maps this rhomboid into a rectangle suitable for
-    ``RegularGridInterpolator``.
+    3. **Volume Addition Law** — ``val_mixtures`` combines the H-He
+       and Z EOSes via ``1/v = (1-Z)/v_HHe + Z/v_Z`` to produce
+       thermodynamic quantities (S, rho, U) at arbitrary (P, T, Y', Z).
+
+    4. **P-T table** — A 4-D S(P, T, Y', Z) table is pre-computed
+       from the forward model.  This avoids repeated calls to
+       ``val_mixtures`` during inversions.
+
+    5. **S bounds** — At each (P, Y', Z), evaluate the forward model
+       at T_min and T_max to get S_lo(P, Y', Z) and S_hi(P, Y', Z).
+       These bounds define the physical entropy range.  They are
+       smoothed along the P axis (Hampel + Gaussian) to suppress
+       spikes from AQUA phase transitions (ionization/dissociation
+       at high T) that would otherwise cause severe kinks in the
+       xi mapping.  A 2% margin is added after smoothing so that
+       brentq never fails at the boundaries.
+
+    6. **xi mapping** — The normalised coordinate
+
+           xi = (S - S_lo) / (S_hi - S_lo)
+
+       maps the trapezoidal S(P) domain to a unit rectangle.  This
+       allows ``RegularGridInterpolator`` to operate on a regular
+       4-D grid (xi, P, Y', Z).
+
+    7. **S-P table** — ``build_sp_table`` uses brentq to solve
+       S(P, T) = S_target at each (xi, P, Y', Z) grid point, storing
+       logT(xi, P, Y', Z).  NaN cells are repaired via interpolation.
+
+    8. **Query** — ``get_logt_sp`` first tries the RGI table.  To
+       avoid cross-Z xi mismatch (where the same xi maps to different
+       physical S at different Z grid points), the lookup brackets
+       the query Z between the two nearest grid points, computes xi
+       at each grid Z separately, and linearly interpolates the
+       resulting logT.  Points where xi is out of bounds (> 1.05 or
+       < -0.05) are returned as NaN, triggering a per-point brentq
+       fallback in ``get_logt_sp``.
 
     Parameters
     ----------
@@ -1448,6 +1487,18 @@ class hhe_z_mixtures():
         Stores 3-D arrays and builds RGI interpolators over
         (logP, Y', Z).
 
+        After computing raw S_lo and S_hi from the forward model at
+        T_min and T_max, the bounds are smoothed along the P axis
+        at each (Y', Z) slice.  This is critical because the AQUA
+        water EOS has ionization/dissociation entropy spikes at high
+        T that can cause S_hi(P) to swing by >10x over a narrow P
+        range.  Without smoothing, the xi mapping produces kinked
+        isentropes (confirmed: up to 0.9 dex logT jumps at Z=0.9).
+
+        A 2% margin is added to the smoothed bounds so that brentq
+        does not fail at ξ near 0 or 1 where smoothing may have
+        shifted the bound past the true T_min/T_max entropy.
+
         Parameters
         ----------
         yvals : 1-D array of Y' values
@@ -1483,6 +1534,31 @@ class hhe_z_mixtures():
                     s_hi_3d[ip, iy, iz] = max(s_cold, s_hot)
         pbar.close()
 
+        # Smooth S bounds along the P axis to remove spikes from AQUA
+        # phase transitions (ionization/dissociation at high T).
+        # Without this, S_hi(P) can swing by 16x over 0.5 dex in logP,
+        # causing the xi mapping to produce kinked isentropes.
+        # Hampel filter removes outlier spikes; Gaussian smooths residual
+        # roughness.  Must be done BEFORE building the SP table so that
+        # brentq solves at the smoothed physical S values.
+        for iy_i in range(nY):
+            for iz_i in range(nZ):
+                s_hi_3d[:, iy_i, iz_i], _ = hampel_filter_1d(
+                    s_hi_3d[:, iy_i, iz_i], window=10, n_sigma=3.0)
+                s_hi_3d[:, iy_i, iz_i] = gaussian_filter1d(
+                    s_hi_3d[:, iy_i, iz_i], sigma=5.0)
+                s_lo_3d[:, iy_i, iz_i], _ = hampel_filter_1d(
+                    s_lo_3d[:, iy_i, iz_i], window=10, n_sigma=3.0)
+                s_lo_3d[:, iy_i, iz_i] = gaussian_filter1d(
+                    s_lo_3d[:, iy_i, iz_i], sigma=5.0)
+
+        # Pad bounds by 2% so brentq doesn't fail at boundaries where
+        # smoothing may have pushed S_lo above the true minimum or
+        # S_hi below the true maximum.
+        margin = 0.02 * (s_hi_3d - s_lo_3d)
+        s_lo_3d -= margin
+        s_hi_3d += margin
+
         self._s_lo = s_lo_3d
         self._s_hi = s_hi_3d
 
@@ -1500,7 +1576,10 @@ class hhe_z_mixtures():
     def s_to_xi(self, _s_kb, _lgp, _yp=None, _z=None):
         """Convert physical entropy (kb/baryon) → normalised ξ ∈ [0,1].
 
-        Uses the stored S bounds.  Works for scalar or array inputs.
+        Uses the stored (and smoothed) S bounds.  Works for scalar or
+        array inputs.  ξ < 0 or ξ > 1 means S is outside the range
+        covered by the table at that (P, Y', Z); this triggers brentq
+        fallback at query time.
         """
         s_lo, s_hi = self._get_bounds(_lgp, _yp, _z)
         denom = s_hi - s_lo
@@ -1738,7 +1817,13 @@ class hhe_z_mixtures():
     # =================================================================
 
     def _lookup_sp_table(self, _s_kb, _lgp, _yp, _z, rgi):
-        """Query a pre-computed (ξ, logP, Y', Z) RGI table."""
+        """Query a pre-computed (ξ, logP, Y', Z) RGI table.
+
+        To avoid cross-Z ξ mismatch, this brackets the query Z between
+        the two nearest grid points, computes the correct ξ at each
+        grid Z (so that both correspond to the same physical S), looks
+        up logT at each, and linearly interpolates in Z.
+        """
         _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
         _lgp  = np.atleast_1d(np.asarray(_lgp, dtype=float))
         _yp_a = np.atleast_1d(np.asarray(_yp, dtype=float))
@@ -1746,17 +1831,46 @@ class hhe_z_mixtures():
         _s_kb, _lgp, _yp_a, _z_a = np.broadcast_arrays(
             _s_kb, _lgp, _yp_a, _z_a)
 
-        xi = self.s_to_xi(_s_kb, _lgp, _yp_a, _z_a)
+        zg = self._zvals  # Z grid points
+        flat = _z_a.ravel()
 
-        # Clamp xi to [0, 1] and let the RGI extrapolate at the
-        # boundaries.  NaN xi (from NaN bounds at extreme P) is
-        # clamped to 0.5 — the RGI will return the nearest valid
-        # table value, which is better than NaN.
-        xi = np.where(np.isfinite(xi), np.clip(xi, 0.0, 1.0), 0.5)
+        # Bracket: find k such that zg[k] <= Z < zg[k+1]
+        k = np.searchsorted(zg, flat, side='right') - 1
+        k = np.clip(k, 0, len(zg) - 2)
+        z_lo = zg[k]
+        z_hi = zg[k + 1]
+        dz = z_hi - z_lo
+        dz[dz == 0] = 1.0  # guard (shouldn't happen)
+        w = ((flat - z_lo) / dz).reshape(_z_a.shape)
 
-        pts = np.column_stack((xi.ravel(), _lgp.ravel(),
-                               _yp_a.ravel(), _z_a.ravel()))
-        out = rgi(pts).reshape(xi.shape)
+        # Compute ξ at each bracket Z using the S bounds at that Z
+        z_lo_arr = z_lo.reshape(_z_a.shape)
+        z_hi_arr = z_hi.reshape(_z_a.shape)
+
+        xi_lo = self.s_to_xi(_s_kb, _lgp, _yp_a, z_lo_arr)
+        xi_hi = self.s_to_xi(_s_kb, _lgp, _yp_a, z_hi_arr)
+
+        # Out-of-bounds check on BOTH bracket ξ values
+        oob_lo = (xi_lo < -0.05) | (xi_lo > 1.05) | ~np.isfinite(xi_lo)
+        oob_hi = (xi_hi < -0.05) | (xi_hi > 1.05) | ~np.isfinite(xi_hi)
+        out_of_bounds = oob_lo | oob_hi
+
+        xi_lo = np.where(np.isfinite(xi_lo), np.clip(xi_lo, 0.0, 1.0), 0.5)
+        xi_hi = np.where(np.isfinite(xi_hi), np.clip(xi_hi, 0.0, 1.0), 0.5)
+
+        # Query RGI at each bracket Z (ξ, P, Y', Z_grid)
+        pts_lo = np.column_stack((xi_lo.ravel(), _lgp.ravel(),
+                                  _yp_a.ravel(), z_lo_arr.ravel()))
+        pts_hi = np.column_stack((xi_hi.ravel(), _lgp.ravel(),
+                                  _yp_a.ravel(), z_hi_arr.ravel()))
+        val_lo = rgi(pts_lo).reshape(_z_a.shape)
+        val_hi = rgi(pts_hi).reshape(_z_a.shape)
+
+        # Linear interpolation in Z
+        out = (1.0 - w) * val_lo + w * val_hi
+
+        # Force NaN for out-of-bounds points → triggers brentq fallback
+        out[out_of_bounds] = np.nan
 
         if out.size == 1:
             return out.item()

@@ -417,7 +417,22 @@ def replace_outlier_isotherms(grid_2d, logt_1d, logp_1d,
 
 
 def smooth_eos_table(grids, logt_1d, logp_1d):
-    """Apply all smoothing strategies to a set of EOS grids.
+    """Apply all smoothing strategies to a **per-component** EOS grid.
+
+    This operates on a single component (e.g., one H-He table or one
+    AQUA Z table) in the (T, P) plane.  It is called *before* the
+    Volume Addition Law combines the components, so it only sees
+    one species' raw table.  The goal is to remove table-construction
+    artifacts (outlier isotherms, low-P extrapolation noise, PPT
+    discontinuities, ionization/dissociation kinks) that would
+    otherwise propagate into the combined EOS and its inversions.
+
+    Note: This does NOT smooth the S bounds used by the xi mapping
+    in ``hhe_z_mixtures``.  Those bounds are smoothed separately in
+    ``compute_s_bounds_grid`` after evaluating the combined forward
+    model, because the AQUA phase-transition entropy spikes that
+    affect S_hi(P) only manifest in the VAL-combined entropy, not
+    in the per-component tables.
 
     Parameters
     ----------
