@@ -1242,7 +1242,7 @@ class hhe_z_mixtures():
         return min(s_cold, s_hot), max(s_cold, s_hot)
 
     def get_logt_sp(self, _s_kb, _lgp, _yp, _z=0.0,
-                    _zm=0.0, _za=0.0, _zr=0.0):
+                    _zm=0.0, _za=0.0, _zr=0.0, **kw):
         """Temperature from (S, P) via root-finding on the forward model.
 
         Works immediately — no need to call ``compute_s_bounds`` first.
@@ -1270,9 +1270,60 @@ class hhe_z_mixtures():
         """
         _yp = self._to_yprime(_yp, _z)
         # --- Fast path: pre-computed table ---
+        # If the table returns NaN (out-of-bounds or bounds are NaN),
+        # fall through to the slow path for those points.
         if self._logt_sp_rgi is not None:
-            return self._lookup_sp_table(
+            result = self._lookup_sp_table(
                 _s_kb, _lgp, _yp, _z, self._logt_sp_rgi)
+            # If all finite, return immediately
+            result_arr = np.atleast_1d(result)
+            if np.all(np.isfinite(result_arr)):
+                return result
+            # Otherwise, fill NaN entries via brentq below
+            if np.isscalar(_s_kb) and np.isscalar(_lgp):
+                pass  # single NaN → fall through to slow path
+            else:
+                # Array: fill only the NaN entries via brentq
+                _s_arr = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+                _p_arr = np.atleast_1d(np.asarray(_lgp, dtype=float))
+                _yp_arr = np.atleast_1d(np.asarray(_yp, dtype=float))
+                _z_arr = np.atleast_1d(np.asarray(_z, dtype=float))
+                _s_arr, _p_arr, _yp_arr, _z_arr = np.broadcast_arrays(
+                    _s_arr, _p_arr, _yp_arr, _z_arr)
+                out = result_arr.copy()
+                bad = ~np.isfinite(out)
+                _zm_s = float(np.atleast_1d(_zm).ravel()[0])
+                _za_s = float(np.atleast_1d(_za).ravel()[0])
+                _zr_s = float(np.atleast_1d(_zr).ravel()[0])
+                if bad.any():
+                    for idx in np.where(bad.ravel())[0]:
+                        s_i = float(_s_arr.ravel()[idx])
+                        p_i = float(_p_arr.ravel()[idx])
+                        yp_i = float(_yp_arr.ravel()[idx])
+                        z_i = float(_z_arr.ravel()[idx])
+                        def err(lgt, _s=s_i, _p=p_i, _y=yp_i, _zv=z_i):
+                            try:
+                                s_test = self.val.get_s_pt_val(
+                                    _p, lgt, _y, _zv, _zm_s, _za_s, _zr_s)
+                                return s_test * erg_to_kbbar - _s
+                            except (ZeroDivisionError, FloatingPointError):
+                                return 1e30
+                        lo, hi = self.logt_min, self.logt_max
+                        err_lo = err(lo)
+                        if err_lo > 1e20 or not np.isfinite(err_lo):
+                            for t_try in np.arange(lo + 0.1, hi, 0.1):
+                                e = err(t_try)
+                                if np.isfinite(e) and e < 1e20:
+                                    lo = t_try
+                                    break
+                        try:
+                            out.ravel()[idx] = brentq(
+                                err, lo, hi,
+                                xtol=1e-6, maxiter=100)
+                        except (ValueError, RuntimeError,
+                                ZeroDivisionError):
+                            pass
+                return out.reshape(result_arr.shape)
 
         # --- Slow path: per-point root-finding ---
         # No rhomboid bounds check here — brentq tries the full
@@ -1301,8 +1352,23 @@ class hhe_z_mixtures():
                 except (ZeroDivisionError, FloatingPointError):
                     return 1e30
 
+            # Find a valid bracket: scan from logt_min upward to find
+            # where the error function first becomes finite and negative
+            # (S_model < S_target), then bracket with logt_max.
+            lo, hi = self.logt_min, self.logt_max
+            err_lo = err(lo)
+            err_hi = err(hi)
+            # If lo is invalid (NaN region), scan upward
+            if err_lo > 1e20 or not np.isfinite(err_lo):
+                for t_try in np.arange(lo + 0.1, hi, 0.1):
+                    e = err(t_try)
+                    if np.isfinite(e) and e < 1e20:
+                        lo = t_try
+                        err_lo = e
+                        break
+
             try:
-                logt_sol = brentq(err, self.logt_min, self.logt_max,
+                logt_sol = brentq(err, lo, hi,
                                   xtol=1e-6, maxiter=100)
                 out[idx] = logt_sol
             except (ValueError, RuntimeError, ZeroDivisionError):
@@ -1313,7 +1379,7 @@ class hhe_z_mixtures():
         return out
 
     def get_logrho_sp(self, _s_kb, _lgp, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0):
+                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
         """Density from (S, P) — calls get_logt_sp then forward model."""
         _yp = self._to_yprime(_yp, _z)
         logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm, _za, _zr)
@@ -1692,7 +1758,7 @@ class hhe_z_mixtures():
     # =================================================================
 
     def get_logp_rhot(self, _lgrho, _lgt, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0):
+                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
         """Pressure from (rho, T) via root-finding or pre-computed table.
 
         Inverts rho(P, T, Y', Z) = 10^_lgrho to find logP.
@@ -2064,7 +2130,7 @@ class hhe_z_mixtures():
         return rlo + np.atleast_1d(_xi) * (rhi - rlo)
 
     def get_logt_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0):
+                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
         """Temperature from (ρ, P) via 1-D root-finding or table.
 
         Inverts ρ(P, T, Y', Z) = 10^logrho to find logT.
@@ -2433,7 +2499,7 @@ class hhe_z_mixtures():
         return s_lo + _xi * (s_hi - s_lo)
 
     def get_logp_logt_srho(self, _s_kb, _lgrho, _yp, _z=0.0,
-                            _zm=0.0, _za=0.0, _zr=0.0):
+                            _zm=0.0, _za=0.0, _zr=0.0, **kw):
         """Pressure and temperature from (S, ρ) via 2-D least-squares.
 
         If a pre-computed S-ρ table has been loaded, the RGI is
@@ -3627,6 +3693,115 @@ class hhe_z_mixtures():
         P = 10.0 ** lgp
         T = 10.0 ** _lgt
         return chi_t * P / T
+
+    # --- S-P basis wrappers (ORCHARD calls these with (S, P, Y, Z, frock)) ---
+
+    # The P-T basis getters are available as get_nabla_ad_pt, get_gamma1_pt, etc.
+    # The bare names (get_nabla_ad, get_gamma1, ...) are overridden below
+    # to accept the OLD ORCHARD calling convention: (S, P, Y, Z, frock, ...)
+    # which inverts S→T first, then delegates to the P-T getter.
+    # To call the P-T version directly, use get_nabla_ad_pt(lgp, lgt, yp, z).
+
+    def get_nabla_ad(self, _s_or_lgp, _lgp_or_lgt, _y, _z=0.0,
+                      _frock=0.0, **kw):
+        """∇_ad.  Accepts old ORCHARD (S, P, Y, Z) or new (P, T, Y, Z).
+
+        Auto-detects: if called with 5+ positional args (has _frock),
+        or with keyword args like tab/ideal_guess, uses old S-P path.
+        Otherwise uses new P-T path.
+        """
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            # Old ORCHARD calling convention: (S, P, Y, Z, frock, ...)
+            _s, _lgp = _s_or_lgp, _lgp_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgt = self.get_logt_sp(_s, _lgp, _y, _z)
+            return self._dispatch('nabla_ad', _lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        # New P-T calling convention: (lgp, lgt, Y, Z)
+        return self._dispatch('nabla_ad', _s_or_lgp, _lgp_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    def get_gamma1(self, _s_or_lgp, _lgp_or_lgt, _y, _z=0.0,
+                    _frock=0.0, **kw):
+        """Γ₁.  Accepts old ORCHARD (S, P, Y, Z) or new (P, T, Y, Z)."""
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            _s, _lgp = _s_or_lgp, _lgp_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgt = self.get_logt_sp(_s, _lgp, _y, _z)
+            return self._dispatch('gamma1', _lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        return self._dispatch('gamma1', _s_or_lgp, _lgp_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    def get_dtds_sp(self, _s_or_lgp, _lgp_or_lgt, _y, _z=0.0,
+                     _frock=0.0, **kw):
+        """dT/dS|_P.  Accepts old (S, P, Y, Z) or new (P, T, Y, Z)."""
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            _s, _lgp = _s_or_lgp, _lgp_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgt = self.get_logt_sp(_s, _lgp, _y, _z)
+            return self._dispatch('dtds_sp', _lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        return self._dispatch('dtds_sp', _s_or_lgp, _lgp_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    def get_dtdy_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
+                       _frock=0.0, **kw):
+        """dT/dY|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
+            if np.isscalar(lgp) and not np.isfinite(lgp):
+                return np.nan
+            return self._dispatch('dtdy_srho', lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        return self._dispatch('dtdy_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    def get_dtdz_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
+                       _frock=0.0, **kw):
+        """dT/dZ|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
+            if np.isscalar(lgp) and not np.isfinite(lgp):
+                return np.nan
+            return self._dispatch('dtdz_srho', lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        return self._dispatch('dtdz_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    def get_dudy_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
+                       _frock=0.0, **kw):
+        """dU/dY|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
+            if np.isscalar(lgp) and not np.isfinite(lgp):
+                return np.nan
+            return self._dispatch('dudy_srho', lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        return self._dispatch('dudy_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    def get_dudz_srho(self, _s_or_lgp, _lgrho_or_lgt, _y, _z=0.0,
+                       _frock=0.0, **kw):
+        """dU/dZ|_{S,ρ}.  Accepts old (S, ρ, Y, Z) or new (P, T, Y, Z)."""
+        if _frock != 0.0 or 'tab' in kw or 'ideal_guess' in kw:
+            _s, _lgrho = _s_or_lgp, _lgrho_or_lgt
+            _y = self._to_yprime(_y, _z)
+            lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
+            if np.isscalar(lgp) and not np.isfinite(lgp):
+                return np.nan
+            return self._dispatch('dudz_srho', lgp, lgt, _y, _z,
+                                   kw.pop('method', 'finite_difference'), **kw)
+        return self._dispatch('dudz_srho', _s_or_lgp, _lgrho_or_lgt, _y, _z,
+                               kw.pop('method', 'finite_difference'), **kw)
+
+    # --- S-ρ basis wrappers (ORCHARD calls these with (S, rho, Y, Z, frock)) ---
 
     def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z,
                             _frock=0.0, **kw):
