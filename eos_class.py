@@ -925,6 +925,7 @@ class hhe_z_mixtures():
     # Table naming convention: {hhe_eos}/{hhe_eos}_{z_eos}_sp_adaptive.npz
     # Auto-discovered relative to CURR_DIR (eos/ directory).
     _TABLE_BASES = {
+        'pt':   '{hhe}_{z}_pt_adaptive.npz',
         'sp':   '{hhe}_{z}_sp_adaptive.npz',
         'rhot': '{hhe}_{z}_rhot_adaptive.npz',
         'rhop': '{hhe}_{z}_rhop_adaptive.npz',
@@ -936,10 +937,11 @@ class hhe_z_mixtures():
                  mu_h_vary=True,
                  species_list=None,
                  z_eos='water',
-                 tab=True,
+                 pt_tab=True,
+                 inv_tab=True,
                  y_prime=True,
                  logp_range=(5.0, 15.0), logp_step=0.05,
-                 logt_range=(2.0, 6.0),
+                 logt_range=(1.0, 7.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
                  n_xi=100):
         """
@@ -957,10 +959,14 @@ class hhe_z_mixtures():
             Z species for val_mixtures.
         z_eos : str
             Label used in table filenames (e.g. 'water', 'ice_mixture').
-        tab : bool
-            If True (default), auto-load pre-computed tables from
-            ``eos/{hhe_eos_name}/`` when they exist.  Set False to
-            always use on-the-fly root-finding inversions.
+        pt_tab : bool
+            If True (default), auto-load the pre-computed P-T basis
+            table for S(P,T), ρ(P,T), U(P,T).  Uses smooth RGI
+            interpolation instead of raw VAL evaluation.
+        inv_tab : bool
+            If True (default), auto-load pre-computed inverted tables
+            (S-P, ρ-T, ρ-P, S-ρ) for fast inversions and derivatives.
+            Set False to use on-the-fly root-finding.
         logp_range : tuple (lo, hi)
             log10 P [dyn/cm²] bounds for the S-P grid.
         logp_step : float
@@ -977,7 +983,8 @@ class hhe_z_mixtures():
 
         self.hhe_eos_name = hhe_eos_name
         self.z_eos_label = z_eos
-        self.tab = tab
+        self.pt_tab = pt_tab
+        self.inv_tab = inv_tab
         self.y_prime = y_prime
 
         # --- Forward-model mixer ---
@@ -1009,6 +1016,9 @@ class hhe_z_mixtures():
         self._s_hi_rgi = None
 
         # Pre-computed tables (None until loaded)
+        self._s_pt_rgi = None
+        self._logrho_pt_rgi = None
+        self._logu_pt_rgi = None
         self._logt_sp_rgi = None
         self._logp_rhot_rgi = None
         self._logt_rhop_rgi = None
@@ -1021,9 +1031,8 @@ class hhe_z_mixtures():
         self._s_lo_srho_rgi = None
         self._s_hi_srho_rgi = None
 
-        # --- Auto-load tables if tab=True and files exist ---
-        if self.tab:
-            self._auto_load_tables()
+        # --- Auto-load tables based on pt_tab and inv_tab flags ---
+        self._auto_load_tables()
 
     # =================================================================
     # Auto-loading
@@ -1036,26 +1045,23 @@ class hhe_z_mixtures():
         return os.path.join(CURR_DIR, self.hhe_eos_name, fname)
 
     def _auto_load_tables(self):
-        """Try to load all available pre-computed tables from disk."""
-        # S-P table
-        sp_path = self._table_path('sp')
-        if os.path.isfile(sp_path):
-            self.load_sp_table(sp_path)
+        """Try to load pre-computed tables from disk.
 
-        # rho-T table
-        rhot_path = self._table_path('rhot')
-        if os.path.isfile(rhot_path):
-            self.load_rhot_table(rhot_path)
+        Controlled by ``self.pt_tab`` (P-T basis table) and
+        ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P, S-ρ tables).
+        """
+        # P-T basis table (controlled by pt_tab)
+        if self.pt_tab:
+            pt_path = self._table_path('pt')
+            if os.path.isfile(pt_path):
+                self.load_pt_table(pt_path)
 
-        # rho-P table
-        rhop_path = self._table_path('rhop')
-        if os.path.isfile(rhop_path):
-            self.load_rhop_table(rhop_path)
-
-        # S-rho table
-        srho_path = self._table_path('srho')
-        if os.path.isfile(srho_path):
-            self.load_srho_table(srho_path)
+        # Inverted tables (controlled by inv_tab)
+        if self.inv_tab:
+            for basis in ('sp', 'rhot', 'rhop', 'srho'):
+                path = self._table_path(basis)
+                if os.path.isfile(path):
+                    getattr(self, f'load_{basis}_table')(path)
 
     # =================================================================
     # Y → Y' conversion
@@ -1072,6 +1078,313 @@ class hhe_z_mixtures():
             return _y
         _z_arr = np.asarray(_z, dtype=float)
         return np.asarray(_y, dtype=float) / (1.0 - _z_arr + 1e-6)
+
+    # =================================================================
+    # P-T basis table
+    # =================================================================
+
+    def build_pt_table(self, yvals, zvals,
+                       _zm=0.0, _za=0.0, _zr=0.0,
+                       verbose=True):
+        """Build the P-T basis table: S, logrho, logU on a regular
+        (logP, logT, Y', Z) grid from the VAL forward model.
+
+        No inversion or xi-mapping needed — just forward evaluation.
+
+        Parameters
+        ----------
+        yvals, zvals : array_like
+            1-D grids of Y' and Z values.
+        verbose : bool
+            Print progress.
+
+        Returns
+        -------
+        result : dict with keys logpvals, logtvals, yvals, zvals,
+                 s_pt, logrho_pt, logu_pt (all float32).
+        """
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        logp = self.logp_vals
+        logt = self.logt_vals
+
+        nP, nT, nY, nZ = len(logp), len(logt), len(yvals), len(zvals)
+
+        if verbose:
+            print(f"Building P-T table: "
+                  f"logP=[{logp[0]:.2f}, {logp[-1]:.2f}] ({nP} pts), "
+                  f"logT=[{logt[0]:.2f}, {logt[-1]:.2f}] ({nT} pts)")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {nP}×{nT}×{nY}×{nZ} = "
+                  f"{nP*nT*nY*nZ:,}")
+            est_mb = nP * nT * nY * nZ * 3 * 4 / 1e6
+            print(f"  Est. size: ~{est_mb:.0f} MB (float32, 3 arrays)")
+
+        s_pt = np.empty((nP, nT, nY, nZ), dtype=float)
+        logrho_pt = np.empty((nP, nT, nY, nZ), dtype=float)
+        logu_pt = np.empty((nP, nT, nY, nZ), dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Building P-T table",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        # Vectorized: evaluate all (P, T) pairs at once for each (Y', Z)
+        lgp_2d, lgt_2d = np.meshgrid(logp, logt, indexing='ij')
+        lgp_flat = lgp_2d.ravel()
+        lgt_flat = lgt_2d.ravel()
+
+        for iy, yp in enumerate(yvals):
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                try:
+                    s_flat = self.val.get_s_pt_val(
+                        lgp_flat, lgt_flat, yp, zv, _zm, _za, _zr)
+                    rho_flat = self.val.get_logrho_pt_val(
+                        lgp_flat, lgt_flat, yp, zv, _zm, _za, _zr)
+                    u_flat = self.val.get_u_pt_val(
+                        lgp_flat, lgt_flat, yp, zv, _zm, _za, _zr)
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        logu_flat = np.where(u_flat > 0,
+                                              np.log10(u_flat), np.nan)
+                except (ZeroDivisionError, FloatingPointError):
+                    s_flat = np.full(nP * nT, np.nan)
+                    rho_flat = np.full(nP * nT, np.nan)
+                    logu_flat = np.full(nP * nT, np.nan)
+
+                s_pt[:, :, iy, iz] = s_flat.reshape(nP, nT)
+                logrho_pt[:, :, iy, iz] = rho_flat.reshape(nP, nT)
+                logu_pt[:, :, iy, iz] = logu_flat.reshape(nP, nT)
+
+        pbar.close()
+
+        # Fill NaN
+        n_nan = np.isnan(s_pt).sum()
+        if n_nan > 0 and verbose:
+            print(f"Filling {n_nan} NaN cells by interpolation ...")
+            s_pt = self._fill_table_nans(s_pt)
+            logrho_pt = self._fill_table_nans(logrho_pt)
+            logu_pt = self._fill_table_nans(logu_pt)
+
+        s_f32 = s_pt.astype(np.float32)
+        logrho_f32 = logrho_pt.astype(np.float32)
+        logu_f32 = logu_pt.astype(np.float32)
+
+        result = {
+            'logpvals':  logp,
+            'logtvals':  logt,
+            'yvals':     yvals,
+            'zvals':     zvals,
+            's_pt':      s_f32,
+            'logrho_pt': logrho_f32,
+            'logu_pt':   logu_f32,
+        }
+
+        # Load into this instance
+        self._load_pt_from_arrays(logp, logt, yvals, zvals,
+                                   s_f32, logrho_f32, logu_f32)
+
+        if verbose:
+            n_total = s_pt.size
+            n_good = np.isfinite(s_pt).sum()
+            mem_mb = (s_f32.nbytes + logrho_f32.nbytes + logu_f32.nbytes) / 1e6
+            print(f"Done. {n_good}/{n_total} cells finite, "
+                  f"table size: {mem_mb:.0f} MB (float32)")
+
+        return result
+
+    def _load_pt_from_arrays(self, logp, logt, yvals, zvals,
+                              s_pt, logrho_pt, logu_pt):
+        """Build P-T RGI interpolators from arrays."""
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._s_pt_rgi = RGI((logp, logt, yvals, zvals),
+                              s_pt, **rgi_kw)
+        self._logrho_pt_rgi = RGI((logp, logt, yvals, zvals),
+                                   logrho_pt, **rgi_kw)
+        self._logu_pt_rgi = RGI((logp, logt, yvals, zvals),
+                                 logu_pt, **rgi_kw)
+
+    def load_pt_table(self, path):
+        """Load a pre-computed P-T table from NPZ."""
+        data = np.load(path)
+        self._load_pt_from_arrays(
+            data['logpvals'], data['logtvals'],
+            data['yvals'], data['zvals'],
+            data['s_pt'], data['logrho_pt'], data['logu_pt'])
+
+    def save_pt_table(self, result, path=None):
+        """Save a P-T table to NPZ."""
+        if path is None:
+            path = self._table_path('pt')
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, **result)
+        print(f"Saved {path}")
+
+    # =================================================================
+    # Internal P-T queries (Y' already converted, no _frock)
+    # =================================================================
+
+    def _query_pt_rgi(self, rgi, lgp, lgt, yp, z):
+        """Query a P-T RGI with linear extrapolation in logT.
+
+        scipy's RGI with fill_value=None does nearest-neighbor
+        extrapolation, which produces isothermal plateaus outside
+        the grid.  This method linearly extrapolates using the
+        gradient at the grid boundary when logT is out of bounds.
+        """
+        scalar = np.isscalar(lgp) and np.isscalar(lgt)
+        lgp_a = np.atleast_1d(lgp)
+        lgt_a = np.atleast_1d(lgt)
+        yp_a = np.atleast_1d(yp)
+        z_a = np.atleast_1d(z)
+        lgp_a, lgt_a, yp_a, z_a = np.broadcast_arrays(
+            lgp_a, lgt_a, yp_a, z_a)
+
+        # Standard RGI query (clamps out-of-bounds to boundary)
+        pts = np.column_stack((lgp_a.ravel(), lgt_a.ravel(),
+                                yp_a.ravel(), z_a.ravel()))
+        result = rgi(pts).reshape(lgp_a.shape)
+
+        # Linear extrapolation for logT below the grid minimum
+        logt_grid = rgi.grid[1]  # axis 1 = logT
+        t_lo = logt_grid[0]
+        t_lo1 = logt_grid[1]
+        dt = t_lo1 - t_lo
+
+        below = lgt_a < t_lo
+        if np.any(below):
+            # Value and gradient at the lower boundary
+            pts_lo = pts.copy()
+            pts_lo[:, 1] = t_lo
+            f_lo = rgi(pts_lo).reshape(lgp_a.shape)
+
+            pts_lo1 = pts.copy()
+            pts_lo1[:, 1] = t_lo1
+            f_lo1 = rgi(pts_lo1).reshape(lgp_a.shape)
+
+            grad = (f_lo1 - f_lo) / dt
+            result = np.where(below,
+                               f_lo + grad * (lgt_a - t_lo),
+                               result)
+
+        # Linear extrapolation for logT above the grid maximum
+        t_hi = logt_grid[-1]
+        t_hi1 = logt_grid[-2]
+        above = lgt_a > t_hi
+        if np.any(above):
+            pts_hi = pts.copy()
+            pts_hi[:, 1] = t_hi
+            f_hi = rgi(pts_hi).reshape(lgp_a.shape)
+
+            pts_hi1 = pts.copy()
+            pts_hi1[:, 1] = t_hi1
+            f_hi1 = rgi(pts_hi1).reshape(lgp_a.shape)
+
+            grad = (f_hi - f_hi1) / (t_hi - t_hi1)
+            result = np.where(above,
+                               f_hi + grad * (lgt_a - t_hi),
+                               result)
+
+        if scalar:
+            return result.item()
+        return result
+
+    def _s_pt(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0):
+        """S(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
+        if self._s_pt_rgi is not None:
+            return self._query_pt_rgi(self._s_pt_rgi, lgp, lgt, yp, z)
+        return self.val.get_s_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
+
+    def _logrho_pt(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0):
+        """logrho(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
+        if self._logrho_pt_rgi is not None:
+            return self._query_pt_rgi(self._logrho_pt_rgi, lgp, lgt, yp, z)
+        return self.val.get_logrho_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
+
+    def _logu_pt(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0):
+        """logU(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
+        if self._logu_pt_rgi is not None:
+            return self._query_pt_rgi(self._logu_pt_rgi, lgp, lgt, yp, z)
+        return np.log10(self.val.get_u_pt_val(lgp, lgt, yp, z, _zm, _za, _zr))
+
+    # =================================================================
+    # P-T table query wrappers (public, with Y' conversion)
+    # =================================================================
+
+    def get_s_pt_tab(self, _lgp, _lgt, _y, _z, _frock=0.0,
+                     val=False, **kw):
+        """S(P, T, Y, Z) in erg/(g·K).
+
+        Uses the pre-computed P-T table RGI by default.
+        Set val=True to call val.get_s_pt_val() directly.
+        """
+        _y = self._to_yprime(_y, _z)
+        if val or self._s_pt_rgi is None:
+            return self.val.get_s_pt_val(_lgp, _lgt, _y, _z)
+        # Table path: 4-D RGI query
+        _lgp_a = np.atleast_1d(_lgp)
+        _lgt_a = np.atleast_1d(_lgt)
+        _y_a = np.atleast_1d(_y)
+        _z_a = np.atleast_1d(_z)
+        _lgp_a, _lgt_a, _y_a, _z_a = np.broadcast_arrays(
+            _lgp_a, _lgt_a, _y_a, _z_a)
+        pts = np.column_stack((_lgp_a.ravel(), _lgt_a.ravel(),
+                                _y_a.ravel(), _z_a.ravel()))
+        result = self._s_pt_rgi(pts).reshape(_lgp_a.shape)
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return result.item()
+        return result
+
+    def get_logrho_pt_tab(self, _lgp, _lgt, _y, _z, _frock=0.0,
+                           val=False, **kw):
+        """log10 ρ(P, T, Y, Z) in g/cm³.
+
+        Uses the pre-computed P-T table RGI by default.
+        Set val=True to call val.get_logrho_pt_val() directly.
+        """
+        _y = self._to_yprime(_y, _z)
+        if val or self._logrho_pt_rgi is None:
+            return self.val.get_logrho_pt_val(_lgp, _lgt, _y, _z)
+        _lgp_a = np.atleast_1d(_lgp)
+        _lgt_a = np.atleast_1d(_lgt)
+        _y_a = np.atleast_1d(_y)
+        _z_a = np.atleast_1d(_z)
+        _lgp_a, _lgt_a, _y_a, _z_a = np.broadcast_arrays(
+            _lgp_a, _lgt_a, _y_a, _z_a)
+        pts = np.column_stack((_lgp_a.ravel(), _lgt_a.ravel(),
+                                _y_a.ravel(), _z_a.ravel()))
+        result = self._logrho_pt_rgi(pts).reshape(_lgp_a.shape)
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return result.item()
+        return result
+
+    def get_logu_pt_tab(self, _lgp, _lgt, _y, _z, _frock=0.0,
+                         val=False, **kw):
+        """log10 U(P, T, Y, Z) in erg/g.
+
+        Uses the pre-computed P-T table RGI by default.
+        Set val=True to call val.get_u_pt_val() directly.
+        """
+        _y = self._to_yprime(_y, _z)
+        if val or self._logu_pt_rgi is None:
+            return np.log10(self.val.get_u_pt_val(_lgp, _lgt, _y, _z))
+        _lgp_a = np.atleast_1d(_lgp)
+        _lgt_a = np.atleast_1d(_lgt)
+        _y_a = np.atleast_1d(_y)
+        _z_a = np.atleast_1d(_z)
+        _lgp_a, _lgt_a, _y_a, _z_a = np.broadcast_arrays(
+            _lgp_a, _lgt_a, _y_a, _z_a)
+        pts = np.column_stack((_lgp_a.ravel(), _lgt_a.ravel(),
+                                _y_a.ravel(), _z_a.ravel()))
+        result = self._logu_pt_rgi(pts).reshape(_lgp_a.shape)
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return result.item()
+        return result
 
     # =================================================================
     # S-bound computation
@@ -1106,9 +1419,9 @@ class hhe_z_mixtures():
         s_at_tmax = np.empty(nP)
 
         for ip, lgp in enumerate(self.logp_vals):
-            s_at_tmin[ip] = self.val.get_s_pt_val(
+            s_at_tmin[ip] = self._s_pt(
                 lgp, self.logt_min, _y_prime, _z, _zm, _za, _zr)
-            s_at_tmax[ip] = self.val.get_s_pt_val(
+            s_at_tmax[ip] = self._s_pt(
                 lgp, self.logt_max, _y_prime, _z, _zm, _za, _zr)
 
         # Convert erg/(g·K) → kb/baryon
@@ -1160,9 +1473,9 @@ class hhe_z_mixtures():
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
                 for ip, lgp in enumerate(self.logp_vals):
-                    s_cold = self.val.get_s_pt_val(
+                    s_cold = self._s_pt(
                         lgp, self.logt_min, yp, zv, _zm, _za, _zr)
-                    s_hot = self.val.get_s_pt_val(
+                    s_hot = self._s_pt(
                         lgp, self.logt_max, yp, zv, _zm, _za, _zr)
                     s_cold *= erg_to_kbbar
                     s_hot  *= erg_to_kbbar
@@ -1238,10 +1551,10 @@ class hhe_z_mixtures():
         Uses the forward model directly — no pre-computed bounds needed.
         """
         _yp = self._to_yprime(_yp, _z)
-        s_cold = (self.val.get_s_pt_val(lgp_i, self.logt_min,
+        s_cold = (self._s_pt(lgp_i, self.logt_min,
                                          _yp, _z, _zm, _za, _zr)
                   * erg_to_kbbar)
-        s_hot  = (self.val.get_s_pt_val(lgp_i, self.logt_max,
+        s_hot  = (self._s_pt(lgp_i, self.logt_max,
                                          _yp, _z, _zm, _za, _zr)
                   * erg_to_kbbar)
         return min(s_cold, s_hot), max(s_cold, s_hot)
@@ -1308,7 +1621,7 @@ class hhe_z_mixtures():
                         z_i = float(_z_arr.ravel()[idx])
                         def err(lgt, _s=s_i, _p=p_i, _y=yp_i, _zv=z_i):
                             try:
-                                s_test = self.val.get_s_pt_val(
+                                s_test = self._s_pt(
                                     _p, lgt, _y, _zv, _zm_s, _za_s, _zr_s)
                                 return s_test * erg_to_kbbar - _s
                             except (ZeroDivisionError, FloatingPointError):
@@ -1359,7 +1672,7 @@ class hhe_z_mixtures():
             #   val.get_s_pt_val(P, T, Y', Z) * erg_to_kbbar = s_i
             def err(lgt):
                 try:
-                    s_test = self.val.get_s_pt_val(
+                    s_test = self._s_pt(
                         lgp_i, lgt, _yp, _z, _zm, _za, _zr)
                     return s_test * erg_to_kbbar - s_i
                 except (ZeroDivisionError, FloatingPointError):
@@ -1413,7 +1726,7 @@ class hhe_z_mixtures():
         out = np.full_like(logt_arr, np.nan, dtype=float)
         good = np.isfinite(logt_arr)
         if good.any():
-            out[good] = self.val.get_logrho_pt_val(
+            out[good] = self._logrho_pt(
                 _lgp_arr[good], logt_arr[good], _yp, _z, _zm, _za, _zr)
 
         if out.size == 1:
@@ -1676,7 +1989,7 @@ class hhe_z_mixtures():
 
                         def err(lgt):
                             try:
-                                s_test = self.val.get_s_pt_val(
+                                s_test = self._s_pt(
                                     lgp_i, lgt, yp, zv, _zm, _za, _zr)
                                 return s_test * erg_to_kbbar - s_phys
                             except (ZeroDivisionError, FloatingPointError):
@@ -1809,7 +2122,7 @@ class hhe_z_mixtures():
 
             def err(lgp):
                 try:
-                    rho_test = self.val.get_logrho_pt_val(
+                    rho_test = self._logrho_pt(
                         lgp, lgt_i, _yp, _z, _zm, _za, _zr)
                     return rho_test - rho_i
                 except (ZeroDivisionError, FloatingPointError):
@@ -1849,9 +2162,9 @@ class hhe_z_mixtures():
             for iz, zv in enumerate(zvals):
                 for it, lgt in enumerate(logt):
                     try:
-                        r_plo = self.val.get_logrho_pt_val(
+                        r_plo = self._logrho_pt(
                             lgp_lo, lgt, yp, zv, _zm, _za, _zr)
-                        r_phi = self.val.get_logrho_pt_val(
+                        r_phi = self._logrho_pt(
                             lgp_hi, lgt, yp, zv, _zm, _za, _zr)
                     except (ZeroDivisionError, FloatingPointError):
                         continue
@@ -1999,7 +2312,7 @@ class hhe_z_mixtures():
 
                         def err(lgp):
                             try:
-                                rho_test = self.val.get_logrho_pt_val(
+                                rho_test = self._logrho_pt(
                                     lgp, lgt_i, yp, zv, _zm, _za, _zr)
                                 return rho_test - rho_phys
                             except (ZeroDivisionError,
@@ -2109,9 +2422,9 @@ class hhe_z_mixtures():
         for iy, yp in enumerate(yvals):
             for iz, zv in enumerate(zvals):
                 for ip, lgp in enumerate(self.logp_vals):
-                    r_hot = self.val.get_logrho_pt_val(
+                    r_hot = self._logrho_pt(
                         lgp, self.logt_max, yp, zv, _zm, _za, _zr)
-                    r_cold = self.val.get_logrho_pt_val(
+                    r_cold = self._logrho_pt(
                         lgp, self.logt_min, yp, zv, _zm, _za, _zr)
                     if np.isfinite(r_hot) and np.isfinite(r_cold):
                         rho_lo[ip, iy, iz] = min(r_hot, r_cold)
@@ -2194,7 +2507,7 @@ class hhe_z_mixtures():
 
             def err(lgt):
                 try:
-                    return (self.val.get_logrho_pt_val(
+                    return (self._logrho_pt(
                         lgp_i, lgt, _yp, _z, _zm, _za, _zr) - rho_i)
                 except (ZeroDivisionError, FloatingPointError):
                     return 1e30
@@ -2298,7 +2611,7 @@ class hhe_z_mixtures():
 
                         def err(lgt):
                             try:
-                                return (self.val.get_logrho_pt_val(
+                                return (self._logrho_pt(
                                     lgp_i, lgt, yp, zv, _zm, _za, _zr)
                                     - rho_phys)
                             except (ZeroDivisionError,
@@ -2327,7 +2640,7 @@ class hhe_z_mixtures():
                         if not solved:
                             try:
                                 lgt_sol = brentq(
-                                    err, self.logt_min, self.logt_max,
+                                    err, 1.0, self.logt_max,
                                     xtol=1e-8, maxiter=100)
                                 logt_tab[ixi, ip, iy, iz] = lgt_sol
                                 prev_logt[ixi, ip] = lgt_sol
@@ -2455,7 +2768,7 @@ class hhe_z_mixtures():
                         # Find P that gives this (rho, T)
                         def err_p(lgp):
                             try:
-                                return (self.val.get_logrho_pt_val(
+                                return (self._logrho_pt(
                                     lgp, lgt, yp, zv, _zm, _za, _zr)
                                     - rho_target)
                             except (ZeroDivisionError, FloatingPointError):
@@ -2466,7 +2779,7 @@ class hhe_z_mixtures():
                         except (ValueError, RuntimeError, ZeroDivisionError):
                             continue
 
-                        s_val = (self.val.get_s_pt_val(
+                        s_val = (self._s_pt(
                             lgp, lgt, yp, zv, _zm, _za, _zr)
                             * erg_to_kbbar)
 
@@ -2578,10 +2891,10 @@ class hhe_z_mixtures():
 
             def residuals(x):
                 lgp, lgt = x
-                s_test = (self.val.get_s_pt_val(
+                s_test = (self._s_pt(
                     lgp, lgt, _yp, _z, _zm, _za, _zr)
                     * erg_to_kbbar)
-                rho_test = self.val.get_logrho_pt_val(
+                rho_test = self._logrho_pt(
                     lgp, lgt, _yp, _z, _zm, _za, _zr)
                 if not (np.isfinite(s_test) and np.isfinite(rho_test)):
                     return np.array([1e30, 1e30])
@@ -2596,7 +2909,7 @@ class hhe_z_mixtures():
                 lgt_seed = 0.5 * (lgt_lo + lgt_hi)
                 try:
                     def err_p(lgp):
-                        return (self.val.get_logrho_pt_val(
+                        return (self._logrho_pt(
                             lgp, lgt_seed, _yp, _z, _zm, _za, _zr)
                             - rho_target)
                     lgp_seed = brentq(err_p, lgp_lo, lgp_hi,
@@ -2728,10 +3041,10 @@ class hhe_z_mixtures():
 
                         def residuals(x):
                             lgp, lgt = x
-                            s_t = (self.val.get_s_pt_val(
+                            s_t = (self._s_pt(
                                 lgp, lgt, yp, zv, _zm, _za, _zr)
                                 * erg_to_kbbar)
-                            rho_t = self.val.get_logrho_pt_val(
+                            rho_t = self._logrho_pt(
                                 lgp, lgt, yp, zv, _zm, _za, _zr)
                             if not (np.isfinite(s_t)
                                     and np.isfinite(rho_t)):
@@ -2769,7 +3082,7 @@ class hhe_z_mixtures():
                             try:
                                 def err_p(lgp):
                                     try:
-                                        return (self.val.get_logrho_pt_val(
+                                        return (self._logrho_pt(
                                             lgp, lgt_seed, yp, zv,
                                             _zm, _za, _zr)
                                             - rho_target)
@@ -3148,18 +3461,18 @@ class hhe_z_mixtures():
                dt=1e-2, smooth=True):
         """C_P via direct FD: dS/d(lnT)|_P."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        f = lambda t: self.val.get_s_pt_val(lgp, t, yp, z, **kw)
+        f = lambda t: self._s_pt(lgp, t, yp, z, **kw)
         return self._fd_or_sg(f, lgt, dt, smooth) / log10_to_loge
 
     def _cv_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
                dt=1e-2, smooth=True):
         """C_V via direct FD: dS/d(lnT)|_ρ."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         def f(t):
             try:
                 p = self.get_logp_rhot(rho0, t, yp, z, **kw)
-                return self.val.get_s_pt_val(p, t, yp, z, **kw)
+                return self._s_pt(p, t, yp, z, **kw)
             except:
                 return np.nan
         return self._fd_or_sg(f, lgt, dt, smooth) / log10_to_loge
@@ -3168,13 +3481,13 @@ class hhe_z_mixtures():
                   dt=1e-2, smooth=True):
         """δ via direct FD: -dlogρ/dlogT|_P."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        f = lambda t: self.val.get_logrho_pt_val(lgp, t, yp, z, **kw)
+        f = lambda t: self._logrho_pt(lgp, t, yp, z, **kw)
         return -self._fd_or_sg(f, lgt, dt, smooth)
 
     def _nabla_ad_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
                      dp=1e-2, smooth=True):
         """∇_ad via direct FD on S-P inversion: dlogT/dlogP|_S."""
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, _zm, _za, _zr) * erg_to_kbbar
+        s_kb = self._s_pt(lgp, lgt, yp, z, _zm, _za, _zr) * erg_to_kbbar
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
         f = lambda p: self.get_logt_sp(s_kb, p, yp, z, **kw)
         result = self._fd_or_sg(f, lgp, dp, smooth)
@@ -3184,11 +3497,11 @@ class hhe_z_mixtures():
                    dp=1e-2, smooth=True):
         """Γ₁ via direct FD: dlogP/dlogρ|_S."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        s_kb = self._s_pt(lgp, lgt, yp, z, **kw) * erg_to_kbbar
         def f(p):
             t = self.get_logt_sp(s_kb, p, yp, z, **kw)
             if np.isfinite(t):
-                return self.val.get_logrho_pt_val(p, t, yp, z, **kw)
+                return self._logrho_pt(p, t, yp, z, **kw)
             return np.nan
         drho_dp = self._fd_or_sg(f, lgp, dp, smooth)
         if np.isfinite(drho_dp) and abs(drho_dp) > 1e-30:
@@ -3199,7 +3512,7 @@ class hhe_z_mixtures():
                   dt=1e-2, smooth=True):
         """χ_T via direct FD on ρ-T inversion: dlogP/dlogT|_ρ."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         f = lambda t: self.get_logp_rhot(rho0, t, yp, z, **kw)
         result = self._fd_or_sg(f, lgt, dt, smooth)
         return result if np.isfinite(result) else np.nan
@@ -3208,7 +3521,7 @@ class hhe_z_mixtures():
                     dr=1e-2, smooth=True):
         """χ_ρ via direct FD on ρ-T inversion: dlogP/dlogρ|_T."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         f = lambda r: self.get_logp_rhot(r, lgt, yp, z, **kw)
         result = self._fd_or_sg(f, rho0, dr, smooth)
         return result if np.isfinite(result) else np.nan
@@ -3217,7 +3530,7 @@ class hhe_z_mixtures():
                   dy=0.01, smooth=True):
         """χ_Y via direct FD on ρ-T inversion: dlogP/dY|_{ρ,T}."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         dy = self._adaptive_dx(yp, dy)
         f = lambda y: self.get_logp_rhot(rho0, lgt, y, z, **kw)
         return self._fd_or_sg(f, yp, dy, smooth) * log10_to_loge
@@ -3226,7 +3539,7 @@ class hhe_z_mixtures():
                   dz=0.01, smooth=True):
         """χ_Z via direct FD on ρ-T inversion: dlogP/dZ|_{ρ,T}."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         dz = self._adaptive_dx(z, dz)
         f = lambda zv: self.get_logp_rhot(rho0, lgt, yp, zv, **kw)
         return self._fd_or_sg(f, z, dz, smooth) * log10_to_loge
@@ -3235,7 +3548,7 @@ class hhe_z_mixtures():
                     ds=0.1, smooth=True):
         """dT/dS|_P via direct FD on S-P inversion."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        s_kb = self._s_pt(lgp, lgt, yp, z, **kw) * erg_to_kbbar
         f = lambda s: 10 ** self.get_logt_sp(s, lgp, yp, z, **kw)
         dTds_kb = self._fd_or_sg(f, s_kb, ds, smooth)
         return dTds_kb * erg_to_kbbar  # convert from dT/d(S_kb) to dT/d(S_cgs)
@@ -3245,7 +3558,7 @@ class hhe_z_mixtures():
         """dS/dY|_{P,T} via direct FD."""
         dy = self._adaptive_dx(yp, dy)
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        f = lambda y: self.val.get_s_pt_val(lgp, lgt, y, z, **kw)
+        f = lambda y: self._s_pt(lgp, lgt, y, z, **kw)
         return self._fd_or_sg(f, yp, dy, smooth)
 
     def _dsdz_pt_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0,
@@ -3253,7 +3566,7 @@ class hhe_z_mixtures():
         """dS/dZ|_{P,T} via direct FD."""
         dz = self._adaptive_dx(z, dz)
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        f = lambda zv: self.val.get_s_pt_val(lgp, lgt, yp, zv, **kw)
+        f = lambda zv: self._s_pt(lgp, lgt, yp, zv, **kw)
         return self._fd_or_sg(f, z, dz, smooth)
 
     # ---- Identity scalar helpers ----
@@ -3327,70 +3640,70 @@ class hhe_z_mixtures():
     # the _vec per-element loop.
 
     def _vec_fd_cp(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        return (self.val.get_s_pt_val(lgp, lgt + h, yp, z)
-                - self.val.get_s_pt_val(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
+        return (self.get_s_pt_tab(lgp, lgt + h, yp, z)
+                - self.get_s_pt_tab(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
 
     def _vec_fd_delta(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        return -(self.val.get_logrho_pt_val(lgp, lgt + h, yp, z)
-                 - self.val.get_logrho_pt_val(lgp, lgt - h, yp, z)) / (2*h)
+        return -(self.get_logrho_pt_tab(lgp, lgt + h, yp, z)
+                 - self.get_logrho_pt_tab(lgp, lgt - h, yp, z)) / (2*h)
 
     def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z) * erg_to_kbbar
+        s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
         return (t2 - t1) / (2*h)
 
     def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z) * erg_to_kbbar
+        s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
-        r1 = self.val.get_logrho_pt_val(lgp - h, t1, yp, z)
-        r2 = self.val.get_logrho_pt_val(lgp + h, t2, yp, z)
+        r1 = self._logrho_pt(lgp - h, t1, yp, z)
+        r2 = self._logrho_pt(lgp + h, t2, yp, z)
         result = (2*h) / (r2 - r1)
         return np.where(np.isfinite(result), result, np.nan)
 
     def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
         return (p2 - p1) / (2*h)
 
     def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0 - h, lgt, yp, z)
         p2 = self.get_logp_rhot(rho0 + h, lgt, yp, z)
         return (p2 - p1) / (2*h)
 
     def _vec_fd_cv(self, lgp, lgt, yp, z, h=1e-2, **kw):
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
-        s1 = self.val.get_s_pt_val(p1, lgt - h, yp, z)
-        s2 = self.val.get_s_pt_val(p2, lgt + h, yp, z)
+        s1 = self._s_pt(p1, lgt - h, yp, z)
+        s2 = self._s_pt(p2, lgt + h, yp, z)
         return (s2 - s1) / (2*h*log10_to_loge)
 
     def _vec_fd_dsdy_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
-        return (self.val.get_s_pt_val(lgp, lgt, yp + h, z)
-                - self.val.get_s_pt_val(lgp, lgt, yp - h, z)) / (2*h)
+        return (self.get_s_pt_tab(lgp, lgt, yp + h, z)
+                - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2*h)
 
     def _vec_fd_dsdz_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
-        return (self.val.get_s_pt_val(lgp, lgt, yp, z + h)
-                - self.val.get_s_pt_val(lgp, lgt, yp, z - h)) / (2*h)
+        return (self.get_s_pt_tab(lgp, lgt, yp, z + h)
+                - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2*h)
 
     def _vec_fd_dtds_sp(self, lgp, lgt, yp, z, h=0.1, **kw):
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z) * erg_to_kbbar
+        s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = 10 ** self.get_logt_sp(s_kb - h, lgp, yp, z)
         t2 = 10 ** self.get_logt_sp(s_kb + h, lgp, yp, z)
         return (t2 - t1) / (2*h / erg_to_kbbar)
 
     def _vec_fd_chi_Y(self, lgp, lgt, yp, z, h=0.01, **kw):
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt, yp - h, z)
         p2 = self.get_logp_rhot(rho0, lgt, yp + h, z)
         return (p2 - p1) * log10_to_loge / (2*h)
 
     def _vec_fd_chi_Z(self, lgp, lgt, yp, z, h=0.01, **kw):
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z)
+        rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt, yp, z - h)
         p2 = self.get_logp_rhot(rho0, lgt, yp, z + h)
         return (p2 - p1) * log10_to_loge / (2*h)
@@ -3398,17 +3711,17 @@ class hhe_z_mixtures():
     def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
         """Ledoux dS/dY|_{ρ,P} vectorized via identity with clamped c."""
         ht = 1e-2
-        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
-        logS_Tp = np.log10(self.val.get_s_pt_val(lgp, lgt + ht, yp, z))
-        logS_Tm = np.log10(self.val.get_s_pt_val(lgp, lgt - ht, yp, z))
+        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
+        logS_Tp = np.log10(self.get_s_pt_tab(lgp, lgt + ht, yp, z))
+        logS_Tm = np.log10(self.get_s_pt_tab(lgp, lgt - ht, yp, z))
         a = (logS_Tp - logS_Tm) / (2 * ht)
-        rho_Tp = self.val.get_logrho_pt_val(lgp, lgt + ht, yp, z)
-        rho_Tm = self.val.get_logrho_pt_val(lgp, lgt - ht, yp, z)
+        rho_Tp = self.get_logrho_pt_tab(lgp, lgt + ht, yp, z)
+        rho_Tm = self.get_logrho_pt_tab(lgp, lgt - ht, yp, z)
         c = (rho_Tp - rho_Tm) / (2 * ht)
-        S_Y = (self.val.get_s_pt_val(lgp, lgt, yp + h, z)
-               - self.val.get_s_pt_val(lgp, lgt, yp - h, z)) / (2 * h)
-        rho_Y = (self.val.get_logrho_pt_val(lgp, lgt, yp + h, z)
-                 - self.val.get_logrho_pt_val(lgp, lgt, yp - h, z)) / (2 * h)
+        S_Y = (self.get_s_pt_tab(lgp, lgt, yp + h, z)
+               - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2 * h)
+        rho_Y = (self.get_logrho_pt_tab(lgp, lgt, yp + h, z)
+                 - self.get_logrho_pt_tab(lgp, lgt, yp - h, z)) / (2 * h)
         # Clamp c to avoid 1/c singularity at dissociation
         c_safe = np.where(np.abs(c) > 0.02, c, np.sign(c) * 0.02)
         c_safe = np.where(c_safe == 0, 0.02, c_safe)
@@ -3417,17 +3730,17 @@ class hhe_z_mixtures():
     def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
         """Ledoux dS/dZ|_{ρ,P} vectorized via identity with clamped c."""
         ht = 1e-2
-        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
-        logS_Tp = np.log10(self.val.get_s_pt_val(lgp, lgt + ht, yp, z))
-        logS_Tm = np.log10(self.val.get_s_pt_val(lgp, lgt - ht, yp, z))
+        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
+        logS_Tp = np.log10(self.get_s_pt_tab(lgp, lgt + ht, yp, z))
+        logS_Tm = np.log10(self.get_s_pt_tab(lgp, lgt - ht, yp, z))
         a = (logS_Tp - logS_Tm) / (2 * ht)
-        rho_Tp = self.val.get_logrho_pt_val(lgp, lgt + ht, yp, z)
-        rho_Tm = self.val.get_logrho_pt_val(lgp, lgt - ht, yp, z)
+        rho_Tp = self.get_logrho_pt_tab(lgp, lgt + ht, yp, z)
+        rho_Tm = self.get_logrho_pt_tab(lgp, lgt - ht, yp, z)
         c = (rho_Tp - rho_Tm) / (2 * ht)
-        S_Z = (self.val.get_s_pt_val(lgp, lgt, yp, z + h)
-               - self.val.get_s_pt_val(lgp, lgt, yp, z - h)) / (2 * h)
-        rho_Z = (self.val.get_logrho_pt_val(lgp, lgt, yp, z + h)
-                 - self.val.get_logrho_pt_val(lgp, lgt, yp, z - h)) / (2 * h)
+        S_Z = (self.get_s_pt_tab(lgp, lgt, yp, z + h)
+               - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2 * h)
+        rho_Z = (self.get_logrho_pt_tab(lgp, lgt, yp, z + h)
+                 - self.get_logrho_pt_tab(lgp, lgt, yp, z - h)) / (2 * h)
         c_safe = np.where(np.abs(c) > 0.02, c, np.sign(c) * 0.02)
         c_safe = np.where(c_safe == 0, 0.02, c_safe)
         return S_Z - S0 * a * log10_to_loge * rho_Z / c_safe
@@ -3435,19 +3748,19 @@ class hhe_z_mixtures():
     def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dT/dY|_{S,ρ} vectorized via identity."""
         ht, hp = 1e-2, 1e-2
-        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
-        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
-        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
-        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
-             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
-        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
-             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
-        S_Y = (self.val.get_s_pt_val(lgp, lgt, yp+h, z)
-               - self.val.get_s_pt_val(lgp, lgt, yp-h, z)) / (2*h)
-        rho_Y = (self.val.get_logrho_pt_val(lgp, lgt, yp+h, z)
-                 - self.val.get_logrho_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
+        a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
+             - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self._s_pt(lgp+hp, lgt, yp, z))
+             - np.log10(self._s_pt(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self._logrho_pt(lgp, lgt+ht, yp, z)
+             - self._logrho_pt(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self._logrho_pt(lgp+hp, lgt, yp, z)
+             - self._logrho_pt(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Y = (self._s_pt(lgp, lgt, yp+h, z)
+               - self._s_pt(lgp, lgt, yp-h, z)) / (2*h)
+        rho_Y = (self._logrho_pt(lgp, lgt, yp+h, z)
+                 - self._logrho_pt(lgp, lgt, yp-h, z)) / (2*h)
         T = 10.0 ** lgt
         det = b*c - a*d
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
@@ -3456,19 +3769,19 @@ class hhe_z_mixtures():
     def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dT/dZ|_{S,ρ} vectorized via identity."""
         ht, hp = 1e-2, 1e-2
-        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
-        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
-        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
-        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
-             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
-        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
-             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
-        S_Z = (self.val.get_s_pt_val(lgp, lgt, yp, z+h)
-               - self.val.get_s_pt_val(lgp, lgt, yp, z-h)) / (2*h)
-        rho_Z = (self.val.get_logrho_pt_val(lgp, lgt, yp, z+h)
-                 - self.val.get_logrho_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
+        a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
+             - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self._s_pt(lgp+hp, lgt, yp, z))
+             - np.log10(self._s_pt(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self._logrho_pt(lgp, lgt+ht, yp, z)
+             - self._logrho_pt(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self._logrho_pt(lgp+hp, lgt, yp, z)
+             - self._logrho_pt(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Z = (self._s_pt(lgp, lgt, yp, z+h)
+               - self._s_pt(lgp, lgt, yp, z-h)) / (2*h)
+        rho_Z = (self._logrho_pt(lgp, lgt, yp, z+h)
+                 - self._logrho_pt(lgp, lgt, yp, z-h)) / (2*h)
         T = 10.0 ** lgt
         det = b*c - a*d
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
@@ -3477,19 +3790,19 @@ class hhe_z_mixtures():
     def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dU/dY|_{S,ρ} vectorized via identity."""
         ht, hp = 1e-2, 1e-2
-        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
-        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
-        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
-        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
-             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
-        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
-             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
-        S_Y = (self.val.get_s_pt_val(lgp, lgt, yp+h, z)
-               - self.val.get_s_pt_val(lgp, lgt, yp-h, z)) / (2*h)
-        rho_Y = (self.val.get_logrho_pt_val(lgp, lgt, yp+h, z)
-                 - self.val.get_logrho_pt_val(lgp, lgt, yp-h, z)) / (2*h)
+        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
+        a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
+             - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self._s_pt(lgp+hp, lgt, yp, z))
+             - np.log10(self._s_pt(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self._logrho_pt(lgp, lgt+ht, yp, z)
+             - self._logrho_pt(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self._logrho_pt(lgp+hp, lgt, yp, z)
+             - self._logrho_pt(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Y = (self._s_pt(lgp, lgt, yp+h, z)
+               - self._s_pt(lgp, lgt, yp-h, z)) / (2*h)
+        rho_Y = (self._logrho_pt(lgp, lgt, yp+h, z)
+                 - self._logrho_pt(lgp, lgt, yp-h, z)) / (2*h)
         U_Y = (self.val.get_u_pt_val(lgp, lgt, yp+h, z)
                - self.val.get_u_pt_val(lgp, lgt, yp-h, z)) / (2*h)
         U_P = (self.val.get_u_pt_val(lgp+hp, lgt, yp, z)
@@ -3506,19 +3819,19 @@ class hhe_z_mixtures():
     def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dU/dZ|_{S,ρ} vectorized via identity."""
         ht, hp = 1e-2, 1e-2
-        S0 = self.val.get_s_pt_val(lgp, lgt, yp, z)
-        a = (np.log10(self.val.get_s_pt_val(lgp, lgt+ht, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp, lgt-ht, yp, z))) / (2*ht)
-        b = (np.log10(self.val.get_s_pt_val(lgp+hp, lgt, yp, z))
-             - np.log10(self.val.get_s_pt_val(lgp-hp, lgt, yp, z))) / (2*hp)
-        c = (self.val.get_logrho_pt_val(lgp, lgt+ht, yp, z)
-             - self.val.get_logrho_pt_val(lgp, lgt-ht, yp, z)) / (2*ht)
-        d = (self.val.get_logrho_pt_val(lgp+hp, lgt, yp, z)
-             - self.val.get_logrho_pt_val(lgp-hp, lgt, yp, z)) / (2*hp)
-        S_Z = (self.val.get_s_pt_val(lgp, lgt, yp, z+h)
-               - self.val.get_s_pt_val(lgp, lgt, yp, z-h)) / (2*h)
-        rho_Z = (self.val.get_logrho_pt_val(lgp, lgt, yp, z+h)
-                 - self.val.get_logrho_pt_val(lgp, lgt, yp, z-h)) / (2*h)
+        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
+        a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
+             - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
+        b = (np.log10(self._s_pt(lgp+hp, lgt, yp, z))
+             - np.log10(self._s_pt(lgp-hp, lgt, yp, z))) / (2*hp)
+        c = (self._logrho_pt(lgp, lgt+ht, yp, z)
+             - self._logrho_pt(lgp, lgt-ht, yp, z)) / (2*ht)
+        d = (self._logrho_pt(lgp+hp, lgt, yp, z)
+             - self._logrho_pt(lgp-hp, lgt, yp, z)) / (2*hp)
+        S_Z = (self._s_pt(lgp, lgt, yp, z+h)
+               - self._s_pt(lgp, lgt, yp, z-h)) / (2*h)
+        rho_Z = (self._logrho_pt(lgp, lgt, yp, z+h)
+                 - self._logrho_pt(lgp, lgt, yp, z-h)) / (2*h)
         U_Z = (self.val.get_u_pt_val(lgp, lgt, yp, z+h)
                - self.val.get_u_pt_val(lgp, lgt, yp, z-h)) / (2*h)
         U_P = (self.val.get_u_pt_val(lgp+hp, lgt, yp, z)
@@ -3617,14 +3930,14 @@ class hhe_z_mixtures():
         Finds T(Y±dY) at constant (P, ρ) via brentq, then
         differentiates S.
         """
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, _zm, _za, _zr)
         if dy is None:
             dy = self._adaptive_dx(yp)
 
         def get_t(yp_i):
             def err(lgt_i):
                 try:
-                    return self.val.get_logrho_pt_val(
+                    return self._logrho_pt(
                         lgp, lgt_i, yp_i, z, _zm, _za, _zr) - rho0
                 except (ZeroDivisionError, FloatingPointError):
                     return 1e30
@@ -3633,21 +3946,21 @@ class hhe_z_mixtures():
         try:
             lgt_p = get_t(yp + dy)
             lgt_m = get_t(yp - dy)
-            return (self.val.get_s_pt_val(lgp, lgt_p, yp + dy, z, _zm, _za, _zr) -
-                    self.val.get_s_pt_val(lgp, lgt_m, yp - dy, z, _zm, _za, _zr)) / (2 * dy)
+            return (self._s_pt(lgp, lgt_p, yp + dy, z, _zm, _za, _zr) -
+                    self._s_pt(lgp, lgt_m, yp - dy, z, _zm, _za, _zr)) / (2 * dy)
         except (ValueError, RuntimeError, ZeroDivisionError):
             return np.nan
 
     def _ledoux_dsdz_fd(self, lgp, lgt, yp, z, _zm, _za, _zr, dz):
         """Direct finite-difference fallback for dS/dZ|_{ρ,P}."""
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, _zm, _za, _zr)
         if dz is None:
             dz = self._adaptive_dx(z)
 
         def get_t(z_i):
             def err(lgt_i):
                 try:
-                    return self.val.get_logrho_pt_val(
+                    return self._logrho_pt(
                         lgp, lgt_i, yp, z_i, _zm, _za, _zr) - rho0
                 except (ZeroDivisionError, FloatingPointError):
                     return 1e30
@@ -3656,8 +3969,8 @@ class hhe_z_mixtures():
         try:
             lgt_p = get_t(z + dz)
             lgt_m = get_t(z - dz)
-            return (self.val.get_s_pt_val(lgp, lgt_p, yp, z + dz, _zm, _za, _zr) -
-                    self.val.get_s_pt_val(lgp, lgt_m, yp, z - dz, _zm, _za, _zr)) / (2 * dz)
+            return (self._s_pt(lgp, lgt_p, yp, z + dz, _zm, _za, _zr) -
+                    self._s_pt(lgp, lgt_m, yp, z - dz, _zm, _za, _zr)) / (2 * dz)
         except (ValueError, RuntimeError, ZeroDivisionError):
             return np.nan
 
@@ -3721,8 +4034,8 @@ class hhe_z_mixtures():
     def _dtdy_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
         """dT/dY|_{S,ρ} via 2D S-ρ inversion."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        s_kb = self._s_pt(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         dy = self._adaptive_dx(yp, dy)
         _, t1 = self.get_logp_logt_srho(s_kb, rho0, yp - dy, z, **kw)
         _, t2 = self.get_logp_logt_srho(s_kb, rho0, yp + dy, z, **kw)
@@ -3733,8 +4046,8 @@ class hhe_z_mixtures():
     def _dtdz_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
         """dT/dZ|_{S,ρ} via 2D S-ρ inversion."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        s_kb = self._s_pt(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         dz = self._adaptive_dx(z, dz)
         _, t1 = self.get_logp_logt_srho(s_kb, rho0, yp, z - dz, **kw)
         _, t2 = self.get_logp_logt_srho(s_kb, rho0, yp, z + dz, **kw)
@@ -3745,8 +4058,8 @@ class hhe_z_mixtures():
     def _dudy_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dy=0.01):
         """dU/dY|_{S,ρ} via 2D S-ρ inversion."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        s_kb = self._s_pt(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         dy = self._adaptive_dx(yp, dy)
         p1, t1 = self.get_logp_logt_srho(s_kb, rho0, yp - dy, z, **kw)
         p2, t2 = self.get_logp_logt_srho(s_kb, rho0, yp + dy, z, **kw)
@@ -3759,8 +4072,8 @@ class hhe_z_mixtures():
     def _dudz_srho_fd(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0, dz=0.01):
         """dU/dZ|_{S,ρ} via 2D S-ρ inversion."""
         kw = dict(_zm=_zm, _za=_za, _zr=_zr)
-        s_kb = self.val.get_s_pt_val(lgp, lgt, yp, z, **kw) * erg_to_kbbar
-        rho0 = self.val.get_logrho_pt_val(lgp, lgt, yp, z, **kw)
+        s_kb = self._s_pt(lgp, lgt, yp, z, **kw) * erg_to_kbbar
+        rho0 = self._logrho_pt(lgp, lgt, yp, z, **kw)
         dz = self._adaptive_dx(z, dz)
         p1, t1 = self.get_logp_logt_srho(s_kb, rho0, yp, z - dz, **kw)
         p2, t2 = self.get_logp_logt_srho(s_kb, rho0, yp, z + dz, **kw)
@@ -3877,19 +4190,16 @@ class hhe_z_mixtures():
         return self._adaptive_dx(x, dx0)
 
     def get_s_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
-        """S(P, T, Y, Z) in erg/(g·K).  Alias for val.get_s_pt_val."""
-        _y = self._to_yprime(_y, _z)
-        return self.val.get_s_pt_val(_lgp, _lgt, _y, _z)
+        """S(P, T, Y, Z).  Delegates to get_s_pt_tab."""
+        return self.get_s_pt_tab(_lgp, _lgt, _y, _z, **kw)
 
     def get_logrho_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
-        """log10 rho(P, T, Y, Z).  Alias for val.get_logrho_pt_val."""
-        _y = self._to_yprime(_y, _z)
-        return self.val.get_logrho_pt_val(_lgp, _lgt, _y, _z)
+        """log10 rho(P, T, Y, Z).  Delegates to get_logrho_pt_tab."""
+        return self.get_logrho_pt_tab(_lgp, _lgt, _y, _z, **kw)
 
     def get_logu_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
-        """log10 U(P, T, Y, Z).  Returns log10(erg/g)."""
-        _y = self._to_yprime(_y, _z)
-        return np.log10(self.val.get_u_pt_val(_lgp, _lgt, _y, _z))
+        """log10 U(P, T, Y, Z).  Delegates to get_logu_pt_tab."""
+        return self.get_logu_pt_tab(_lgp, _lgt, _y, _z, **kw)
 
     # --- Derivative aliases (old names → new names) ---
 
@@ -3923,8 +4233,8 @@ class hhe_z_mixtures():
         s_kb = _s  # already in kb/baryon
         lgt1 = self.get_logt_sp(s_kb - ds, _lgp, _y, _z)
         lgt2 = self.get_logt_sp(s_kb + ds, _lgp, _y, _z)
-        rho1 = self.val.get_logrho_pt_val(_lgp, lgt1, _y, _z)
-        rho2 = self.val.get_logrho_pt_val(_lgp, lgt2, _y, _z)
+        rho1 = self._logrho_pt(_lgp, lgt1, _y, _z)
+        rho2 = self._logrho_pt(_lgp, lgt2, _y, _z)
         return (rho2 - rho1) * log10_to_loge / (2 * ds / erg_to_kbbar)
 
     def get_dlogt_dy_rhop_rhot(self, _lgrho, _lgt, _y, _z,

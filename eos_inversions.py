@@ -73,7 +73,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
     p.add_argument('--basis', required=True,
-                   choices=['sp', 'rhot', 'rhop', 'srho'],
+                   choices=['pt', 'sp', 'rhot', 'rhop', 'srho'],
                    help='Target basis for inversion')
 
     # EOS selection
@@ -204,6 +204,11 @@ def main():
     print("-" * 65)
 
     # --- Create EOS ---
+    # pt_tab=True uses the smooth P-T table for forward-model evaluation
+    # during inversions. inv_tab=False avoids loading inverted tables
+    # (which are what we're building). For --basis pt, both are off
+    # since we build from raw VAL.
+    _pt_tab = (args.basis != 'pt')  # PT basis builds from VAL
     eos = hhe_z_mixtures(
         hhe_eos_name=args.hhe_eos,
         hg=hg,
@@ -212,7 +217,8 @@ def main():
         mu_h_vary=mu_h_vary,
         species_list=args.species,
         z_eos=args.z_eos,
-        tab=False,
+        pt_tab=_pt_tab,
+        inv_tab=False,
         logp_range=(args.logp_lo, args.logp_hi),
         logp_step=args.logp_step,
         logt_range=(args.logt_lo, args.logt_hi),
@@ -224,7 +230,11 @@ def main():
     # --- Build table ---
     t0 = time.time()
 
-    if args.basis == 'sp':
+    if args.basis == 'pt':
+        result = eos.build_pt_table(yvals, zvals)
+        eos.save_pt_table(result, path=args.output)
+
+    elif args.basis == 'sp':
         result = eos.build_sp_table(yvals, zvals, n_xi=args.n_xi)
         eos.save_sp_table(result, path=args.output)
 

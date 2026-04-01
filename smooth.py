@@ -1,5 +1,83 @@
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, median_filter
+
+
+def hampel_filter_1d(arr, window=5, n_sigma=3.0):
+    """Hampel filter: replace outliers with the local median.
+
+    Scans a 1-D array and replaces points that deviate from the
+    local median by more than n_sigma × MAD (median absolute
+    deviation).  Uses linear interpolation from valid neighbors
+    instead of the median, to preserve gradients.
+
+    Parameters
+    ----------
+    arr : 1-D array
+    window : int
+        Half-width of the sliding window (total width = 2*window+1).
+    n_sigma : float
+        Threshold in units of MAD.
+
+    Returns
+    -------
+    cleaned : 1-D array (copy)
+    n_replaced : int, number of points replaced
+    """
+    arr = np.asarray(arr, dtype=float)
+    cleaned = arr.copy()
+    n = len(arr)
+    flagged = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        lo = max(0, i - window)
+        hi = min(n, i + window + 1)
+        local = arr[lo:hi]
+        med = np.nanmedian(local)
+        mad = 1.4826 * np.nanmedian(np.abs(local - med))
+        if mad < 1e-30:
+            continue
+        if np.abs(arr[i] - med) > n_sigma * mad:
+            flagged[i] = True
+
+    # Interpolate flagged points from valid neighbors
+    if flagged.any():
+        good = ~flagged & np.isfinite(arr)
+        if good.sum() >= 2:
+            cleaned[flagged] = np.interp(
+                np.where(flagged)[0],
+                np.where(good)[0],
+                arr[good])
+
+    return cleaned, int(flagged.sum())
+
+
+def hampel_filter_2d(grid, axis, window=5, n_sigma=3.0):
+    """Apply Hampel filter along one axis of a 2-D grid.
+
+    Parameters
+    ----------
+    grid : 2-D array, shape (nT, nP) or (nP, nT)
+    axis : int, 0 or 1
+        0 = filter along each column (varying T at fixed P)
+        1 = filter along each row (varying P at fixed T)
+    window, n_sigma : Hampel parameters
+
+    Returns
+    -------
+    cleaned : 2-D array (copy)
+    total_replaced : int
+    """
+    cleaned = grid.copy()
+    total = 0
+    if axis == 0:
+        for j in range(grid.shape[1]):
+            cleaned[:, j], n = hampel_filter_1d(grid[:, j], window, n_sigma)
+            total += n
+    else:
+        for i in range(grid.shape[0]):
+            cleaned[i, :], n = hampel_filter_1d(grid[i, :], window, n_sigma)
+            total += n
+    return cleaned, total
 
 
 def get_polyfit(arr, deg=10):
@@ -368,7 +446,20 @@ def smooth_eos_table(grids, logt_1d, logp_1d):
             smoothed[key], logp_1d, invalid_mask=invalid_lowp, side='left', n_anchor=5
         )
 
-    # Step 2: 2D Gaussian smoothing in low-P region
+    # Step 2: Hampel filter along isotherms and isobars.
+    # Removes isolated sharp glitches FIRST, so that the subsequent
+    # Gaussian smoothing doesn't amplify outliers into broad bumps
+    # that shift the adiabat.
+    for key in ['logrho', 'logs', 'logu']:
+        smoothed[key], _ = hampel_filter_2d(
+            smoothed[key], axis=1, window=5, n_sigma=3.0)
+        smoothed[key], _ = hampel_filter_2d(
+            smoothed[key], axis=0, window=5, n_sigma=3.0)
+
+    # Step 3: 2D Gaussian smoothing in the low-P region.
+    # Applied AFTER the Hampel filter, which already removed
+    # sharp outliers that would otherwise get smeared into
+    # broad bumps by the Gaussian.
     for key in ['logrho', 'logs', 'logu']:
         smoothed[key] = smooth_lowp_2d(
             smoothed[key], logp_1d,
@@ -376,14 +467,14 @@ def smooth_eos_table(grids, logt_1d, logp_1d):
             sigma_t=3.0, sigma_p=3.0,
         )
 
-    # Step 3: PPT floor + post-floor repair
+    # Step 4: PPT floor + post-floor repair (high-P only)
     last_clean = detect_invalid_highp(grids, logp_1d, logt_1d)
     for key in ['logrho', 'logs', 'logu']:
         smoothed[key] = extrapolate_from_boundary(
             smoothed[key], logp_1d, last_clean_idx=last_clean, side='right', n_anchor=10
         )
 
-    # Step 4: Targeted 2D Gaussian smoothing in dissociation/ionization region
+    # Step 5: Targeted 2D Gaussian in dissociation/ionization zone.
     for key in ['logrho', 'logs', 'logu']:
         smoothed[key] = targeted_gaussian_smooth(
             smoothed[key], logt_1d, logp_1d,
