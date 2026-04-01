@@ -1,6 +1,25 @@
 """
 Tests for hhe_z_mixtures: on-the-fly inversion and S-P table accuracy.
 
+This suite validates the hhe_z_mixtures class at three levels:
+
+  1. **Inversion tests** (6 tests): Verify that the S-P root-finding
+     inversion (brentq) recovers the input entropy to < 1e-4 k_B/baryon.
+     Tests scalar, array, multi-metal, density consistency, full adiabat
+     tracing, and adiabat monotonicity (dT/dP >= 0).
+
+  2. **Table tests** (5 tests): Verify that the pre-computed rhomboid
+     xi-mapped S-P table reproduces the exact brentq inversion.
+     Benchmarks: max |dlogT| < 0.05 on a fixed grid, median |dlogT| < 0.005
+     on 100 random points.  Also checks NaN-free guarantee and save/load
+     roundtrip to .npz files.
+
+  3. **Edge-case tests** (2 tests): Out-of-bounds queries return NaN or
+     boundary clamps, and different Y'/Z compositions give different T.
+
+Shared fixtures cache a single hhe_z_mixtures instance (CMS19, smoothed,
+water, logP 6-13.5, dlogP=0.1, n_xi=50) to avoid redundant table loads.
+
 Run from the orchard root directory:
     python -m pytest eos/test_hhe_z_mixtures.py -v
     python eos/test_hhe_z_mixtures.py           # standalone
@@ -49,7 +68,12 @@ def _get_eos_with_table():
 # =====================================================================
 
 def test_inversion_scalar_roundtrip():
-    """Scalar inversion: S(P, T(S,P)) must equal the queried S."""
+    """Scalar inversion: S(P, T(S,P)) must equal the queried S.
+
+    For five (S, logP) pairs spanning the domain edges and interior,
+    calls get_logt_sp to invert S -> T, then evaluates the forward
+    model S(P,T) and checks |S_recovered - S_query| < 1e-4 k_B/baryon.
+    """
     eos = _get_eos()
     yp, z = 0.245, 0.0
 
@@ -72,7 +96,12 @@ def test_inversion_scalar_roundtrip():
 
 
 def test_inversion_array_roundtrip():
-    """Array inversion: all converged points must round-trip."""
+    """Array inversion: vectorized (S, P) arrays must round-trip.
+
+    Passes 8-element arrays to get_logt_sp and verifies that at least
+    6 converge with |err| < 1e-4 k_B/baryon.  Tests the vectorized
+    code path including broadcasting and NaN handling.
+    """
     eos = _get_eos()
     yp, z = 0.245, 0.0
 
@@ -91,7 +120,12 @@ def test_inversion_array_roundtrip():
 
 
 def test_inversion_with_metals():
-    """Inversion with Z > 0 must also round-trip."""
+    """Inversion with Z > 0 must also round-trip.
+
+    Tests two multi-metal compositions: (a) Z=0.02 pure water, and
+    (b) Z=0.05 with water+CH4+NH3 sub-fractions (_zm=0.1, _za=0.05).
+    Verifies the VAL mixing path through the inversion.
+    """
     eos = _get_eos()
 
     cases = [
@@ -111,7 +145,12 @@ def test_inversion_with_metals():
 
 
 def test_inversion_logrho_consistency():
-    """logrho from S-P inversion must match forward model at (P, T)."""
+    """logrho from S-P inversion must match forward model at (P, T).
+
+    Calls get_logrho_sp (which internally inverts S->T then evaluates
+    rho(P,T)) and compares against a direct rho(P, T(S,P)) call.
+    The two must agree to < 1e-8 since they use the same forward model.
+    """
     eos = _get_eos()
     yp, z = 0.245, 0.0
     s_kb, lgp = 7.0, 10.0
@@ -126,7 +165,11 @@ def test_inversion_logrho_consistency():
 
 
 def test_inversion_adiabat():
-    """Full adiabat: inversion at many pressures for a fixed S."""
+    """Full adiabat: inversion at 50 pressures for a fixed S = 7 k_B/baryon.
+
+    Traces T(P) along an isentrope from logP=7 to 13.  Requires at
+    least 40/50 points to converge, each with |err| < 1e-4 k_B/baryon.
+    """
     eos = _get_eos()
     yp, z = 0.245, 0.0
     s_kb = 7.0
@@ -145,7 +188,13 @@ def test_inversion_adiabat():
 
 
 def test_inversion_monotonic_adiabat():
-    """Adiabat T(P) must be monotonically increasing with P."""
+    """Adiabat T(P) must be monotonically increasing with P.
+
+    Physical adiabats have dT/dP > 0 (compression heats).  Checks
+    that all consecutive dlogT steps are >= -1e-6 (allowing for
+    numerical tolerance).  A violation would indicate a glitch in
+    the inversion or an unphysical table feature.
+    """
     eos = _get_eos()
     yp, z = 0.245, 0.0
     s_kb = 7.0
@@ -165,16 +214,22 @@ def test_inversion_monotonic_adiabat():
 # =====================================================================
 
 def test_table_builds_successfully():
-    """Table build must converge on >95% of cells."""
+    """S-P table build must succeed and produce a valid RGI.
+
+    Builds a small table (Y'=[0.20, 0.245, 0.30], Z=[0.0, 0.02],
+    n_xi=50) and checks that the RegularGridInterpolator is set.
+    """
     eos = _get_eos_with_table()
     assert eos._logt_sp_rgi is not None, "Table RGI not set"
 
 
 def test_table_vs_inversion_accuracy():
-    """Table lookup must agree with exact inversion within tolerance.
+    """Table lookup must agree with exact brentq inversion.
 
-    This is the primary accuracy benchmark. Tolerance depends on
-    table resolution (n_xi=50, dlogP=0.1 → ~0.5% median).
+    Primary accuracy benchmark.  Compares table-based get_logt_sp
+    against on-the-fly brentq inversion (separate instance with no
+    table) at 8 fixed (S, logP) points.  Tolerance: max |dlogT| < 0.05
+    (with n_xi=50, dlogP=0.1 table resolution).
     """
     eos_tab = _get_eos_with_table()
 
@@ -208,7 +263,13 @@ def test_table_vs_inversion_accuracy():
 
 
 def test_table_vs_inversion_random():
-    """Random sample: median relative T error must be < 1%."""
+    """Random sample: median |dlogT| < 0.005 (~1% relative T error).
+
+    Draws 100 random (S, logP) points in [4,11] x [7,13] and compares
+    table vs exact inversion.  Requires at least 50 to converge in
+    both paths.  Median |dlogT| < 0.005 ensures the table is accurate
+    across the interior of the domain, not just at test points.
+    """
     eos_tab = _get_eos_with_table()
 
     eos_inv = hhe_z_mixtures(
@@ -241,7 +302,13 @@ def test_table_vs_inversion_random():
 
 
 def test_table_save_load_roundtrip():
-    """Save → load → query must reproduce the same values."""
+    """Save table to .npz, load into a fresh instance, query must match.
+
+    Writes the S-P table arrays (xi_vals, logpvals, yvals, zvals,
+    logt_sp, s_lo, s_hi, logt_min, logt_max) to a temp file, loads
+    them into a new hhe_z_mixtures instance, and checks that lookups
+    agree to < 1e-10 at three test points.
+    """
     eos_tab = _get_eos_with_table()
 
     with tempfile.NamedTemporaryFile(suffix='.npz', delete=False) as f:
@@ -286,7 +353,12 @@ def test_table_save_load_roundtrip():
 
 
 def test_table_zero_nans():
-    """Built table must have zero NaN cells after interpolation."""
+    """Built table must have zero NaN cells after _fill_table_nans.
+
+    The 3-pass NaN repair (nearest-neighbor, linear, nearest again)
+    must leave zero NaN values in the logt_sp array.  Any remaining
+    NaN would cause silent failures during RGI lookup.
+    """
     eos = _get_eos_with_table()
     logt_data = eos._logt_sp_rgi.values
     n_nan_logt = np.isnan(logt_data).sum()
@@ -299,7 +371,12 @@ def test_table_zero_nans():
 # =====================================================================
 
 def test_out_of_bounds_returns_nan():
-    """Queries far outside the physical domain must return NaN."""
+    """Queries far outside the physical domain must return NaN or clamp.
+
+    Tests S=200 (far above any physical entropy) and S=-5 (unphysical
+    negative).  The inversion should return NaN or the boundary logT
+    value, not a spurious finite result.
+    """
     eos = _get_eos()
     yp = 0.245
 
@@ -315,7 +392,12 @@ def test_out_of_bounds_returns_nan():
 
 
 def test_different_compositions_differ():
-    """Different Y' or Z should give different T at the same (S, P)."""
+    """Different Y' or Z must give different T at the same (S, P).
+
+    At S=7, logP=10, compares Y'=0.245 vs 0.30 (He fraction change)
+    and Y'=0.245,Z=0 vs Z=0.05 (metal addition).  Both must shift T.
+    A failure would indicate the composition dependence is broken.
+    """
     eos = _get_eos()
     s_kb, lgp = 7.0, 10.0
 
