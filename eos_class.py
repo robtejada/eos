@@ -1366,7 +1366,10 @@ class hhe_z_mixtures():
         self.logt_min = logt_range[0]
         self.logt_max = logt_range[1]
         self.n_xi = n_xi
-        self.xi_vals = np.linspace(0.0, 1.0, n_xi)
+        # Default ξ grid (overwritten when a table is loaded)
+        _alpha = 3.0
+        _t = np.linspace(0.0, 1.0, n_xi)
+        self.xi_vals = np.sinh(_alpha * _t) / np.sinh(_alpha)
 
         self.logrho_vals = np.arange(logrho_range[0],
                                       logrho_range[1] + logrho_step * 0.1,
@@ -1889,16 +1892,20 @@ class hhe_z_mixtures():
         # logt_max=7 gives S > 600 kb/baryon, while physical
         # planetary entropies are ≲ 50.  Without capping, physical
         # isentropes map to ξ < 0.03 at low P, destroying table
-        # resolution.  The cap is set per (Y', Z) slice as the
-        # maximum of S_hi in the upper half of the P grid (where
-        # S_hi is well-behaved), plus a 20% margin.
-        mid_ip = nP // 2
+        # resolution.
+        #
+        # Strategy: use the 75th percentile of S_hi across the
+        # full P grid as the cap (with a 50% margin), so that
+        # the bulk of the ξ range covers physically relevant S.
+        # Combined with sinh-clustered ξ, this ensures good
+        # resolution at both low and high pressures.
         for iy_i in range(nY):
             for iz_i in range(nZ):
-                upper_half = s_hi_3d[mid_ip:, iy_i, iz_i]
-                cap = np.nanmax(upper_half) * 1.2
-                s_hi_3d[:, iy_i, iz_i] = np.minimum(
-                    s_hi_3d[:, iy_i, iz_i], cap)
+                col = s_hi_3d[:, iy_i, iz_i]
+                cap = np.nanpercentile(col, 75) * 1.5
+                # Don't cap below the minimum s_hi (safety)
+                cap = max(cap, np.nanmin(col))
+                s_hi_3d[:, iy_i, iz_i] = np.minimum(col, cap)
 
         # Smooth S bounds along the P axis to remove spikes from AQUA
         # phase transitions (ionization/dissociation at high T).
@@ -2598,14 +2605,32 @@ class hhe_z_mixtures():
 
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
-        xi_vals = np.linspace(0.0, 1.0, n_xi)
+
+        # Non-uniform ξ spacing: cluster points near ξ=0 where
+        # physical planetary entropies (S ≈ 4–15 kb/baryon) live.
+        # At low P and high Z, the S range is huge (s_hi > 100) but
+        # physical S maps to ξ < 0.1, so uniform spacing wastes
+        # resolution.  A sinh-based mapping puts ~half the points
+        # in the lower 20% of ξ.
+        #
+        #   ξ = sinh(α * t) / sinh(α)   where t ∈ [0, 1]
+        #
+        # α controls the clustering strength (α=0 → uniform,
+        # larger α → more clustered near 0).
+        alpha = 3.0
+        t_uniform = np.linspace(0.0, 1.0, n_xi)
+        xi_vals = np.sinh(alpha * t_uniform) / np.sinh(alpha)
+
         logp = self.logp_vals
 
         nP, nY, nZ = len(logp), len(yvals), len(zvals)
 
         # --- Step 1: compute S bounds ---
         if verbose:
-            print(f"Building S-P table: n_xi={n_xi}, "
+            frac_below_20 = np.sum(xi_vals < 0.2) / n_xi
+            print(f"Building S-P table: n_xi={n_xi} "
+                  f"(sinh-clustered, α={alpha}, "
+                  f"{frac_below_20:.0%} of pts below ξ=0.2), "
                   f"logP=[{logp[0]:.2f}, {logp[-1]:.2f}] "
                   f"(dlogP={logp[1]-logp[0]:.2f}, {nP} pts), "
                   f"logT=[{self.logt_min:.1f}, {self.logt_max:.1f}]")
