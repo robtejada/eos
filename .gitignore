@@ -67,3 +67,5 @@ rock_eos/mgsio3_JJ_SP.npz
 .claude/*
 diagnose_isentrope_kinks.py
 compare_aqua_revised.py
+scvh/scvh_*ppv2*
+scvh/scvh_*highS*
