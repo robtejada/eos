@@ -382,10 +382,10 @@ class Fe_EOS:
 
         candidates.extend(
             [
-                this_dir / "gonzales_iron_eos",
-                this_dir / "eos" / "gonzales_iron_eos",
-                Path.cwd() / "gonzales_iron_eos",
-                Path.cwd() / "eos" / "gonzales_iron_eos",
+                this_dir / "gonzalez_iron_eos",
+                this_dir / "eos" / "gonzalez_iron_eos",
+                Path.cwd() / "gonzalez_iron_eos",
+                Path.cwd() / "eos" / "gonzalez_iron_eos",
             ]
         )
 
@@ -394,7 +394,7 @@ class Fe_EOS:
                 return cand
 
         raise FileNotFoundError(
-            "Could not locate 'gonzales_iron_eos' directory. "
+            "Could not locate 'gonzalez_iron_eos' directory. "
             "Pass data_dir explicitly."
         )
 
@@ -1625,10 +1625,10 @@ class Fe_COMBINED_EOS(Fe_EOS):
         this_dir = Path(__file__).resolve().parent
         fname = "iron_eos_SP_comb_gonzalez.npz"
         candidates = [
-            Path.cwd() / "eos" / "gonzales_iron_eos" / fname,
-            Path.cwd() / "gonzales_iron_eos" / fname,
-            this_dir / "gonzales_iron_eos" / fname,
-            this_dir / "eos" / "gonzales_iron_eos" / fname,
+            Path.cwd() / "eos" / "gonzalez_iron_eos" / fname,
+            Path.cwd() / "gonzalez_iron_eos" / fname,
+            this_dir / "gonzalez_iron_eos" / fname,
+            this_dir / "eos" / "gonzalez_iron_eos" / fname,
         ]
         for cand in candidates:
             if cand.is_file():
