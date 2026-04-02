@@ -1299,12 +1299,12 @@ class hhe_z_mixtures():
                  smooth_hhe=True, smooth_z=True,
                  mu_h_vary=True,
                  species_list=None,
-                 z_eos='water_revised',
+                 z_eos='aqua_revised',
                  pt_tab=True,
                  inv_tab=True,
                  y_prime=True,
                  logp_range=(5.0, 15.0), logp_step=0.05,
-                 logt_range=(1.0, 7.0),
+                 logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
                  n_xi=100):
         """

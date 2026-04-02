@@ -36,7 +36,7 @@ from eos.eos_class import hhe_z_mixtures
 
 DEFAULTS = {
     'hhe_eos':    'cd',
-    'z_eos':      'aqua',
+    'z_eos':      'aqua_revised',
     'hg':         True,
     'smooth_hhe': True,
     'smooth_z':   True,
@@ -89,8 +89,8 @@ def build_parser():
     p.add_argument('--no_mu_h_vary', action='store_true',
                    help='Disable P-T dependent mu_H')
     p.add_argument('--species', nargs='+',
-                   default=['water'],
-                   help="Z species for val_mixtures (default: water)")
+                   default=['water_revised'],
+                   help="Z species for val_mixtures (default: water_revised)")
 
     # P grid
     p.add_argument('--logp_lo', type=float, default=DEFAULTS['logp_lo'],
