@@ -10,6 +10,9 @@ def hampel_filter_1d(arr, window=5, n_sigma=3.0):
     deviation).  Uses linear interpolation from valid neighbors
     instead of the median, to preserve gradients.
 
+    Uses a vectorized sliding-window approach via stride tricks
+    for performance (avoids per-element Python loops).
+
     Parameters
     ----------
     arr : 1-D array
@@ -26,18 +29,24 @@ def hampel_filter_1d(arr, window=5, n_sigma=3.0):
     arr = np.asarray(arr, dtype=float)
     cleaned = arr.copy()
     n = len(arr)
-    flagged = np.zeros(n, dtype=bool)
+    if n < 3:
+        return cleaned, 0
 
-    for i in range(n):
-        lo = max(0, i - window)
-        hi = min(n, i + window + 1)
-        local = arr[lo:hi]
-        med = np.nanmedian(local)
-        mad = 1.4826 * np.nanmedian(np.abs(local - med))
-        if mad < 1e-30:
-            continue
-        if np.abs(arr[i] - med) > n_sigma * mad:
-            flagged[i] = True
+    # Pad array to handle edges (reflect padding)
+    w = int(window)
+    padded = np.pad(arr, w, mode='reflect')
+
+    # Build sliding window view: shape (n, 2*w+1)
+    from numpy.lib.stride_tricks import sliding_window_view
+    windows = sliding_window_view(padded, 2 * w + 1)  # (n, 2w+1)
+
+    # Vectorized median and MAD
+    med = np.nanmedian(windows, axis=1)
+    mad = 1.4826 * np.nanmedian(np.abs(windows - med[:, None]), axis=1)
+
+    # Flag outliers
+    deviation = np.abs(arr - med)
+    flagged = (mad > 1e-30) & (deviation > n_sigma * mad)
 
     # Interpolate flagged points from valid neighbors
     if flagged.any():

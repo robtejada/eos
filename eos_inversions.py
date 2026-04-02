@@ -46,7 +46,7 @@ DEFAULTS = {
     'logp_lo':    5.0, # 0.1 bar
     'logp_hi':    15.0, # 1000 Mbar
     'logp_step':  0.05,
-    'logt_lo':    1.0,
+    'logt_lo':    1.5,
     'logt_hi':    7.0,
 
     # ρ grid (for rhot, rhop, srho)

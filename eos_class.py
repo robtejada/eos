@@ -975,7 +975,7 @@ class hhe_z_mixtures():
                  smooth_hhe=True, smooth_z=True,
                  mu_h_vary=True,
                  species_list=None,
-                 z_eos='water',
+                 z_eos='aqua',
                  pt_tab=True,
                  inv_tab=True,
                  y_prime=True,
@@ -1201,13 +1201,37 @@ class hhe_z_mixtures():
 
         pbar.close()
 
-        # Fill NaN
-        n_nan = np.isnan(s_pt).sum()
-        if n_nan > 0 and verbose:
-            print(f"Filling {n_nan} NaN cells by interpolation ...")
-            s_pt = self._fill_table_nans(s_pt)
-            logrho_pt = self._fill_table_nans(logrho_pt)
-            logu_pt = self._fill_table_nans(logu_pt)
+        # Fill NaN in all arrays first (so Hampel has no gaps).
+        # Uses PT-axis ordering: (P, T, Y', Z).
+        for arr, label in [(s_pt, 'S'), (logrho_pt, 'logrho'),
+                           (logu_pt, 'logU')]:
+            n_nan = np.isnan(arr).sum()
+            if n_nan > 0:
+                if verbose:
+                    print(f"Filling {n_nan} NaN cells in {label} ...")
+                self._fill_nans_2axis(arr, axis0=0, axis1=1)
+
+        # Detect and replace finite outlier spikes along the P axis.
+        # The CD21 H-He forward model can produce isolated entropy
+        # spikes (e.g. 260x at logP=12.75, low T) from numerical
+        # artifacts in the underlying tables.  Only S is filtered;
+        # rho and U at the same grid points are typically smooth.
+        if verbose:
+            print("Running Hampel outlier filter on S along P axis ...")
+        flat = s_pt.reshape(nP, -1)  # (nP, nT*nY*nZ)
+        n_cols = flat.shape[1]
+        n_outliers = 0
+        for j in range(n_cols):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=7, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"Replaced {n_outliers} finite outlier cells "
+                  f"in S (Hampel filter along P axis)")
 
         s_f32 = s_pt.astype(np.float32)
         logrho_f32 = logrho_pt.astype(np.float32)
@@ -1534,6 +1558,22 @@ class hhe_z_mixtures():
                     s_hi_3d[ip, iy, iz] = max(s_cold, s_hot)
         pbar.close()
 
+        # Cap S_hi to prevent the ξ range from being dominated by
+        # extreme values at low P / high T.  At low pressures,
+        # logt_max=7 gives S > 600 kb/baryon, while physical
+        # planetary entropies are ≲ 50.  Without capping, physical
+        # isentropes map to ξ < 0.03 at low P, destroying table
+        # resolution.  The cap is set per (Y', Z) slice as the
+        # maximum of S_hi in the upper half of the P grid (where
+        # S_hi is well-behaved), plus a 20% margin.
+        mid_ip = nP // 2
+        for iy_i in range(nY):
+            for iz_i in range(nZ):
+                upper_half = s_hi_3d[mid_ip:, iy_i, iz_i]
+                cap = np.nanmax(upper_half) * 1.2
+                s_hi_3d[:, iy_i, iz_i] = np.minimum(
+                    s_hi_3d[:, iy_i, iz_i], cap)
+
         # Smooth S bounds along the P axis to remove spikes from AQUA
         # phase transitions (ionization/dissociation at high T).
         # Without this, S_hi(P) can swing by 16x over 0.5 dex in logP,
@@ -1638,14 +1678,213 @@ class hhe_z_mixtures():
                   * erg_to_kbbar)
         return min(s_cold, s_hot), max(s_cold, s_hot)
 
+    # =================================================================
+    # Unified Newton-Raphson solvers (1-D and 2-D)
+    # =================================================================
+
+    def _newton_1d(self, err_func, guess, lo_abs, hi_abs,
+                   max_iter=30, tol=1e-8, h=1e-4):
+        """Newton-Raphson with adaptive brentq fallback for any 1-D inversion.
+
+        The solver tries Newton-Raphson first.  If Newton fails to
+        converge, the brentq fallback places a bracket around Newton's
+        last iterate and expands it recursively until a sign change is
+        found, up to the hard bounds ``[lo_abs, hi_abs]``.
+
+        Parameters
+        ----------
+        err_func : callable
+            f(x) = 0 at the desired root.  Must return float or NaN.
+        guess : float
+            Initial estimate (from ideal_eos or previous solution).
+        lo_abs, hi_abs : float
+            Hard bounds for the brentq bracket expansion
+            (e.g. logT=[1.5, 7.0] or logP bounds).
+        max_iter : int
+            Maximum Newton iterations.
+        tol : float
+            Convergence tolerance on |f(x)|.
+        h : float
+            Step for central-difference derivative.
+
+        Returns
+        -------
+        solution : float
+            Converged x, or NaN on failure.
+        converged : bool
+        """
+        x = float(np.clip(guess, lo_abs, hi_abs))
+
+        # --- Phase 1: Newton-Raphson ---
+        for _ in range(max_iter):
+            f_val = err_func(x)
+            if not np.isfinite(f_val):
+                break
+            if abs(f_val) < tol:
+                return x, True
+
+            f_plus = err_func(x + h)
+            f_minus = err_func(x - h)
+            if not (np.isfinite(f_plus) and np.isfinite(f_minus)):
+                break
+            fp = (f_plus - f_minus) / (2.0 * h)
+            if abs(fp) < 1e-30:
+                break
+
+            step = f_val / fp
+            if abs(step) > 1.0:
+                step = np.sign(step) * 1.0
+            x_new = np.clip(x - step, lo_abs, hi_abs)
+            if abs(x_new - x) < 1e-12:
+                f_new = err_func(x_new)
+                return x_new, (np.isfinite(f_new) and abs(f_new) < tol * 100)
+            x = x_new
+
+        # --- Phase 2: Adaptive brentq fallback ---
+        # Bracket starts around Newton's last iterate and expands
+        # recursively until a sign change is found.
+        delta = 0.5
+        factor = 2.0
+        max_attempts = 8
+        center = x  # Newton's last iterate
+
+        a = np.clip(center - delta, lo_abs, hi_abs)
+        b = np.clip(center + delta, lo_abs, hi_abs)
+
+        for _ in range(max_attempts):
+            fa = err_func(a)
+            fb = err_func(b)
+
+            if (np.isfinite(fa) and np.isfinite(fb)
+                    and fa * fb < 0):
+                try:
+                    sol = brentq(err_func, a, b,
+                                 xtol=1e-6, maxiter=100)
+                    return sol, True
+                except (ValueError, RuntimeError,
+                        ZeroDivisionError):
+                    pass
+
+            # Expand bracket
+            a = np.clip(a - delta * factor, lo_abs, hi_abs)
+            b = np.clip(b + delta * factor, lo_abs, hi_abs)
+            delta *= factor
+
+            # If we've hit both hard bounds without sign change → give up
+            if a == lo_abs and b == hi_abs:
+                # One last try with full range
+                fa = err_func(a)
+                fb = err_func(b)
+                if (np.isfinite(fa) and np.isfinite(fb)
+                        and fa * fb < 0):
+                    try:
+                        sol = brentq(err_func, a, b,
+                                     xtol=1e-6, maxiter=100)
+                        return sol, True
+                    except (ValueError, RuntimeError,
+                            ZeroDivisionError):
+                        pass
+                return np.nan, False
+
+        return np.nan, False
+
+    def _newton_2d(self, residuals_func, guess, lb, ub,
+                   max_iter=30, tol=1e-8, h=1e-4):
+        """2-D Newton-Raphson for (S, rho) → (P, T) with least_squares fallback.
+
+        Parameters
+        ----------
+        residuals_func : callable
+            f(x) → array of length 2, where x = [logP, logT].
+        guess : array_like, shape (2,)
+            Initial [logP, logT] estimate.
+        lb, ub : array_like, shape (2,)
+            Lower/upper bounds for [logP, logT].
+        max_iter : int
+            Maximum Newton iterations.
+        tol : float
+            Convergence tolerance on max(|residual|).
+        h : float
+            Step for numerical Jacobian.
+
+        Returns
+        -------
+        solution : ndarray, shape (2,)
+            Converged [logP, logT], or [NaN, NaN].
+        converged : bool
+        """
+        x = np.clip(np.asarray(guess, dtype=float), lb, ub)
+
+        for _ in range(max_iter):
+            r = residuals_func(x)
+            if not np.all(np.isfinite(r)):
+                break
+            if np.max(np.abs(r)) < tol:
+                return x, True
+
+            # Numerical Jacobian (2x2)
+            J = np.empty((2, 2))
+            for j in range(2):
+                x_plus = x.copy()
+                x_minus = x.copy()
+                x_plus[j] += h
+                x_minus[j] -= h
+                r_plus = residuals_func(x_plus)
+                r_minus = residuals_func(x_minus)
+                if not (np.all(np.isfinite(r_plus))
+                        and np.all(np.isfinite(r_minus))):
+                    J[:, j] = 0.0
+                else:
+                    J[:, j] = (r_plus - r_minus) / (2.0 * h)
+
+            det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+            if abs(det) < 1e-30:
+                break
+
+            # Solve J @ dx = r  →  dx = J^{-1} @ r
+            dx = np.array([
+                ( J[1, 1] * r[0] - J[0, 1] * r[1]) / det,
+                (-J[1, 0] * r[0] + J[0, 0] * r[1]) / det])
+
+            # Limit step size
+            for j in range(2):
+                if abs(dx[j]) > 1.0:
+                    dx[j] = np.sign(dx[j]) * 1.0
+
+            x_new = np.clip(x - dx, lb, ub)
+            if np.max(np.abs(x_new - x)) < 1e-12:
+                r_new = residuals_func(x_new)
+                return x_new, (np.all(np.isfinite(r_new))
+                               and np.max(np.abs(r_new)) < tol * 100)
+            x = x_new
+
+        # --- Fallback: least_squares ---
+        try:
+            sol = least_squares(
+                residuals_func, x,
+                bounds=(lb, ub),
+                method='trf',
+                xtol=1e-10, ftol=1e-10,
+                gtol=1e-10, max_nfev=200)
+            if sol.success and np.all(np.isfinite(sol.x)):
+                return sol.x, True
+        except Exception:
+            pass
+
+        return np.array([np.nan, np.nan]), False
+
     def get_logt_sp(self, _s_kb, _lgp, _yp, _z=0.0,
                     _zm=0.0, _za=0.0, _zr=0.0, **kw):
-        """Temperature from (S, P) via root-finding on the forward model.
+        """Temperature from (S, P) via Newton-Raphson on the forward model.
 
-        Works immediately — no need to call ``compute_s_bounds`` first.
-        The physical S bounds are evaluated on-the-fly from the
-        underlying P-T table edges.  If a pre-computed S-P table has
-        been loaded (via ``load_sp_table``), the RGI is used instead.
+        Uses ``ideal_xy`` for initial guesses and the previous
+        converged solution as the starting point when sweeping arrays
+        (so isentropes naturally track the correct high-T branch).
+        Falls back to adaptive brentq bracketed around Newton's last
+        iterate, bounded by [1.5, 7.0] in logT.
+
+        If a pre-computed S-P table has been loaded, the RGI lookup
+        is used first; Newton/brentq only fills NaN entries.
 
         Parameters
         ----------
@@ -1663,24 +1902,31 @@ class hhe_z_mixtures():
         Returns
         -------
         logt : float or array
-            log10 T [K].  NaN where S is outside the physical rhomboid.
+            log10 T [K].  NaN where S is outside the physical domain.
         """
         _yp = self._to_yprime(_yp, _z)
+
+        def _make_err(s_i, p_i, yp_i, z_i, zm_i, za_i, zr_i):
+            def err(lgt):
+                try:
+                    s_test = self._s_pt(
+                        p_i, lgt, yp_i, z_i, zm_i, za_i, zr_i)
+                    return float(s_test * erg_to_kbbar - s_i)
+                except (ZeroDivisionError, FloatingPointError):
+                    return np.nan
+            return err
+
         # --- Fast path: pre-computed table ---
-        # If the table returns NaN (out-of-bounds or bounds are NaN),
-        # fall through to the slow path for those points.
         if self._logt_sp_rgi is not None:
             result = self._lookup_sp_table(
                 _s_kb, _lgp, _yp, _z, self._logt_sp_rgi)
-            # If all finite, return immediately
             result_arr = np.atleast_1d(result)
             if np.all(np.isfinite(result_arr)):
                 return result
-            # Otherwise, fill NaN entries via brentq below
+            # Fill NaN entries via _newton_1d
             if np.isscalar(_s_kb) and np.isscalar(_lgp):
                 pass  # single NaN → fall through to slow path
             else:
-                # Array: fill only the NaN entries via brentq
                 _s_arr = np.atleast_1d(np.asarray(_s_kb, dtype=float))
                 _p_arr = np.atleast_1d(np.asarray(_lgp, dtype=float))
                 _yp_arr = np.atleast_1d(np.asarray(_yp, dtype=float))
@@ -1693,101 +1939,42 @@ class hhe_z_mixtures():
                 _za_s = float(np.atleast_1d(_za).ravel()[0])
                 _zr_s = float(np.atleast_1d(_zr).ravel()[0])
                 if bad.any():
+                    prev_sol = None
                     for idx in np.where(bad.ravel())[0]:
                         s_i = float(_s_arr.ravel()[idx])
                         p_i = float(_p_arr.ravel()[idx])
                         yp_i = float(_yp_arr.ravel()[idx])
                         z_i = float(_z_arr.ravel()[idx])
-                        def err(lgt, _s=s_i, _p=p_i, _y=yp_i, _zv=z_i):
-                            try:
-                                s_test = self._s_pt(
-                                    _p, lgt, _y, _zv, _zm_s, _za_s, _zr_s)
-                                return s_test * erg_to_kbbar - _s
-                            except (ZeroDivisionError, FloatingPointError):
-                                return 1e30
-                        lo, hi = self.logt_min, self.logt_max
-                        err_lo = err(lo)
-                        if err_lo > 1e20 or not np.isfinite(err_lo):
-                            for t_try in np.arange(lo + 0.5, hi, 0.5):
-                                e = err(t_try)
-                                if np.isfinite(e) and e < 1e20:
-                                    lo = t_try
-                                    break
-                        try:
-                            out.ravel()[idx] = brentq(
-                                err, lo, hi,
-                                xtol=1e-6, maxiter=100)
-                        except (ValueError, RuntimeError,
-                                ZeroDivisionError):
-                            # Extrapolate from nearest valid boundary
-                            e_lo = err(lo)
-                            e_hi = err(hi)
-                            if np.isfinite(e_lo) and np.isfinite(e_hi):
-                                out.ravel()[idx] = lo if abs(e_lo) < abs(e_hi) else hi
-                            elif np.isfinite(e_hi):
-                                out.ravel()[idx] = hi
-                            elif np.isfinite(e_lo):
-                                out.ravel()[idx] = lo
+                        err_f = _make_err(s_i, p_i, yp_i, z_i,
+                                          _zm_s, _za_s, _zr_s)
+                        guess = (prev_sol if prev_sol is not None
+                                 else ideal_xy.get_t_sp(s_i, p_i, yp_i))
+                        sol, ok = self._newton_1d(
+                            err_f, guess, 1.5, 7.0)
+                        if np.isfinite(sol):
+                            out.ravel()[idx] = sol
+                            prev_sol = sol
                 return out.reshape(result_arr.shape)
 
-        # --- Slow path: per-point root-finding ---
-        # No rhomboid bounds check here — brentq tries the full
-        # [logt_min, logt_max] bracket.  The forward model can
-        # extrapolate beyond the strict P-T table edges (RGI with
-        # fill_value=None), so the root-finder is allowed to
-        # converge on those extrapolated values.  NaN is returned
-        # only when brentq genuinely cannot find a sign change.
+        # --- Slow path: per-point Newton-Raphson ---
         scalar_input = np.isscalar(_s_kb) and np.isscalar(_lgp)
         _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
         _lgp  = np.atleast_1d(np.asarray(_lgp, dtype=float))
         _s_kb, _lgp = np.broadcast_arrays(_s_kb, _lgp)
         out = np.full_like(_s_kb, np.nan, dtype=float)
 
+        prev_sol = None
         for idx in np.ndindex(_s_kb.shape):
-            s_i   = _s_kb[idx]
-            lgp_i = _lgp[idx]
+            s_i   = float(_s_kb[idx])
+            lgp_i = float(_lgp[idx])
 
-            # Target: find logT such that
-            #   val.get_s_pt_val(P, T, Y', Z) * erg_to_kbbar = s_i
-            def err(lgt):
-                try:
-                    s_test = self._s_pt(
-                        lgp_i, lgt, _yp, _z, _zm, _za, _zr)
-                    return s_test * erg_to_kbbar - s_i
-                except (ZeroDivisionError, FloatingPointError):
-                    return 1e30
-
-            # Find a valid bracket: scan from logt_min upward to find
-            # where the error function first becomes finite and negative
-            # (S_model < S_target), then bracket with logt_max.
-            lo, hi = self.logt_min, self.logt_max
-            err_lo = err(lo)
-            err_hi = err(hi)
-            # If lo is invalid (NaN region), scan upward
-            if err_lo > 1e20 or not np.isfinite(err_lo):
-                for t_try in np.arange(lo + 0.5, hi, 0.5):
-                    e = err(t_try)
-                    if np.isfinite(e) and e < 1e20:
-                        lo = t_try
-                        err_lo = e
-                        break
-
-            try:
-                logt_sol = brentq(err, lo, hi,
-                                  xtol=1e-6, maxiter=100)
-                out[idx] = logt_sol
-            except (ValueError, RuntimeError, ZeroDivisionError):
-                # Brentq failed — likely beyond the EOS domain.
-                # Extrapolate: return the T at the boundary where
-                # the error is smallest (closest to the target S).
-                err_lo_v = err(lo)
-                err_hi_v = err(hi)
-                if np.isfinite(err_lo_v) and np.isfinite(err_hi_v):
-                    out[idx] = lo if abs(err_lo_v) < abs(err_hi_v) else hi
-                elif np.isfinite(err_hi_v):
-                    out[idx] = hi
-                elif np.isfinite(err_lo_v):
-                    out[idx] = lo
+            err_f = _make_err(s_i, lgp_i, _yp, _z, _zm, _za, _zr)
+            guess = (prev_sol if prev_sol is not None
+                     else ideal_xy.get_t_sp(s_i, lgp_i, _yp))
+            sol, ok = self._newton_1d(err_f, guess, 1.5, 7.0)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
 
         if scalar_input:
             return out.item()
@@ -1913,6 +2100,55 @@ class hhe_z_mixtures():
     # =================================================================
     # NaN repair for tables
     # =================================================================
+
+    @staticmethod
+    def _fill_nans_2axis(arr, axis0=0, axis1=1):
+        """Interpolate NaN cells in a 4-D array along two axes (in-place).
+
+        Pass 1: interpolate along ``axis0`` at each slice of the other dims.
+        Pass 2: interpolate along ``axis1`` for any remaining NaN.
+        """
+        shape = arr.shape
+        n0, n1 = shape[axis0], shape[axis1]
+        other = [i for i in range(4) if i not in (axis0, axis1)]
+        n2, n3 = shape[other[0]], shape[other[1]]
+
+        for i2 in range(n2):
+            for i3 in range(n3):
+                # Build index template
+                idx = [None] * 4
+                idx[other[0]] = i2
+                idx[other[1]] = i3
+
+                # Pass 1: along axis0
+                for j1 in range(n1):
+                    idx[axis1] = j1
+                    idx[axis0] = slice(None)
+                    col = arr[tuple(idx)]
+                    bad = np.isnan(col)
+                    if not bad.any():
+                        continue
+                    good = ~bad
+                    if good.sum() < 2:
+                        continue
+                    col[bad] = np.interp(
+                        np.where(bad)[0], np.where(good)[0], col[good])
+                    arr[tuple(idx)] = col
+
+                # Pass 2: along axis1
+                for j0 in range(n0):
+                    idx[axis0] = j0
+                    idx[axis1] = slice(None)
+                    row = arr[tuple(idx)]
+                    bad = np.isnan(row)
+                    if not bad.any():
+                        continue
+                    good = ~bad
+                    if good.sum() < 2:
+                        continue
+                    row[bad] = np.interp(
+                        np.where(bad)[0], np.where(good)[0], row[good])
+                    arr[tuple(idx)] = row
 
     @staticmethod
     def _fill_table_nans(table):
@@ -2101,46 +2337,29 @@ class hhe_z_mixtures():
                     for ixi in range(n_xi):
                         s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
 
-                        def err(lgt):
+                        def err(lgt, _s=s_phys, _p=lgp_i):
                             try:
                                 s_test = self._s_pt(
-                                    lgp_i, lgt, yp, zv, _zm, _za, _zr)
-                                return s_test * erg_to_kbbar - s_phys
-                            except (ZeroDivisionError, FloatingPointError):
-                                return 1e30
+                                    _p, lgt, yp, zv, _zm, _za, _zr)
+                                return float(
+                                    s_test * erg_to_kbbar - _s)
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return np.nan
 
-                        solved = False
-
-                        # Newton from previous solution (fast path)
-                        if use_newton:
-                            guess = prev_logt[ixi, ip]
-                            if np.isfinite(guess):
-                                try:
-                                    lgt_sol = newton(
-                                        err, x0=guess,
-                                        tol=1e-8, maxiter=50)
-                                    if lmin <= lgt_sol <= lmax:
-                                        logt_sp[ixi, ip, iy, iz] = lgt_sol
-                                        prev_logt[ixi, ip] = lgt_sol
-                                        solved = True
-                                except (ValueError, RuntimeError,
-                                        OverflowError):
-                                    pass
-
-                        # Brentq fallback (guaranteed bracket)
-                        if not solved:
-                            try:
-                                lgt_sol = brentq(
-                                    err, lmin, lmax,
-                                    xtol=1e-8, maxiter=100)
-                                logt_sp[ixi, ip, iy, iz] = lgt_sol
-                                prev_logt[ixi, ip] = lgt_sol
-                            except (ValueError, RuntimeError, ZeroDivisionError):
-                                pass  # NaN stays
+                        # Use previous solution or mid-range as guess
+                        guess = prev_logt[ixi, ip]
+                        if not np.isfinite(guess):
+                            guess = 0.5 * (lmin + lmax)
+                        lgt_sol, ok = self._newton_1d(
+                            err, guess, 1.5, 7.0)
+                        if np.isfinite(lgt_sol):
+                            logt_sp[ixi, ip, iy, iz] = lgt_sol
+                            prev_logt[ixi, ip] = lgt_sol
 
         pbar.close()
 
-        # --- Step 3: fill any remaining NaNs by interpolation ---
+        # --- Step 3: fill NaNs first (so Hampel has no gaps) ---
         n_nan_before = np.isnan(logt_sp).sum()
         if n_nan_before > 0:
             if verbose:
@@ -2152,7 +2371,23 @@ class hhe_z_mixtures():
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # --- Step 4: cast to float32 to halve memory ---
+        # --- Step 4: Hampel outlier filter on logT along ξ axis ---
+        if verbose:
+            print("Running Hampel outlier filter on logT along ξ axis ...")
+        flat = logt_sp.reshape(n_xi, -1)
+        n_outliers = 0
+        for j in range(flat.shape[1]):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=5, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"  Replaced {n_outliers} outlier cells in logT")
+
+        # --- Step 5: cast to float32 to halve memory ---
         logt_sp_f32 = logt_sp.astype(np.float32)
         s_lo_f32    = s_lo.astype(np.float32)
         s_hi_f32    = s_hi.astype(np.float32)
@@ -2221,7 +2456,7 @@ class hhe_z_mixtures():
                 _lgrho, _lgt, _yp, _z)
 
         _yp = self._to_yprime(_yp, _z)
-        # --- Slow path: per-point brentq ---
+        # --- Slow path: Newton-Raphson per-point ---
         scalar_input = np.isscalar(_lgrho) and np.isscalar(_lgt)
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
         _lgt   = np.atleast_1d(np.asarray(_lgt, dtype=float))
@@ -2230,24 +2465,25 @@ class hhe_z_mixtures():
 
         lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
 
+        prev_sol = None
         for idx in np.ndindex(_lgrho.shape):
-            rho_i = _lgrho[idx]
-            lgt_i = _lgt[idx]
+            rho_i = float(_lgrho[idx])
+            lgt_i = float(_lgt[idx])
 
-            def err(lgp):
+            def err(lgp, _r=rho_i, _t=lgt_i):
                 try:
                     rho_test = self._logrho_pt(
-                        lgp, lgt_i, _yp, _z, _zm, _za, _zr)
-                    return rho_test - rho_i
+                        lgp, _t, _yp, _z, _zm, _za, _zr)
+                    return float(rho_test - _r)
                 except (ZeroDivisionError, FloatingPointError):
-                    return 1e30
+                    return np.nan
 
-            try:
-                lgp_sol = brentq(err, lgp_lo, lgp_hi,
-                                 xtol=1e-8, maxiter=100)
-                out[idx] = lgp_sol
-            except (ValueError, RuntimeError, ZeroDivisionError):
-                pass
+            guess = (prev_sol if prev_sol is not None
+                     else ideal_xy.get_p_rhot(rho_i, lgt_i, _yp))
+            sol, ok = self._newton_1d(err, guess, lgp_lo, lgp_hi)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
 
         if scalar_input:
             return out.item()
@@ -2424,52 +2660,48 @@ class hhe_z_mixtures():
                     for ixi in range(n_xi):
                         rho_phys = rlo_i + xi_vals[ixi] * (rhi_i - rlo_i)
 
-                        def err(lgp):
+                        def err(lgp, _rho=rho_phys, _t=lgt_i):
                             try:
                                 rho_test = self._logrho_pt(
-                                    lgp, lgt_i, yp, zv, _zm, _za, _zr)
-                                return rho_test - rho_phys
+                                    lgp, _t, yp, zv, _zm, _za, _zr)
+                                return float(rho_test - _rho)
                             except (ZeroDivisionError,
                                     FloatingPointError):
-                                return 1e30
+                                return np.nan
 
-                        solved = False
-
-                        if use_newton:
-                            guess = prev_logp[ixi, it]
-                            if np.isfinite(guess):
-                                try:
-                                    lgp_sol = newton(
-                                        err, x0=guess,
-                                        tol=1e-8, maxiter=50)
-                                    if lgp_lo <= lgp_sol <= lgp_hi:
-                                        logp_tab[ixi, it, iy, iz] = lgp_sol
-                                        prev_logp[ixi, it] = lgp_sol
-                                        solved = True
-                                except (ValueError, RuntimeError,
-                                        OverflowError,
-                                        ZeroDivisionError):
-                                    pass
-
-                        if not solved:
-                            try:
-                                lgp_sol = brentq(
-                                    err, lgp_lo, lgp_hi,
-                                    xtol=1e-8, maxiter=100)
-                                logp_tab[ixi, it, iy, iz] = lgp_sol
-                                prev_logp[ixi, it] = lgp_sol
-                            except (ValueError, RuntimeError,
-                                    ZeroDivisionError):
-                                pass
+                        guess = prev_logp[ixi, it]
+                        if not np.isfinite(guess):
+                            guess = 0.5 * (lgp_lo + lgp_hi)
+                        lgp_sol, ok = self._newton_1d(
+                            err, guess, lgp_lo, lgp_hi)
+                        if np.isfinite(lgp_sol):
+                            logp_tab[ixi, it, iy, iz] = lgp_sol
+                            prev_logp[ixi, it] = lgp_sol
 
         pbar.close()
 
-        # Step 3: fill NaNs
+        # Step 3: fill NaNs first (so Hampel has no gaps)
         n_nan = np.isnan(logp_tab).sum()
         if n_nan > 0:
             if verbose:
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
+
+        # Step 4: Hampel outlier filter on logP along ξ axis
+        if verbose:
+            print("Running Hampel outlier filter on logP along ξ axis ...")
+        flat = logp_tab.reshape(n_xi, -1)
+        n_outliers = 0
+        for j in range(flat.shape[1]):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=5, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"  Replaced {n_outliers} outlier cells in logP")
 
         logp_f32 = logp_tab.astype(np.float32)
 
@@ -2608,29 +2840,31 @@ class hhe_z_mixtures():
         if self._logt_rhop_rgi is not None:
             return self._lookup_rhop_table(_lgrho, _lgp, _yp, _z)
 
-        # Slow path: 1-D brentq per point
+        # Slow path: Newton-Raphson per point
         scalar = np.isscalar(_lgrho) and np.isscalar(_lgp)
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
         _lgp   = np.atleast_1d(np.asarray(_lgp, dtype=float))
         _lgrho, _lgp = np.broadcast_arrays(_lgrho, _lgp)
         out = np.full_like(_lgrho, np.nan, dtype=float)
 
+        prev_sol = None
         for idx in np.ndindex(_lgrho.shape):
-            rho_i = _lgrho[idx]
-            lgp_i = _lgp[idx]
+            rho_i = float(_lgrho[idx])
+            lgp_i = float(_lgp[idx])
 
-            def err(lgt):
+            def err(lgt, _r=rho_i, _p=lgp_i):
                 try:
-                    return (self._logrho_pt(
-                        lgp_i, lgt, _yp, _z, _zm, _za, _zr) - rho_i)
+                    return float(self._logrho_pt(
+                        _p, lgt, _yp, _z, _zm, _za, _zr) - _r)
                 except (ZeroDivisionError, FloatingPointError):
-                    return 1e30
+                    return np.nan
 
-            try:
-                out[idx] = brentq(err, self.logt_min, self.logt_max,
-                                  xtol=1e-6, maxiter=100)
-            except (ValueError, RuntimeError, ZeroDivisionError):
-                pass
+            guess = (prev_sol if prev_sol is not None
+                     else ideal_xy.get_t_rhop(rho_i, lgp_i, _yp))
+            sol, ok = self._newton_1d(err, guess, 1.5, 7.0)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
 
         if scalar:
             return out.item()
@@ -2723,53 +2957,48 @@ class hhe_z_mixtures():
                     for ixi in range(n_xi):
                         rho_phys = rlo_i + xi_vals[ixi] * (rhi_i - rlo_i)
 
-                        def err(lgt):
+                        def err(lgt, _rho=rho_phys, _p=lgp_i):
                             try:
-                                return (self._logrho_pt(
-                                    lgp_i, lgt, yp, zv, _zm, _za, _zr)
-                                    - rho_phys)
+                                return float(self._logrho_pt(
+                                    _p, lgt, yp, zv, _zm, _za, _zr)
+                                    - _rho)
                             except (ZeroDivisionError,
                                     FloatingPointError):
-                                return 1e30
+                                return np.nan
 
-                        solved = False
-
-                        if use_newton:
-                            guess = prev_logt[ixi, ip]
-                            if np.isfinite(guess):
-                                try:
-                                    lgt_sol = newton(
-                                        err, x0=guess,
-                                        tol=1e-8, maxiter=50)
-                                    if (self.logt_min <= lgt_sol
-                                            <= self.logt_max):
-                                        logt_tab[ixi, ip, iy, iz] = lgt_sol
-                                        prev_logt[ixi, ip] = lgt_sol
-                                        solved = True
-                                except (ValueError, RuntimeError,
-                                        OverflowError,
-                                        ZeroDivisionError):
-                                    pass
-
-                        if not solved:
-                            try:
-                                lgt_sol = brentq(
-                                    err, 1.0, self.logt_max,
-                                    xtol=1e-8, maxiter=100)
-                                logt_tab[ixi, ip, iy, iz] = lgt_sol
-                                prev_logt[ixi, ip] = lgt_sol
-                            except (ValueError, RuntimeError,
-                                    ZeroDivisionError):
-                                pass
+                        guess = prev_logt[ixi, ip]
+                        if not np.isfinite(guess):
+                            guess = 0.5 * (1.5 + 7.0)
+                        lgt_sol, ok = self._newton_1d(
+                            err, guess, 1.5, 7.0)
+                        if np.isfinite(lgt_sol):
+                            logt_tab[ixi, ip, iy, iz] = lgt_sol
+                            prev_logt[ixi, ip] = lgt_sol
 
         pbar.close()
 
-        # Step 3: fill NaNs
+        # Step 3: fill NaNs first (so Hampel has no gaps)
         n_nan = np.isnan(logt_tab).sum()
         if n_nan > 0:
             if verbose:
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logt_tab = self._fill_table_nans(logt_tab)
+
+        # Step 4: Hampel outlier filter on logT along ξ axis
+        if verbose:
+            print("Running Hampel outlier filter on logT along ξ axis ...")
+        flat = logt_tab.reshape(n_xi, -1)
+        n_outliers = 0
+        for j in range(flat.shape[1]):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=5, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"  Replaced {n_outliers} outlier cells in logT")
 
         logt_f32 = logt_tab.astype(np.float32)
         rho_lo_f32 = rho_lo.astype(np.float32)
@@ -3153,90 +3382,74 @@ class hhe_z_mixtures():
                         s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
                         s_scale = max(abs(s_phys), 1.0)
 
-                        def residuals(x):
+                        def residuals(x, _s=s_phys, _ss=s_scale,
+                                      _rho=rho_target, _rs=rho_scale):
                             lgp, lgt = x
-                            s_t = (self._s_pt(
-                                lgp, lgt, yp, zv, _zm, _za, _zr)
-                                * erg_to_kbbar)
-                            rho_t = self._logrho_pt(
-                                lgp, lgt, yp, zv, _zm, _za, _zr)
+                            try:
+                                s_t = (self._s_pt(
+                                    lgp, lgt, yp, zv, _zm, _za, _zr)
+                                    * erg_to_kbbar)
+                                rho_t = self._logrho_pt(
+                                    lgp, lgt, yp, zv, _zm, _za, _zr)
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return np.array([1e30, 1e30])
                             if not (np.isfinite(s_t)
                                     and np.isfinite(rho_t)):
                                 return np.array([1e30, 1e30])
                             return np.array([
-                                (s_t - s_phys) / s_scale,
-                                (rho_t - rho_target) / rho_scale])
+                                (s_t - _s) / _ss,
+                                (rho_t - _rho) / _rs])
 
-                        solved = False
-
-                        # Warm-start from previous Z
-                        if use_warm:
-                            guess = prev_pt[ixi, ir]
-                            if np.all(np.isfinite(guess)):
-                                x0 = np.clip(guess, lb, ub)
-                                try:
-                                    sol = least_squares(
-                                        residuals, x0,
-                                        bounds=(lb, ub),
-                                        method='trf',
-                                        xtol=1e-10, ftol=1e-10,
-                                        gtol=1e-10, max_nfev=200)
-                                    if (sol.success
-                                            and np.all(np.isfinite(sol.x))):
-                                        logp_tab[ixi, ir, iy, iz] = sol.x[0]
-                                        logt_tab[ixi, ir, iy, iz] = sol.x[1]
-                                        prev_pt[ixi, ir] = sol.x
-                                        solved = True
-                                except Exception:
-                                    pass
-
-                        # Cold start: seed from mid-T + rho-inversion
-                        if not solved:
-                            lgt_seed = 0.5 * (lgt_lo + lgt_hi)
+                        # Try _newton_2d first, then least_squares
+                        # as fallback (already inside _newton_2d).
+                        guess = prev_pt[ixi, ir]
+                        if not np.all(np.isfinite(guess)):
+                            # Cold-start from ideal EOS
                             try:
-                                def err_p(lgp):
-                                    try:
-                                        return (self._logrho_pt(
-                                            lgp, lgt_seed, yp, zv,
-                                            _zm, _za, _zr)
-                                            - rho_target)
-                                    except (ZeroDivisionError, FloatingPointError):
-                                        return 1e30
-                                lgp_seed = brentq(err_p, lgp_lo,
-                                                   lgp_hi,
-                                                   xtol=1e-5,
-                                                   maxiter=60)
-                            except (ValueError, RuntimeError, ZeroDivisionError):
-                                lgp_seed = 0.5 * (lgp_lo + lgp_hi)
-
-                            x0 = np.clip(
-                                np.array([lgp_seed, lgt_seed]),
-                                lb, ub)
-
-                            try:
-                                sol = least_squares(
-                                    residuals, x0,
-                                    bounds=(lb, ub),
-                                    method='trf',
-                                    xtol=1e-10, ftol=1e-10,
-                                    gtol=1e-10, max_nfev=200)
-                                if (sol.success
-                                        and np.all(np.isfinite(sol.x))):
-                                    logp_tab[ixi, ir, iy, iz] = sol.x[0]
-                                    logt_tab[ixi, ir, iy, iz] = sol.x[1]
-                                    prev_pt[ixi, ir] = sol.x
+                                pt_ideal = ideal_xy.get_pt_srho(
+                                    s_phys, rho_target, yp)
+                                guess = np.asarray(pt_ideal,
+                                                   dtype=float)
                             except Exception:
-                                pass
+                                guess = np.array([
+                                    0.5 * (lgp_lo + lgp_hi),
+                                    0.5 * (lgt_lo + lgt_hi)])
+
+                        sol, ok = self._newton_2d(
+                            residuals, guess, lb, ub)
+                        if ok and np.all(np.isfinite(sol)):
+                            logp_tab[ixi, ir, iy, iz] = sol[0]
+                            logt_tab[ixi, ir, iy, iz] = sol[1]
+                            prev_pt[ixi, ir] = sol
 
         pbar.close()
 
-        # Step 3: fill NaNs
+        # Step 3: fill NaNs first (so Hampel has no gaps)
         n_nan = np.isnan(logp_tab).sum()
         if n_nan > 0:
             if verbose:
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
+
+        # Step 4: Hampel outlier filter along ξ axis
+        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
+            if verbose:
+                print(f"Running Hampel outlier filter on {label} "
+                      f"along ξ axis ...")
+            flat = arr.reshape(n_xi, -1)
+            n_out = 0
+            for j in range(flat.shape[1]):
+                col = flat[:, j]
+                cleaned, n_rep = hampel_filter_1d(
+                    col, window=5, n_sigma=3.0)
+                if n_rep > 0:
+                    changed = (cleaned != col) & np.isfinite(col)
+                    flat[changed, j] = cleaned[changed]
+                    n_out += n_rep
+            if n_out > 0 and verbose:
+                print(f"  Replaced {n_out} outlier cells in {label}")
 
         logp_f32 = logp_tab.astype(np.float32)
         logt_f32 = logt_tab.astype(np.float32)
