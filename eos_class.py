@@ -180,6 +180,13 @@ class z_eos:
       - 'ammonia'  : NH3 EOS (Gao + DFT blend), P-T basis only
       - 'mg2sio4'  : Mg2SiO4 forsterite ANEOS, P-T basis only
 
+    The ``aqua_version`` parameter selects which AQUA table to load:
+      - 'revised'  : Cano Amoros et al. — revised entropies (default), P-T only
+      - 'original' : Haldemann et al. 2020 — original table, P-T and rho-T
+
+    In ``val_mixtures`` / ``hhe_z_mixtures``, use 'water_revised' or
+    'water' in the species_list to select the table version.
+
     Units are consistent with hhe_eos:
       - logp : log10(P) in dyn/cm^2
       - logt : log10(T) in K
@@ -195,11 +202,18 @@ class z_eos:
     _J_kg_to_erg_g = 1e4          # 1 J/kg = 1e4 erg/g
     _GPa_to_dyncm2 = 1e10         # 1 GPa = 1e10 dyn/cm^2
 
-    def __init__(self, species='water', smooth_z=False):
+    def __init__(self, species='water', smooth_z=False, aqua_version='revised'):
         self.species = species
+        self.aqua_version = aqua_version
 
         if species == 'water':
-            self._load_aqua(smooth_z)
+            if aqua_version == 'revised':
+                self._load_aqua_revised(smooth_z)
+            elif aqua_version == 'original':
+                self._load_aqua(smooth_z)
+            else:
+                raise ValueError(f"Unknown aqua_version '{aqua_version}'. "
+                                 f"Use 'revised' or 'original'.")
         elif species == 'methane':
             self._load_ch4_nh3('methane', smooth_z)
         elif species == 'ammonia':
@@ -290,6 +304,74 @@ class z_eos:
         self.logu_rhot_rgi = RGI((self.logrhovals_rhot, self.logtvals_rhot),
                                   self.logu_rhot, method='linear',
                                   bounds_error=False, fill_value=None)
+
+    # -----------------------------------------------------------------
+    # Revised AQUA loader (Cano Amoros et al.)
+    # -----------------------------------------------------------------
+    def _load_aqua_revised(self, smooth_z):
+        """Load the revised AQUA EOS (P-T basis only) from CSV.
+
+        Revised entropies from Mazevet et al. (2021) and new superionic
+        data from French et al. (2016).  Sentinel entropy = -1 is
+        replaced with NaN.
+        """
+        csv_path = f'{CURR_DIR}/aqua/aqua_revised_amoros/AQUA_revised_eos_pt.csv'
+        pt_df = pd.read_csv(csv_path)
+
+        # Rename columns to match internal convention
+        pt_df.rename(columns={
+            'pressure_Pa': 'press',
+            'temperature_K': 'temp',
+            'density_kg_m3': 'rho',
+            'entropy_J_kgK': 's',
+            'internal_energy_J_kg': 'u',
+        }, inplace=True)
+
+        # Replace sentinel entropy values
+        pt_df.loc[pt_df['s'] == -1, 's'] = np.nan
+
+        # Unit conversions (SI → CGS)
+        pt_df['logp'] = np.log10(pt_df['press'] * self._Pa_to_dyn)
+        pt_df['logt'] = np.log10(pt_df['temp'])
+        pt_df['logrho'] = np.log10(pt_df['rho'] * self._kgm3_to_gcm3)
+        pt_df['logu'] = np.log10(pt_df['u'] * self._J_kg_to_erg_g)
+
+        s_cgs = pt_df['s'].values * self._J_kgK_to_erg_gK
+        with np.errstate(invalid='ignore', divide='ignore'):
+            pt_df['logs'] = np.where(s_cgs > 0, np.log10(s_cgs), np.nan)
+
+        # Reshape to 2D grid
+        n_p_pt = pt_df['logp'].nunique()
+        shape_pt = (n_p_pt, -1)
+
+        self.logpvals_pt = np.reshape(pt_df['logp'].values, shape_pt)[:, 0]
+        self.logtvals_pt = np.reshape(pt_df['logt'].values, shape_pt)[0, :]
+
+        self.logrho_pt = np.reshape(pt_df['logrho'].values, shape_pt)
+        self.logs_pt = np.reshape(pt_df['logs'].values, shape_pt)
+        self.logu_pt = np.reshape(pt_df['logu'].values, shape_pt)
+        self.phase_pt = np.reshape(pt_df['phase'].values, shape_pt)
+
+        # Additional fields from revised table
+        self.flag_pt = np.reshape(pt_df['flag'].values, shape_pt)
+        self.ad_grad_pt = np.reshape(pt_df['ad_grad'].values, shape_pt)
+
+        # No rho-T basis available for revised table
+        self.has_rhot = False
+
+        if smooth_z:
+            self._smooth_aqua_lowp_lowt()
+
+        # Build P-T RGI interpolators
+        self.logrho_pt_rgi = RGI((self.logpvals_pt, self.logtvals_pt),
+                                  self.logrho_pt, method='linear',
+                                  bounds_error=False, fill_value=None)
+        self.logs_pt_rgi = RGI((self.logpvals_pt, self.logtvals_pt),
+                                self.logs_pt, method='linear',
+                                bounds_error=False, fill_value=None)
+        self.logu_pt_rgi = RGI((self.logpvals_pt, self.logtvals_pt),
+                                self.logu_pt, method='linear',
+                                bounds_error=False, fill_value=None)
 
     # -----------------------------------------------------------------
     # CH4 / NH3 loader
@@ -454,13 +536,242 @@ class z_eos:
         return self._interpolate_pt(self.logu_pt_rgi, lgp, lgt)
 
     def get_logp_rhot(self, lgrho, lgt):
+        if not hasattr(self, 'logp_rhot_rgi'):
+            raise AttributeError(
+                "rho-T basis not available for revised AQUA table. "
+                "Use aqua_version='original' or the P-T basis methods.")
         return self._interpolate_rhot(self.logp_rhot_rgi, lgrho, lgt)
 
     def get_logs_rhot(self, lgrho, lgt):
+        if not hasattr(self, 'logs_rhot_rgi'):
+            raise AttributeError(
+                "rho-T basis not available for revised AQUA table. "
+                "Use aqua_version='original' or the P-T basis methods.")
         return self._interpolate_rhot(self.logs_rhot_rgi, lgrho, lgt)
 
     def get_logu_rhot(self, lgrho, lgt):
+        if not hasattr(self, 'logu_rhot_rgi'):
+            raise AttributeError(
+                "rho-T basis not available for revised AQUA table. "
+                "Use aqua_version='original' or the P-T basis methods.")
         return self._interpolate_rhot(self.logu_rhot_rgi, lgrho, lgt)
+
+    # =================================================================
+    # Inversion methods
+    # =================================================================
+
+    def _newton_1d_z(self, err_func, guess, lo_abs, hi_abs,
+                     max_iter=30, tol=1e-8, h=1e-4):
+        """Newton-Raphson with adaptive brentq fallback (z_eos version).
+
+        Identical algorithm to ``hhe_z_mixtures._newton_1d`` but
+        self-contained so that z_eos has no dependency on the mixture
+        class.
+
+        Parameters
+        ----------
+        err_func : callable
+            f(x) = 0 at the root.
+        guess : float
+            Initial estimate.
+        lo_abs, hi_abs : float
+            Hard bounds for brentq bracket expansion.
+
+        Returns
+        -------
+        solution, converged : float, bool
+        """
+        x = float(np.clip(guess, lo_abs, hi_abs))
+
+        for _ in range(max_iter):
+            f_val = err_func(x)
+            if not np.isfinite(f_val):
+                break
+            if abs(f_val) < tol:
+                return x, True
+            f_plus = err_func(x + h)
+            f_minus = err_func(x - h)
+            if not (np.isfinite(f_plus) and np.isfinite(f_minus)):
+                break
+            fp = (f_plus - f_minus) / (2.0 * h)
+            if abs(fp) < 1e-30:
+                break
+            step = f_val / fp
+            if abs(step) > 1.0:
+                step = np.sign(step) * 1.0
+            x_new = np.clip(x - step, lo_abs, hi_abs)
+            if abs(x_new - x) < 1e-12:
+                f_new = err_func(x_new)
+                return x_new, (np.isfinite(f_new)
+                               and abs(f_new) < tol * 100)
+            x = x_new
+
+        # Adaptive brentq fallback
+        delta = 0.5
+        factor = 2.0
+        a = np.clip(x - delta, lo_abs, hi_abs)
+        b = np.clip(x + delta, lo_abs, hi_abs)
+        for _ in range(8):
+            fa = err_func(a)
+            fb = err_func(b)
+            if (np.isfinite(fa) and np.isfinite(fb)
+                    and fa * fb < 0):
+                try:
+                    sol = brentq(err_func, a, b,
+                                 xtol=1e-6, maxiter=100)
+                    return sol, True
+                except (ValueError, RuntimeError):
+                    pass
+            a = np.clip(a - delta * factor, lo_abs, hi_abs)
+            b = np.clip(b + delta * factor, lo_abs, hi_abs)
+            delta *= factor
+            if a == lo_abs and b == hi_abs:
+                fa = err_func(a)
+                fb = err_func(b)
+                if (np.isfinite(fa) and np.isfinite(fb)
+                        and fa * fb < 0):
+                    try:
+                        return brentq(err_func, a, b,
+                                      xtol=1e-6, maxiter=100), True
+                    except (ValueError, RuntimeError):
+                        pass
+                return np.nan, False
+        return np.nan, False
+
+    def get_logt_sp(self, _s_kb, lgp):
+        """Temperature from (S, P) via Newton-Raphson.
+
+        Inverts S(P, T) = _s_kb to find logT.  Consistent with
+        ``hhe_z_mixtures.get_logt_sp`` — the input entropy is in
+        kb/baryon, converted internally to log10(erg/g/K) for
+        comparison with the ``logs_pt`` forward model.
+
+        Parameters
+        ----------
+        _s_kb : float or array
+            Target entropy in kb/baryon.
+        lgp : float or array
+            log10 P [dyn/cm²].
+
+        Returns
+        -------
+        logt : float or array
+            log10 T [K].  NaN where no solution found.
+        """
+        scalar = np.isscalar(_s_kb) and np.isscalar(lgp)
+        _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        lgp = np.atleast_1d(np.asarray(lgp, dtype=float))
+        _s_kb, lgp = np.broadcast_arrays(_s_kb, lgp)
+        out = np.full_like(_s_kb, np.nan, dtype=float)
+
+        lo_t = float(self.logtvals_pt[0])
+        hi_t = float(self.logtvals_pt[-1])
+
+        # Convert kb/baryon → log10(erg/g/K)
+        # S [erg/g/K] = S [kb/baryon] / erg_to_kbbar
+        logs_target = np.log10(_s_kb / erg_to_kbbar)
+
+        prev_sol = None
+        for idx in np.ndindex(logs_target.shape):
+            s_i = float(logs_target[idx])
+            p_i = float(lgp[idx])
+
+            def err(lgt, _s=s_i, _p=p_i):
+                return float(self.get_logs_pt(_p, lgt) - _s)
+
+            guess = prev_sol if prev_sol is not None else 0.5 * (lo_t + hi_t)
+            sol, ok = self._newton_1d_z(err, guess, lo_t, hi_t)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
+
+        return out.item() if scalar else out
+
+    def get_logt_rhop(self, lgrho_target, lgp):
+        """Temperature from (rho, P) via Newton-Raphson.
+
+        Inverts logrho(P, T) = lgrho_target to find logT.
+
+        Parameters
+        ----------
+        lgrho_target : float or array
+            Target log10(rho) in g/cm³.
+        lgp : float or array
+            log10 P [dyn/cm²].
+
+        Returns
+        -------
+        logt : float or array
+            log10 T [K].  NaN where no solution found.
+        """
+        scalar = np.isscalar(lgrho_target) and np.isscalar(lgp)
+        lgrho_target = np.atleast_1d(np.asarray(lgrho_target, dtype=float))
+        lgp = np.atleast_1d(np.asarray(lgp, dtype=float))
+        lgrho_target, lgp = np.broadcast_arrays(lgrho_target, lgp)
+        out = np.full_like(lgrho_target, np.nan, dtype=float)
+
+        lo_t = float(self.logtvals_pt[0])
+        hi_t = float(self.logtvals_pt[-1])
+
+        prev_sol = None
+        for idx in np.ndindex(lgrho_target.shape):
+            rho_i = float(lgrho_target[idx])
+            p_i = float(lgp[idx])
+
+            def err(lgt, _rho=rho_i, _p=p_i):
+                return float(self.get_logrho_pt(_p, lgt) - _rho)
+
+            guess = prev_sol if prev_sol is not None else 0.5 * (lo_t + hi_t)
+            sol, ok = self._newton_1d_z(err, guess, lo_t, hi_t)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
+
+        return out.item() if scalar else out
+
+    def get_logp_rhot_inv(self, lgrho_target, lgt):
+        """Pressure from (rho, T) via Newton-Raphson on the P-T table.
+
+        Inverts logrho(P, T) = lgrho_target to find logP.
+        Unlike ``get_logp_rhot`` (which requires the rho-T basis table),
+        this works for all species by root-finding on the P-T forward model.
+
+        Parameters
+        ----------
+        lgrho_target : float or array
+            Target log10(rho) in g/cm³.
+        lgt : float or array
+            log10 T [K].
+
+        Returns
+        -------
+        logp : float or array
+            log10 P [dyn/cm²].  NaN where no solution found.
+        """
+        scalar = np.isscalar(lgrho_target) and np.isscalar(lgt)
+        lgrho_target = np.atleast_1d(np.asarray(lgrho_target, dtype=float))
+        lgt = np.atleast_1d(np.asarray(lgt, dtype=float))
+        lgrho_target, lgt = np.broadcast_arrays(lgrho_target, lgt)
+        out = np.full_like(lgrho_target, np.nan, dtype=float)
+
+        lo_p = float(self.logpvals_pt[0])
+        hi_p = float(self.logpvals_pt[-1])
+
+        prev_sol = None
+        for idx in np.ndindex(lgrho_target.shape):
+            rho_i = float(lgrho_target[idx])
+            t_i = float(lgt[idx])
+
+            def err(lgp, _rho=rho_i, _t=t_i):
+                return float(self.get_logrho_pt(lgp, _t) - _rho)
+
+            guess = prev_sol if prev_sol is not None else 0.5 * (lo_p + hi_p)
+            sol, ok = self._newton_1d_z(err, guess, lo_p, hi_p)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
+
+        return out.item() if scalar else out
 
 
 class val_mixtures:
@@ -510,7 +821,7 @@ class val_mixtures:
     _DISSOC_A = 2.9656
     _DISSOC_B = 0.0974
 
-    def __init__(self, hhe_eos_name='cms', hg=True,
+    def __init__(self, hhe_eos_name='cd', hg=True,
                  smooth_hhe=False, smooth_z=False,
                  species_list=None, mu_h_vary=True):
         """
@@ -526,7 +837,9 @@ class val_mixtures:
             Smooth Z tables before RGI creation.
         species_list : list of str or None
             Which Z species to load. Default: all four
-            ['water', 'methane', 'ammonia', 'mg2sio4'].
+            ['water_revised', 'methane', 'ammonia', 'mg2sio4'].
+            Use 'water_revised' for the revised AQUA table (Cano Amoros
+            et al.) or 'water' for the original (Haldemann et al. 2020).
         mu_h_vary : bool
             If True (default), use P-T dependent molecular weight for
             hydrogen: mu_H = 2 below the H2 dissociation boundary and
@@ -534,7 +847,7 @@ class val_mixtures:
             everywhere.
         """
         if species_list is None:
-            species_list = ['water', 'methane', 'ammonia', 'mg2sio4']
+            species_list = ['water_revised', 'methane', 'ammonia', 'mg2sio4']
 
         self.hhe_eos_name = hhe_eos_name
         self.hg = hg
@@ -544,9 +857,18 @@ class val_mixtures:
         self.hhe = hhe_eos(hhe_eos_name, smooth_hhe=smooth_hhe)
 
         # Z EOS instances — one per species
+        # 'water_revised' and 'water' both map to the 'water' key in self.z
+        # but load different AQUA table versions.
         self.z = {}
         for sp in species_list:
-            self.z[sp] = z_eos(species=sp, smooth_z=smooth_z)
+            if sp == 'water_revised':
+                self.z['water'] = z_eos(species='water', smooth_z=smooth_z,
+                                        aqua_version='revised')
+            elif sp == 'water':
+                self.z['water'] = z_eos(species='water', smooth_z=smooth_z,
+                                        aqua_version='original')
+            else:
+                self.z[sp] = z_eos(species=sp, smooth_z=smooth_z)
 
     # =================================================================
     # helpers
@@ -950,7 +1272,9 @@ class hhe_z_mixtures():
     mu_h_vary : bool
         P-T dependent hydrogen molecular weight.
     species_list : list of str or None
-        Z species for val_mixtures.
+        Z species for val_mixtures. Use 'water_revised' for the revised
+        AQUA table (Cano Amoros et al.) or 'water' for the original
+        (Haldemann et al. 2020). Default includes 'water_revised'.
     logp_range : tuple (lo, hi)
         log10 P [dyn/cm²] bounds for the S-P grid.
     logp_step : float
@@ -975,7 +1299,7 @@ class hhe_z_mixtures():
                  smooth_hhe=True, smooth_z=True,
                  mu_h_vary=True,
                  species_list=None,
-                 z_eos='aqua',
+                 z_eos='water_revised',
                  pt_tab=True,
                  inv_tab=True,
                  y_prime=True,
@@ -995,7 +1319,9 @@ class hhe_z_mixtures():
         mu_h_vary : bool
             P-T dependent hydrogen molecular weight.
         species_list : list of str or None
-            Z species for val_mixtures.
+            Z species for val_mixtures. Use 'water_revised' for revised
+            AQUA (Cano Amoros et al.) or 'water' for original (Haldemann
+            et al. 2020).
         z_eos : str
             Label used in table filenames (e.g. 'water', 'ice_mixture').
         pt_tab : bool

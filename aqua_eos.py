@@ -34,6 +34,10 @@ ideal_z = ideal_eos.IdealEOS(m=18)
 
 CURR_DIR = os.path.dirname(os.path.realpath(__file__))
 
+# Set to 'revised' to use the Cano Amoros et al. revised AQUA table,
+# or 'original' to use the Haldemann et al. 2020 table.
+AQUA_VERSION = 'revised'
+
 def aqua_reader(basis):
     if basis == 'pt':
         cols = ['press', 'temp', 'rho', 'grada', 's', 'u', 'c', 'mmw', 'x_ion', 'x_d', 'phase']
@@ -57,6 +61,31 @@ def aqua_reader(basis):
     return tab_df
 
 
+def aqua_reader_revised():
+    """Read the revised AQUA P-T table (Cano Amoros et al.) from CSV."""
+    csv_path = '%s/aqua/aqua_revised_amoros/AQUA_revised_eos_pt.csv' % CURR_DIR
+    tab_df = pd.read_csv(csv_path)
+
+    tab_df.rename(columns={
+        'pressure_Pa': 'press',
+        'temperature_K': 'temp',
+        'density_kg_m3': 'rho',
+        'entropy_J_kgK': 's',
+        'internal_energy_J_kg': 'u',
+    }, inplace=True)
+
+    # Replace sentinel entropy values (-1) with NaN
+    tab_df.loc[tab_df['s'] == -1, 's'] = np.nan
+
+    tab_df['logp'] = np.log10(tab_df['press']*Pa_to_dyn)  # in dyn/cm2
+    tab_df['logrho'] = np.log10(tab_df['rho']*SI_to_cgs)  # in g/cm3
+    tab_df['logt'] = np.log10(tab_df['temp'])
+    tab_df['s'] = tab_df['s']*J_to_erg  # in erg/g/K
+    tab_df['logu'] = np.log10(tab_df['u']*J_to_cgs)
+
+    return tab_df
+
+
 def grid_data(df, basis):
     # grids data for interpolation
     twoD = {}
@@ -71,7 +100,10 @@ def grid_data(df, basis):
 
 
 ### P, T ####
-aqua_data_pt = grid_data(aqua_reader('pt'), 'pt') # 2D grid
+if AQUA_VERSION == 'revised':
+    aqua_data_pt = grid_data(aqua_reader_revised(), 'pt')  # 2D grid (revised)
+else:
+    aqua_data_pt = grid_data(aqua_reader('pt'), 'pt')  # 2D grid (original)
 
 logpvals_pt = aqua_data_pt['logp'][:,0]
 logtvals = aqua_data_pt['logt'][0]
@@ -105,6 +137,7 @@ def get_logu_pt_tab(lgp, lgt):
     return u_rgi_pt(np.array([lgp, lgt]).T)
 
 ### rho, T ###
+# NOTE: rho-T basis always uses the original AQUA table (no revised version available)
 
 aqua_data_rhot = grid_data(aqua_reader('rhot'), basis='rhot')
 logrhovals_rhot = aqua_data_rhot['logrho'][:,0]
@@ -139,6 +172,7 @@ def get_logu_rhot_tab(lgrho, lgt):
     return u_rgi_rhot(np.array([lgrho, lgt]).T)
 
 # ### rho, U ###
+# NOTE: rho-U basis always uses the original AQUA table (no revised version available)
 
 aqua_data_rhou = grid_data(aqua_reader('rhou'), basis='rhou')
 logrhovals_rhou = aqua_data_rhou['logrho'][:,0]
@@ -173,6 +207,8 @@ def get_logt_rhou_tab(lgrho, lgu):
     return t_rgi_rhou(np.array([lgrho, lgu]).T)
 
 ####### Inverted Functions #######
+# NOTE: Inverted tables (S-P, S-rho) are pre-computed from the original
+# AQUA table. They need to be regenerated for the revised table.
 
 ### rho(s, p), t(s, p) ###
 
