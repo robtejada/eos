@@ -66,3 +66,4 @@ rock_eos/mgsio3_JJ_SP.npz
 *.png
 .claude/*
 diagnose_isentrope_kinks.py
+compare_aqua_revised.py
