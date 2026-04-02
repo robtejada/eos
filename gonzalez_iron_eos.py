@@ -486,3 +486,194 @@ class Fe_GONZALEZ_EOS:
 
         fig.tight_layout()
         return fig
+
+    # ------------------------------------------------------------------
+    # Thermodynamic consistency
+    # ------------------------------------------------------------------
+
+    def test_thermodynamic_consistency(
+        self,
+        P_range_GPa=(50, 1500),
+        T_range_K=(3500, 25000),
+        n_P=100,
+        n_T=100,
+        fd_step=0.01,
+        tab=False,
+    ):
+        """
+        Test first-law and Maxwell-relation consistency on a (logP, logT) grid.
+
+        Uses centered finite differences in log10 space.
+
+        First law at constant P:
+            dU/dlogT|_P = T * dS/dlogT|_P + (P/rho^2) * drho/dlogT|_P
+
+        First law at constant T:
+            dU/dlogP|_T = T * dS/dlogP|_T + (P/rho^2) * drho/dlogP|_T
+
+        Maxwell relation (from dG = VdP - SdT):
+            (P/rho^2) * drho/dlogT|_P = T * dS/dlogP|_T
+
+        Parameters
+        ----------
+        P_range_GPa : tuple
+            (P_min, P_max) in GPa.
+        T_range_K : tuple
+            (T_min, T_max) in K.
+        n_P, n_T : int
+            Grid resolution.
+        fd_step : float
+            Finite-difference step in log10 space.
+        tab : bool
+            If True, use the pre-computed table for S, rho, U.
+
+        Returns
+        -------
+        dict with keys 'first_law_constP', 'first_law_constT', 'maxwell',
+        plus 'P_1d', 'T_1d' arrays.
+        """
+        lgp_1d = np.linspace(np.log10(P_range_GPa[0]), np.log10(P_range_GPa[1]), n_P)
+        lgt_1d = np.linspace(np.log10(T_range_K[0]), np.log10(T_range_K[1]), n_T)
+        LGT, LGP = np.meshgrid(lgt_1d, lgp_1d)
+
+        h = fd_step
+
+        # Evaluate S, rho, U and their FD derivatives in log10 space.
+        # P is in GPa throughout; convert to dyn/cm^2 for the PdV term.
+        GPA_TO_DYNCM2 = 1e10  # 1 GPa = 1e10 dyn/cm^2
+
+        def _eval(lgp, lgt):
+            P_gpa = 10.0**lgp
+            T_K = 10.0**lgt
+            rho = self.get_rho_pt(P_gpa, T_K, tab=tab)
+            s = self.get_s_pt(P_gpa, T_K, tab=tab)
+            u_val = self.get_u_pt(P_gpa, T_K, tab=tab)
+            return rho, s, u_val
+
+        rho_c, s_c, u_c = _eval(LGP, LGT)
+
+        # d/dlogT at constant P
+        _, s_Tp, u_Tp = _eval(LGP, LGT + h)
+        _, s_Tm, u_Tm = _eval(LGP, LGT - h)
+        rho_Tp_arr, _, _ = _eval(LGP, LGT + h)
+        rho_Tm_arr, _, _ = _eval(LGP, LGT - h)
+
+        dS_dlogT = (s_Tp - s_Tm) / (2.0 * h)
+        drho_dlogT = (rho_Tp_arr - rho_Tm_arr) / (2.0 * h)
+        dU_dlogT = (u_Tp - u_Tm) / (2.0 * h)
+
+        # d/dlogP at constant T
+        rho_Pp, s_Pp, u_Pp = _eval(LGP + h, LGT)
+        rho_Pm, s_Pm, u_Pm = _eval(LGP - h, LGT)
+
+        dS_dlogP = (s_Pp - s_Pm) / (2.0 * h)
+        drho_dlogP = (rho_Pp - rho_Pm) / (2.0 * h)
+        dU_dlogP = (u_Pp - u_Pm) / (2.0 * h)
+
+        T = 10.0**LGT
+        P_cgs = 10.0**LGP * GPA_TO_DYNCM2  # dyn/cm^2
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            P_over_rho2 = P_cgs / (rho_c**2)
+
+        def _frac_err(lhs, rhs):
+            denom = 0.5 * (np.abs(lhs) + np.abs(rhs))
+            with np.errstate(invalid="ignore", divide="ignore"):
+                err = np.abs(lhs - rhs) / (denom + 1e-30)
+            err[denom < 1e-30] = 0.0
+            return err
+
+        # Test A: first law at constant P
+        lhs_A = dU_dlogT
+        rhs_A = T * dS_dlogT + P_over_rho2 * drho_dlogT
+        err_A = _frac_err(lhs_A, rhs_A)
+
+        # Test B: first law at constant T
+        lhs_B = dU_dlogP
+        rhs_B = T * dS_dlogP + P_over_rho2 * drho_dlogP
+        err_B = _frac_err(lhs_B, rhs_B)
+
+        # Test C: Maxwell relation
+        lhs_C = P_over_rho2 * drho_dlogT
+        rhs_C = T * dS_dlogP
+        err_C = _frac_err(lhs_C, rhs_C)
+
+        results = {
+            "P_1d_GPa": 10.0**lgp_1d,
+            "T_1d_K": 10.0**lgt_1d,
+            "first_law_constP": err_A,
+            "first_law_constT": err_B,
+            "maxwell": err_C,
+        }
+
+        for name in ["first_law_constP", "first_law_constT", "maxwell"]:
+            finite = results[name][np.isfinite(results[name])]
+            if len(finite) > 0:
+                print(f"  {name:22s}  median={np.median(finite):.2e}  "
+                      f"p95={np.percentile(finite, 95):.2e}  "
+                      f"max={np.max(finite):.2e}")
+
+        return results
+
+    def plot_thermodynamic_consistency(
+        self,
+        results=None,
+        figsize=(20, 5),
+        save_path=None,
+        **test_kwargs,
+    ):
+        """
+        Run thermodynamic consistency tests and plot heatmaps.
+
+        Parameters
+        ----------
+        results : dict, optional
+            Pre-computed results from test_thermodynamic_consistency().
+            If None, runs the test with **test_kwargs.
+        save_path : str, optional
+            If given, save figure to this path.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        """
+        import matplotlib.pyplot as plt
+
+        if results is None:
+            results = self.test_thermodynamic_consistency(**test_kwargs)
+
+        P_1d = results["P_1d_GPa"]
+        T_1d = results["T_1d_K"]
+        Tm = self.get_T_melt(P_1d)
+
+        test_names = ["first_law_constP", "first_law_constT", "maxwell"]
+        titles = [
+            r"First law (const $P$): $dU/d\log T = T\,dS/d\log T + (P/\rho^2)\,d\rho/d\log T$",
+            r"First law (const $T$): $dU/d\log P = T\,dS/d\log P + (P/\rho^2)\,d\rho/d\log P$",
+            r"Maxwell: $(P/\rho^2)\,d\rho/d\log T|_P = T\,dS/d\log P|_T$",
+        ]
+
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+        for ax, tname, title in zip(axes, test_names, titles):
+            err = results[tname]
+            log_err = np.log10(np.clip(err, 1e-16, None))
+
+            pcm = ax.pcolormesh(T_1d, P_1d, log_err, shading="auto",
+                                cmap="inferno", vmin=-6, vmax=0)
+            ax.plot(Tm, P_1d, "w--", linewidth=1.5, label="Melt curve")
+            ax.set_xlabel("Temperature [K]")
+            ax.set_ylabel("Pressure [GPa]")
+            ax.set_title(title, fontsize=9)
+            cb = fig.colorbar(pcm, ax=ax, pad=0.02)
+            cb.set_label(r"$\log_{10}$ fractional error")
+            ax.legend(loc="upper right", fontsize=8)
+
+        fig.suptitle("Gonzalez Iron EOS — Thermodynamic Consistency",
+                     fontsize=13, y=1.02)
+        fig.tight_layout()
+
+        if save_path is not None:
+            fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+        return fig
