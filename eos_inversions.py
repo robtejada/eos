@@ -55,7 +55,7 @@ DEFAULTS = {
     'logrho_step': 0.05,
 
     # ξ resolution (for sp, rhop, srho)
-    'n_xi':       100,
+    'n_xi':       150,
 
     # Y' and Z grids
     'y_lo':       0.05,

@@ -1306,7 +1306,7 @@ class hhe_z_mixtures():
                  logp_range=(5.0, 15.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
-                 n_xi=100):
+                 n_xi=150):
         """
         Parameters
         ----------
@@ -1367,7 +1367,7 @@ class hhe_z_mixtures():
         self.logt_max = logt_range[1]
         self.n_xi = n_xi
         # Default ξ grid (overwritten when a table is loaded)
-        _alpha = 3.0
+        _alpha = 2.0
         _t = np.linspace(0.0, 1.0, n_xi)
         self.xi_vals = np.sinh(_alpha * _t) / np.sinh(_alpha)
 
@@ -2617,7 +2617,7 @@ class hhe_z_mixtures():
         #
         # α controls the clustering strength (α=0 → uniform,
         # larger α → more clustered near 0).
-        alpha = 3.0
+        alpha = 2.0
         t_uniform = np.linspace(0.0, 1.0, n_xi)
         xi_vals = np.sinh(alpha * t_uniform) / np.sinh(alpha)
 
@@ -2957,7 +2957,9 @@ class hhe_z_mixtures():
 
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
-        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        alpha_xi = 2.0
+        t_uniform = np.linspace(0.0, 1.0, n_xi)
+        xi_vals = np.sinh(alpha_xi * t_uniform) / np.sinh(alpha_xi)
         logt = self.logt_vals
         nT, nY, nZ = len(logt), len(yvals), len(zvals)
         lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
@@ -3256,7 +3258,9 @@ class hhe_z_mixtures():
 
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
-        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        alpha_xi = 2.0
+        t_uniform = np.linspace(0.0, 1.0, n_xi)
+        xi_vals = np.sinh(alpha_xi * t_uniform) / np.sinh(alpha_xi)
         logp = self.logp_vals
         nP, nY, nZ = len(logp), len(yvals), len(zvals)
 
@@ -3487,6 +3491,35 @@ class hhe_z_mixtures():
         s_lo[~np.isfinite(s_lo)] = np.nan
         s_hi[~np.isfinite(s_hi)] = np.nan
 
+        # Cap S_hi to prevent the ξ range from being dominated
+        # by extreme values at low ρ / high T (same treatment as
+        # compute_s_bounds_grid for the S-P table).
+        for iy_i in range(nY):
+            for iz_i in range(nZ):
+                col = s_hi[:, iy_i, iz_i]
+                finite = col[np.isfinite(col)]
+                if len(finite) > 0:
+                    cap = np.nanpercentile(finite, 75) * 1.5
+                    cap = max(cap, np.nanmin(finite))
+                    s_hi[:, iy_i, iz_i] = np.where(
+                        np.isfinite(col), np.minimum(col, cap), col)
+
+        # Smooth S bounds along the ρ axis
+        for iy_i in range(nY):
+            for iz_i in range(nZ):
+                for arr in [s_hi, s_lo]:
+                    col = arr[:, iy_i, iz_i]
+                    if np.isfinite(col).sum() > 5:
+                        col[:], _ = hampel_filter_1d(
+                            col, window=10, n_sigma=3.0)
+                        col[:] = gaussian_filter1d(col, sigma=3.0)
+
+        # Pad bounds by 2%
+        margin = 0.02 * (s_hi - s_lo)
+        margin = np.where(np.isfinite(margin), margin, 0.0)
+        s_lo -= margin
+        s_hi += margin
+
         self._s_lo_srho = s_lo.astype(np.float32)
         self._s_hi_srho = s_hi.astype(np.float32)
         self._yvals_srho = yvals
@@ -3670,7 +3703,9 @@ class hhe_z_mixtures():
 
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
-        xi_vals = np.linspace(0.0, 1.0, n_xi)
+        alpha_xi = 2.0
+        t_uniform = np.linspace(0.0, 1.0, n_xi)
+        xi_vals = np.sinh(alpha_xi * t_uniform) / np.sinh(alpha_xi)
         logrho = self.logrho_vals
 
         nR, nY, nZ = len(logrho), len(yvals), len(zvals)
