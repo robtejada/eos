@@ -202,9 +202,21 @@ class z_eos:
     _J_kg_to_erg_g = 1e4          # 1 J/kg = 1e4 erg/g
     _GPa_to_dyncm2 = 1e10         # 1 GPa = 1e10 dyn/cm^2
 
+    # Mean molecular weights for ideal-gas initial guesses
+    _SPECIES_MU = {
+        'water':   18.015,   # H2O
+        'methane': 16.043,   # CH4
+        'ammonia': 17.031,   # NH3
+        'mg2sio4': 140.69,   # Mg2SiO4 (forsterite)
+    }
+
     def __init__(self, species='water', smooth_z=False, aqua_version='revised'):
         self.species = species
         self.aqua_version = aqua_version
+
+        # Ideal EOS for initial guesses in inversions
+        mu = self._SPECIES_MU.get(species, 18.0)
+        self._ideal = ideal_eos.IdealEOS(mu)
 
         if species == 'water':
             if aqua_version == 'revised':
@@ -674,12 +686,19 @@ class z_eos:
         prev_sol = None
         for idx in np.ndindex(logs_target.shape):
             s_i = float(logs_target[idx])
+            s_kb_i = float(_s_kb[idx])
             p_i = float(lgp[idx])
 
             def err(lgt, _s=s_i, _p=p_i):
                 return float(self.get_logs_pt(_p, lgt) - _s)
 
-            guess = prev_sol if prev_sol is not None else 0.5 * (lo_t + hi_t)
+            if prev_sol is not None:
+                guess = prev_sol
+            else:
+                # Ideal-gas guess using species molecular weight
+                guess = float(np.clip(
+                    self._ideal.get_t_sp(s_kb_i, p_i, 0.0),
+                    lo_t, hi_t))
             sol, ok = self._newton_1d_z(err, guess, lo_t, hi_t)
             if np.isfinite(sol):
                 out[idx] = sol
@@ -721,7 +740,12 @@ class z_eos:
             def err(lgt, _rho=rho_i, _p=p_i):
                 return float(self.get_logrho_pt(_p, lgt) - _rho)
 
-            guess = prev_sol if prev_sol is not None else 0.5 * (lo_t + hi_t)
+            if prev_sol is not None:
+                guess = prev_sol
+            else:
+                guess = float(np.clip(
+                    self._ideal.get_t_rhop(rho_i, p_i, 0.0),
+                    lo_t, hi_t))
             sol, ok = self._newton_1d_z(err, guess, lo_t, hi_t)
             if np.isfinite(sol):
                 out[idx] = sol
@@ -765,7 +789,12 @@ class z_eos:
             def err(lgp, _rho=rho_i, _t=t_i):
                 return float(self.get_logrho_pt(lgp, _t) - _rho)
 
-            guess = prev_sol if prev_sol is not None else 0.5 * (lo_p + hi_p)
+            if prev_sol is not None:
+                guess = prev_sol
+            else:
+                guess = float(np.clip(
+                    self._ideal.get_p_rhot(rho_i, t_i, 0.0),
+                    lo_p, hi_p))
             sol, ok = self._newton_1d_z(err, guess, lo_p, hi_p)
             if np.isfinite(sol):
                 out[idx] = sol
