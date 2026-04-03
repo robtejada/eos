@@ -6,7 +6,6 @@ import eos.const as const
 import pdb
 import pandas as pd
 from tqdm import tqdm
-from numba import njit
 from eos import ideal_eos, metals_eos, ice_eos
 from eos import ideal_eos, metals_eos, scvh_eos
 from eos.smooth import smooth_eos_table, hampel_filter_1d
