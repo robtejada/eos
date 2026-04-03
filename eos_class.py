@@ -676,8 +676,10 @@ class z_eos:
         _s_kb, lgp = np.broadcast_arrays(_s_kb, lgp)
         out = np.full_like(_s_kb, np.nan, dtype=float)
 
-        lo_t = float(self.logtvals_pt[0])
-        hi_t = float(self.logtvals_pt[-1])
+        # Allow extrapolation beyond table T range (RGI with
+        # fill_value=None does nearest-neighbor extrapolation).
+        lo_t = 2.0
+        hi_t = 7.0
 
         # Convert kb/baryon → log10(erg/g/K)
         # S [erg/g/K] = S [kb/baryon] / erg_to_kbbar
@@ -729,8 +731,9 @@ class z_eos:
         lgrho_target, lgp = np.broadcast_arrays(lgrho_target, lgp)
         out = np.full_like(lgrho_target, np.nan, dtype=float)
 
-        lo_t = float(self.logtvals_pt[0])
-        hi_t = float(self.logtvals_pt[-1])
+        # Allow extrapolation beyond table T range
+        lo_t = 2.0
+        hi_t = 7.0
 
         prev_sol = None
         for idx in np.ndindex(lgrho_target.shape):
@@ -2151,7 +2154,7 @@ class hhe_z_mixtures():
         return np.nan, False
 
     def _newton_2d(self, residuals_func, guess, lb, ub,
-                   max_iter=30, tol=1e-8, h=1e-4):
+                   max_iter=15, tol=1e-8, h=1e-4):
         """2-D Newton-Raphson for (S, rho) → (P, T) with least_squares fallback.
 
         Parameters
@@ -2220,14 +2223,14 @@ class hhe_z_mixtures():
                                and np.max(np.abs(r_new)) < tol * 100)
             x = x_new
 
-        # --- Fallback: least_squares ---
+        # --- Fallback: least_squares (limited budget) ---
         try:
             sol = least_squares(
                 residuals_func, x,
                 bounds=(lb, ub),
                 method='trf',
-                xtol=1e-10, ftol=1e-10,
-                gtol=1e-10, max_nfev=200)
+                xtol=1e-8, ftol=1e-8,
+                gtol=1e-8, max_nfev=50)
             if sol.success and np.all(np.isfinite(sol.x)):
                 return sol.x, True
         except Exception:
@@ -3770,16 +3773,18 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        prev_pt = np.full((n_xi, nR, 2), np.nan)
+        # Warm-start caches:
+        #   prev_z[ixi, ir]  — previous Z solution (reused across Z)
+        #   prev_xi          — previous ξ solution (reused across ξ)
+        #   prev_rho         — previous ρ solution (reused across ρ)
+        prev_z = np.full((n_xi, nR, 2), np.nan)
 
         for iy, yp in enumerate(yvals):
-            prev_pt[:] = np.nan
+            prev_z[:] = np.nan
 
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
-
-                use_warm = iz > 0
 
                 for ir in range(nR):
                     rho_target = logrho[ir]
@@ -3792,6 +3797,7 @@ class hhe_z_mixtures():
                         continue
 
                     rho_scale = max(abs(rho_target), 1.0)
+                    prev_xi = np.array([np.nan, np.nan])
 
                     for ixi in range(n_xi):
                         s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
@@ -3816,11 +3822,15 @@ class hhe_z_mixtures():
                                 (s_t - _s) / _ss,
                                 (rho_t - _rho) / _rs])
 
-                        # Try _newton_2d first, then least_squares
-                        # as fallback (already inside _newton_2d).
-                        guess = prev_pt[ixi, ir]
-                        if not np.all(np.isfinite(guess)):
-                            # Cold-start from ideal EOS
+                        # Guess priority:
+                        #   1. Previous ξ (adjacent S, same ρ)
+                        #   2. Previous Z (same ξ/ρ, adjacent Z)
+                        #   3. Ideal EOS (cold start)
+                        if np.all(np.isfinite(prev_xi)):
+                            guess = prev_xi.copy()
+                        elif np.all(np.isfinite(prev_z[ixi, ir])):
+                            guess = prev_z[ixi, ir].copy()
+                        else:
                             try:
                                 pt_ideal = ideal_xy.get_pt_srho(
                                     s_phys, rho_target, yp)
@@ -3836,7 +3846,8 @@ class hhe_z_mixtures():
                         if ok and np.all(np.isfinite(sol)):
                             logp_tab[ixi, ir, iy, iz] = sol[0]
                             logt_tab[ixi, ir, iy, iz] = sol[1]
-                            prev_pt[ixi, ir] = sol
+                            prev_z[ixi, ir] = sol
+                            prev_xi = sol
 
         pbar.close()
 
