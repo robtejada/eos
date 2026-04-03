@@ -65,6 +65,7 @@ rock_eos/mgsio3_JJ_eos.txt
 rock_eos/mgsio3_JJ_SP.npz
 *.png
 .claude/*
+CLAUDE.md
 diagnose_isentrope_kinks.py
 compare_aqua_revised.py
 compare_aqua_mlcp_revised.py
