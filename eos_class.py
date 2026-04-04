@@ -1333,6 +1333,7 @@ class hhe_z_mixtures():
                  z_eos='aqua_revised',
                  pt_tab=True,
                  inv_tab=True,
+                 srho_tab=False,
                  y_prime=True,
                  logp_range=(5.0, 15.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
@@ -1361,8 +1362,13 @@ class hhe_z_mixtures():
             interpolation instead of raw VAL evaluation.
         inv_tab : bool
             If True (default), auto-load pre-computed inverted tables
-            (S-P, ρ-T, ρ-P, S-ρ) for fast inversions and derivatives.
+            (S-P, ρ-T, ρ-P) for fast inversions and derivatives.
             Set False to use on-the-fly root-finding.
+        srho_tab : bool
+            If True, also load the pre-computed S-ρ table when
+            ``inv_tab=True``.  Default False — the S-ρ inversion
+            uses the 1-D decomposition via the ρ-T or S-P tables
+            instead of the pre-computed 2-D S-ρ table.
         logp_range : tuple (lo, hi)
             log10 P [dyn/cm²] bounds for the S-P grid.
         logp_step : float
@@ -1381,6 +1387,7 @@ class hhe_z_mixtures():
         self.z_eos_label = z_eos
         self.pt_tab = pt_tab
         self.inv_tab = inv_tab
+        self.srho_tab = srho_tab
         self.y_prime = y_prime
 
         # --- Forward-model mixer ---
@@ -1446,8 +1453,9 @@ class hhe_z_mixtures():
     def _auto_load_tables(self):
         """Try to load pre-computed tables from disk.
 
-        Controlled by ``self.pt_tab`` (P-T basis table) and
-        ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P, S-ρ tables).
+        Controlled by ``self.pt_tab`` (P-T basis table),
+        ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P tables), and
+        ``self.srho_tab`` (S-ρ table, loaded only when True).
         """
         # P-T basis table (controlled by pt_tab)
         if self.pt_tab:
@@ -1457,10 +1465,15 @@ class hhe_z_mixtures():
 
         # Inverted tables (controlled by inv_tab)
         if self.inv_tab:
-            for basis in ('sp', 'rhot', 'rhop', 'srho'):
+            for basis in ('sp', 'rhot', 'rhop'):
                 path = self._table_path(basis)
                 if os.path.isfile(path):
                     getattr(self, f'load_{basis}_table')(path)
+            # S-ρ table only loaded when explicitly requested
+            if self.srho_tab:
+                path = self._table_path('srho')
+                if os.path.isfile(path):
+                    self.load_srho_table(path)
 
     # =================================================================
     # Y → Y' conversion
@@ -2238,7 +2251,8 @@ class hhe_z_mixtures():
         return np.array([np.nan, np.nan]), False
 
     def get_logt_sp(self, _s_kb, _lgp, _yp, _z=0.0,
-                    _zm=0.0, _za=0.0, _zr=0.0, **kw):
+                    _zm=0.0, _za=0.0, _zr=0.0,
+                    use_tab=True, **kw):
         """Temperature from (S, P) via Newton-Raphson on the forward model.
 
         Uses ``ideal_xy`` for initial guesses and the previous
@@ -2249,6 +2263,8 @@ class hhe_z_mixtures():
 
         If a pre-computed S-P table has been loaded, the RGI lookup
         is used first; Newton/brentq only fills NaN entries.
+        Set ``use_tab=False`` to force per-point Newton-Raphson
+        even when an S-P table is loaded.
 
         Parameters
         ----------
@@ -2262,6 +2278,8 @@ class hhe_z_mixtures():
             Total metal mass fraction (default 0).
         _zm, _za, _zr : float
             Nested metal sub-fractions.
+        use_tab : bool, optional
+            Use pre-computed S-P table if available (default True).
 
         Returns
         -------
@@ -2281,7 +2299,7 @@ class hhe_z_mixtures():
             return err
 
         # --- Fast path: pre-computed table ---
-        if self._logt_sp_rgi is not None:
+        if use_tab and self._logt_sp_rgi is not None:
             result = self._lookup_sp_table(
                 _s_kb, _lgp, _yp, _z, self._logt_sp_rgi)
             result_arr = np.atleast_1d(result)
@@ -2827,13 +2845,16 @@ class hhe_z_mixtures():
     # =================================================================
 
     def get_logp_rhot(self, _lgrho, _lgt, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
+                      _zm=0.0, _za=0.0, _zr=0.0,
+                      use_tab=True, **kw):
         """Pressure from (rho, T) via root-finding or pre-computed table.
 
         Inverts rho(P, T, Y', Z) = 10^_lgrho to find logP.
+        Set ``use_tab=False`` to force per-point Newton-Raphson
+        even when a ρ-T table is loaded.
         """
         # --- Fast path: ξ-mapped table ---
-        if self._logp_rhot_rgi is not None:
+        if use_tab and self._logp_rhot_rgi is not None:
             return self._lookup_rhot_table(
                 _lgrho, _lgt, _yp, _z)
 
@@ -3594,12 +3615,76 @@ class hhe_z_mixtures():
         s_hi = self._s_hi_srho_rgi(pts).reshape(_lgrho_a.shape)
         return s_lo + _xi * (s_hi - s_lo)
 
-    def get_logp_logt_srho(self, _s_kb, _lgrho, _yp, _z=0.0,
-                            _zm=0.0, _za=0.0, _zr=0.0, **kw):
-        """Pressure and temperature from (S, ρ) via 2-D least-squares.
+    # -----------------------------------------------------------------
+    # 1-D decompositions for S-ρ inversion
+    # -----------------------------------------------------------------
 
-        If a pre-computed S-ρ table has been loaded, the RGI is
-        used instead.
+    def _srho_via_rhot(self, s_target, rho_target, yp, z,
+                       zm=0.0, za=0.0, zr=0.0,
+                       prev_lgt=None, use_tab=True):
+        """(S, ρ) → (logP, logT) via 1-D root-find in T.
+
+        Uses the ρ-T inversion P(ρ, T) and forward model S(P, T).
+        At fixed ρ, S(T) is monotonically increasing, so brentq
+        is guaranteed to converge.
+        """
+        lgt_lo, lgt_hi = self.logt_min, self.logt_max
+
+        def err_t(lgt):
+            lgp = self.get_logp_rhot(
+                rho_target, lgt, yp, z, zm, za, zr,
+                use_tab=use_tab)
+            if not np.isfinite(lgp):
+                return np.nan
+            s_val = (self._s_pt(lgp, lgt, yp, z, zm, za, zr)
+                     * erg_to_kbbar)
+            return float(s_val - s_target)
+
+        guess = (prev_lgt if prev_lgt is not None
+                 else 0.5 * (lgt_lo + lgt_hi))
+        sol_lgt, ok = self._newton_1d(err_t, guess, lgt_lo, lgt_hi)
+        if not ok or not np.isfinite(sol_lgt):
+            return np.nan, np.nan
+        sol_lgp = self.get_logp_rhot(
+            rho_target, sol_lgt, yp, z, zm, za, zr,
+            use_tab=use_tab)
+        return sol_lgp, sol_lgt
+
+    def _srho_via_sp(self, s_target, rho_target, yp, z,
+                     zm=0.0, za=0.0, zr=0.0,
+                     prev_lgp=None, use_tab=True):
+        """(S, ρ) → (logP, logT) via 1-D root-find in P.
+
+        Uses the S-P inversion T(S, P) and forward model ρ(P, T).
+        Along an isentrope, ρ(P) is monotonically increasing, so
+        brentq is guaranteed to converge.
+        """
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+
+        def err_p(lgp):
+            lgt = self.get_logt_sp(
+                s_target, lgp, yp, z, zm, za, zr,
+                use_tab=use_tab)
+            if not np.isfinite(lgt):
+                return np.nan
+            lgrho = self._logrho_pt(
+                lgp, lgt, yp, z, zm, za, zr)
+            return float(lgrho - rho_target)
+
+        guess = (prev_lgp if prev_lgp is not None
+                 else 0.5 * (lgp_lo + lgp_hi))
+        sol_lgp, ok = self._newton_1d(err_p, guess, lgp_lo, lgp_hi)
+        if not ok or not np.isfinite(sol_lgp):
+            return np.nan, np.nan
+        sol_lgt = self.get_logt_sp(
+            s_target, sol_lgp, yp, z, zm, za, zr,
+            use_tab=use_tab)
+        return sol_lgp, sol_lgt
+
+    def get_logp_logt_srho(self, _s_kb, _lgrho, _yp, _z=0.0,
+                            _zm=0.0, _za=0.0, _zr=0.0,
+                            basis='rhot', use_tab=True, **kw):
+        """Pressure and temperature from (S, ρ).
 
         Parameters
         ----------
@@ -3611,6 +3696,18 @@ class hhe_z_mixtures():
             Y' = Y/(1-Z).
         _z : float
             Total metal mass fraction.
+        basis : str, optional
+            Which 1-D decomposition to use (default ``'rhot'``).
+            ``'rhot'``: root-find in T using the ρ-T inversion
+            P(ρ, T) and forward S(P, T).
+            ``'sp'``: root-find in P using the S-P inversion
+            T(S, P) and forward ρ(P, T).
+        use_tab : bool, optional
+            If True (default), use pre-computed tables for the
+            chosen basis.  Raises ``RuntimeError`` if the required
+            table has not been loaded.
+            If False, solve per-point via Newton-Raphson (slower
+            but does not require pre-computed tables).
 
         Returns
         -------
@@ -3619,11 +3716,30 @@ class hhe_z_mixtures():
             NaN where the solver fails.
         """
         _yp = self._to_yprime(_yp, _z)
-        # --- Fast path: pre-computed table ---
-        if self._srho_rgi_p is not None:
-            return self._lookup_srho_table(_s_kb, _lgrho, _yp, _z)
 
-        # --- Slow path: per-point least_squares ---
+        use_rhot = (basis == 'rhot')
+
+        # Validate table availability when use_tab=True
+        if use_tab:
+            if use_rhot and self._logp_rhot_rgi is None:
+                raise RuntimeError(
+                    "S-ρ inversion with basis='rhot' and use_tab=True "
+                    "requires a pre-computed ρ-T table.  "
+                    "Build or load one first:\n"
+                    "  eos.build_rhot_table(yvals, zvals)   # or\n"
+                    "  eos.load_rhot_table(path)\n"
+                    "Or set use_tab=False to use per-point "
+                    "Newton-Raphson.")
+            if not use_rhot and self._logt_sp_rgi is None:
+                raise RuntimeError(
+                    "S-ρ inversion with basis='sp' and use_tab=True "
+                    "requires a pre-computed S-P table.  "
+                    "Build or load one first:\n"
+                    "  eos.build_sp_table(yvals, zvals)   # or\n"
+                    "  eos.load_sp_table(path)\n"
+                    "Or set use_tab=False to use per-point "
+                    "Newton-Raphson.")
+
         scalar = np.isscalar(_s_kb) and np.isscalar(_lgrho)
         _s_kb  = np.atleast_1d(np.asarray(_s_kb, dtype=float))
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
@@ -3632,64 +3748,25 @@ class hhe_z_mixtures():
         lgp_out = np.full_like(_s_kb, np.nan, dtype=float)
         lgt_out = np.full_like(_s_kb, np.nan, dtype=float)
 
-        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
-        lgt_lo, lgt_hi = self.logt_min, self.logt_max
-        lb = np.array([lgp_lo, lgt_lo])
-        ub = np.array([lgp_hi, lgt_hi])
-
-        # Warm-start: carry forward the last converged solution
-        prev_x = None
+        prev_val = None  # logT for rhot, logP for sp
 
         for idx in np.ndindex(_s_kb.shape):
-            s_target = _s_kb[idx]
-            rho_target = _lgrho[idx]
+            s_i   = float(_s_kb[idx])
+            rho_i = float(_lgrho[idx])
 
-            s_scale = max(abs(s_target), 1.0)
-            rho_scale = max(abs(rho_target), 1.0)
-
-            def residuals(x):
-                lgp, lgt = x
-                s_test = (self._s_pt(
-                    lgp, lgt, _yp, _z, _zm, _za, _zr)
-                    * erg_to_kbbar)
-                rho_test = self._logrho_pt(
-                    lgp, lgt, _yp, _z, _zm, _za, _zr)
-                if not (np.isfinite(s_test) and np.isfinite(rho_test)):
-                    return np.array([1e30, 1e30])
-                return np.array([(s_test - s_target) / s_scale,
-                                 (rho_test - rho_target) / rho_scale])
-
-            # Initial guess
-            if prev_x is not None:
-                x0 = prev_x.copy()
+            if use_rhot:
+                lgp, lgt = self._srho_via_rhot(
+                    s_i, rho_i, _yp, _z, _zm, _za, _zr,
+                    prev_lgt=prev_val, use_tab=use_tab)
             else:
-                # Seed: mid-T, then invert for P from rho
-                lgt_seed = 0.5 * (lgt_lo + lgt_hi)
-                try:
-                    def err_p(lgp):
-                        return (self._logrho_pt(
-                            lgp, lgt_seed, _yp, _z, _zm, _za, _zr)
-                            - rho_target)
-                    lgp_seed = brentq(err_p, lgp_lo, lgp_hi,
-                                      xtol=1e-5, maxiter=60)
-                except (ValueError, RuntimeError, ZeroDivisionError):
-                    lgp_seed = 0.5 * (lgp_lo + lgp_hi)
-                x0 = np.array([lgp_seed, lgt_seed])
+                lgp, lgt = self._srho_via_sp(
+                    s_i, rho_i, _yp, _z, _zm, _za, _zr,
+                    prev_lgp=prev_val, use_tab=use_tab)
 
-            x0 = np.clip(x0, lb, ub)
-
-            try:
-                sol = least_squares(residuals, x0,
-                                     bounds=(lb, ub),
-                                     method='trf',
-                                     xtol=1e-10, ftol=1e-10,
-                                     gtol=1e-10, max_nfev=200)
-                if sol.success and np.all(np.isfinite(sol.x)):
-                    lgp_out[idx] = sol.x[0]
-                    lgt_out[idx] = sol.x[1]
-                    prev_x = sol.x.copy()
-            except Exception:
-                pass
+            if np.isfinite(lgp) and np.isfinite(lgt):
+                lgp_out[idx] = lgp
+                lgt_out[idx] = lgt
+                prev_val = lgt if use_rhot else lgp
 
         if scalar:
             return lgp_out.item(), lgt_out.item()
@@ -3722,13 +3799,48 @@ class hhe_z_mixtures():
 
     def build_srho_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         n_xi=None, verbose=True):
+                         n_xi=None, basis='rhot', use_tab=True,
+                         verbose=True):
         """Build logP and logT tables on a (ξ, logrho, Y', Z) grid.
 
         The ξ coordinate normalises the entropy axis at each
         (logrho, Y', Z) from 0 (S_lo) to 1 (S_hi), matching the
         S-P rhomboid approach.
+
+        Parameters
+        ----------
+        basis : str, optional
+            ``'rhot'`` (default): 1-D root-find in T via ρ-T
+            inversion.  ``'sp'``: 1-D root-find in P via S-P
+            inversion.
+        use_tab : bool, optional
+            If True (default), require pre-computed tables for the
+            chosen basis (ρ-T or S-P).  Raises ``RuntimeError``
+            if the table is not loaded.
+            If False, use per-point Newton-Raphson for the inner
+            inversion (slower but no table dependency).
         """
+        use_rhot = (basis == 'rhot')
+        if use_tab:
+            if use_rhot and self._logp_rhot_rgi is None:
+                raise RuntimeError(
+                    "build_srho_table with basis='rhot' and "
+                    "use_tab=True requires a pre-computed ρ-T "
+                    "table.  Build or load one first:\n"
+                    "  eos.build_rhot_table(yvals, zvals)   # or\n"
+                    "  eos.load_rhot_table(path)\n"
+                    "Or set use_tab=False to use per-point "
+                    "Newton-Raphson.")
+            if not use_rhot and self._logt_sp_rgi is None:
+                raise RuntimeError(
+                    "build_srho_table with basis='sp' and "
+                    "use_tab=True requires a pre-computed S-P "
+                    "table.  Build or load one first:\n"
+                    "  eos.build_sp_table(yvals, zvals)   # or\n"
+                    "  eos.load_sp_table(path)\n"
+                    "Or set use_tab=False to use per-point "
+                    "Newton-Raphson.")
+
         if n_xi is None:
             n_xi = self.n_xi
 
@@ -3759,24 +3871,16 @@ class hhe_z_mixtures():
         # Step 2: invert
         logp_tab = np.full((n_xi, nR, nY, nZ), np.nan, dtype=float)
         logt_tab = np.full((n_xi, nR, nY, nZ), np.nan, dtype=float)
-
-        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
-        lgt_lo, lgt_hi = self.logt_min, self.logt_max
-        lb = np.array([lgp_lo, lgt_lo])
-        ub = np.array([lgp_hi, lgt_hi])
-
         total = nY * nZ
         pbar = tqdm(total=total,
-                     desc="Inverting P,T → S,ρ",
+                     desc=f"Inverting S,ρ → P,T ({basis})",
                      disable=not verbose,
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        # Warm-start caches:
-        #   prev_z[ixi, ir]  — previous Z solution (reused across Z)
-        #   prev_xi          — previous ξ solution (reused across ξ)
-        #   prev_rho         — previous ρ solution (reused across ρ)
-        prev_z = np.full((n_xi, nR, 2), np.nan)
+        # Warm-start cache: previous Z solution at each (ξ, ρ)
+        # Stores the 1-D warm-start variable (logT for rhot, logP for sp)
+        prev_z = np.full((n_xi, nR), np.nan)
 
         for iy, yp in enumerate(yvals):
             prev_z[:] = np.nan
@@ -3795,58 +3899,41 @@ class hhe_z_mixtures():
                     if shi_i <= slo_i:
                         continue
 
-                    rho_scale = max(abs(rho_target), 1.0)
-                    prev_xi = np.array([np.nan, np.nan])
+                    prev_xi = np.nan  # 1-D warm-start along ξ
 
                     for ixi in range(n_xi):
                         s_phys = slo_i + xi_vals[ixi] * (shi_i - slo_i)
-                        s_scale = max(abs(s_phys), 1.0)
-
-                        def residuals(x, _s=s_phys, _ss=s_scale,
-                                      _rho=rho_target, _rs=rho_scale):
-                            lgp, lgt = x
-                            try:
-                                s_t = (self._s_pt(
-                                    lgp, lgt, yp, zv, _zm, _za, _zr)
-                                    * erg_to_kbbar)
-                                rho_t = self._logrho_pt(
-                                    lgp, lgt, yp, zv, _zm, _za, _zr)
-                            except (ZeroDivisionError,
-                                    FloatingPointError):
-                                return np.array([1e30, 1e30])
-                            if not (np.isfinite(s_t)
-                                    and np.isfinite(rho_t)):
-                                return np.array([1e30, 1e30])
-                            return np.array([
-                                (s_t - _s) / _ss,
-                                (rho_t - _rho) / _rs])
 
                         # Guess priority:
                         #   1. Previous ξ (adjacent S, same ρ)
                         #   2. Previous Z (same ξ/ρ, adjacent Z)
-                        #   3. Ideal EOS (cold start)
-                        if np.all(np.isfinite(prev_xi)):
-                            guess = prev_xi.copy()
-                        elif np.all(np.isfinite(prev_z[ixi, ir])):
-                            guess = prev_z[ixi, ir].copy()
-                        else:
-                            try:
-                                pt_ideal = ideal_xy.get_pt_srho(
-                                    s_phys, rho_target, yp)
-                                guess = np.asarray(pt_ideal,
-                                                   dtype=float)
-                            except Exception:
-                                guess = np.array([
-                                    0.5 * (lgp_lo + lgp_hi),
-                                    0.5 * (lgt_lo + lgt_hi)])
+                        prev_guess = (prev_xi
+                                      if np.isfinite(prev_xi)
+                                      else prev_z[ixi, ir])
 
-                        sol, ok = self._newton_2d(
-                            residuals, guess, lb, ub)
-                        if ok and np.all(np.isfinite(sol)):
-                            logp_tab[ixi, ir, iy, iz] = sol[0]
-                            logt_tab[ixi, ir, iy, iz] = sol[1]
-                            prev_z[ixi, ir] = sol
-                            prev_xi = sol
+                        if use_rhot:
+                            lgp, lgt = self._srho_via_rhot(
+                                s_phys, rho_target, yp, zv,
+                                _zm, _za, _zr,
+                                prev_lgt=(prev_guess
+                                          if np.isfinite(prev_guess)
+                                          else None),
+                                use_tab=use_tab)
+                        else:
+                            lgp, lgt = self._srho_via_sp(
+                                s_phys, rho_target, yp, zv,
+                                _zm, _za, _zr,
+                                prev_lgp=(prev_guess
+                                          if np.isfinite(prev_guess)
+                                          else None),
+                                use_tab=use_tab)
+
+                        if np.isfinite(lgp) and np.isfinite(lgt):
+                            logp_tab[ixi, ir, iy, iz] = lgp
+                            logt_tab[ixi, ir, iy, iz] = lgt
+                            warm = lgt if use_rhot else lgp
+                            prev_z[ixi, ir] = warm
+                            prev_xi = warm
 
         pbar.close()
 

@@ -134,6 +134,17 @@ def build_parser():
     p.add_argument('--z_step', type=float, default=DEFAULTS['z_step'],
                    help=f"Z step (default: {DEFAULTS['z_step']})")
 
+    # S-ρ specific
+    p.add_argument('--srho_basis', default='rhot',
+                   choices=['rhot', 'sp'],
+                   help="1-D decomposition for srho inversion "
+                        "(default: rhot)")
+    p.add_argument('--srho_use_tab', default=True,
+                   type=lambda x: x.lower() not in ('false', '0', 'no'),
+                   help="Use pre-computed rhot/sp table for srho "
+                        "inversion (default: True). Set to False "
+                        "to use per-point Newton-Raphson.")
+
     # Output
     p.add_argument('--output', type=str, default=None,
                    help='Output path (default: auto from hhe_eos/z_eos)')
@@ -169,6 +180,9 @@ def main():
         print(f"  logrho range:[{args.logrho_lo}, {args.logrho_hi}] step {args.logrho_step}")
     if args.basis in ('sp', 'rhop', 'srho'):
         print(f"  n_xi:        {args.n_xi}")
+    if args.basis == 'srho':
+        print(f"  srho basis:  {args.srho_basis}")
+        print(f"  srho use_tab:{args.srho_use_tab}")
     nY, nZ = len(yvals), len(zvals)
     print(f"  Y' grid:     [{yvals[0]:.3f}, {yvals[-1]:.3f}] step {args.y_step} ({nY} pts)")
     print(f"  Z grid:      [{zvals[0]:.3f}, {zvals[-1]:.3f}] step {args.z_step} ({nZ} pts)")
@@ -213,7 +227,12 @@ def main():
     # during inversions. inv_tab=False avoids loading inverted tables
     # (which are what we're building). For --basis pt, both are off
     # since we build from raw VAL.
-    _pt_tab = (args.basis != 'pt')  # PT basis builds from VAL
+    #
+    # For --basis srho, we set inv_tab=True so the required dependency
+    # table (ρ-T or S-P) is auto-loaded, and srho_tab=False so the
+    # old S-ρ table is NOT loaded (we're building a fresh one).
+    _pt_tab  = (args.basis != 'pt')  # PT basis builds from VAL
+    _inv_tab = (args.basis == 'srho' and args.srho_use_tab)
     eos = hhe_z_mixtures(
         hhe_eos_name=args.hhe_eos,
         hg=hg,
@@ -223,7 +242,8 @@ def main():
         species_list=args.species,
         z_eos=args.z_eos,
         pt_tab=_pt_tab,
-        inv_tab=False,
+        inv_tab=_inv_tab,
+        srho_tab=False,
         logp_range=(args.logp_lo, args.logp_hi),
         logp_step=args.logp_step,
         logt_range=(args.logt_lo, args.logt_hi),
@@ -252,7 +272,30 @@ def main():
         eos.save_rhop_table(result, path=args.output)
 
     elif args.basis == 'srho':
-        result = eos.build_srho_table(yvals, zvals, n_xi=args.n_xi)
+        # The S-ρ inversion uses a 1-D decomposition.  When
+        # use_tab=True, the required dependency table (ρ-T or S-P)
+        # was auto-loaded via inv_tab=True above.  Verify it's there.
+        if args.srho_use_tab:
+            if args.srho_basis == 'rhot' and eos._logp_rhot_rgi is None:
+                rhot_path = eos._table_path('rhot')
+                print(f"ERROR: ρ-T table not found at {rhot_path}")
+                print("Build it first:  python eos_inversions.py "
+                      "--basis rhot ...")
+                print("Or set --srho_use_tab False to use "
+                      "per-point Newton-Raphson.")
+                sys.exit(1)
+            if args.srho_basis == 'sp' and eos._logt_sp_rgi is None:
+                sp_path = eos._table_path('sp')
+                print(f"ERROR: S-P table not found at {sp_path}")
+                print("Build it first:  python eos_inversions.py "
+                      "--basis sp ...")
+                print("Or set --srho_use_tab False to use "
+                      "per-point Newton-Raphson.")
+                sys.exit(1)
+
+        result = eos.build_srho_table(yvals, zvals, n_xi=args.n_xi,
+                                      basis=args.srho_basis,
+                                      use_tab=args.srho_use_tab)
         eos.save_srho_table(result, path=args.output)
 
     elapsed = time.time() - t0
