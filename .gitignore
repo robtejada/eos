@@ -71,3 +71,4 @@ compare_aqua_revised.py
 compare_aqua_mlcp_revised.py
 scvh/scvh_*ppv2*
 scvh/scvh_*highS*
+test_srho_monotonicity.py
