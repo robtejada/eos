@@ -3479,7 +3479,7 @@ class hhe_z_mixtures():
 
     def compute_s_bounds_srho(self, yvals, zvals,
                               _zm=0.0, _za=0.0, _zr=0.0,
-                              n_t_sweep=20, verbose=True):
+                              n_t_sweep=60, verbose=True):
         """Compute physical S bounds at each (logrho, Y', Z).
 
         At each (logrho, Y', Z), sweeps logT from logt_min to logt_max,
@@ -3564,12 +3564,14 @@ class hhe_z_mixtures():
                     if np.isfinite(col).sum() > 5:
                         col[:], _ = hampel_filter_1d(
                             col, window=10, n_sigma=3.0)
-                        col[:] = gaussian_filter1d(col, sigma=3.0)
+                        col[:] = gaussian_filter1d(col, sigma=1.5)
 
-        # Pad bounds by 2%
+        # Pad bounds: s_lo inward (upward) so ξ=0 maps to a
+        # safely achievable entropy, avoiding NaN cells at the
+        # low-S boundary; s_hi outward (upward) as before.
         margin = 0.02 * (s_hi - s_lo)
         margin = np.where(np.isfinite(margin), margin, 0.0)
-        s_lo -= margin
+        s_lo += margin
         s_hi += margin
 
         self._s_lo_srho = s_lo.astype(np.float32)
@@ -3702,6 +3704,8 @@ class hhe_z_mixtures():
             P(ρ, T) and forward S(P, T).
             ``'sp'``: root-find in P using the S-P inversion
             T(S, P) and forward ρ(P, T).
+            Ignored when the pre-computed S-ρ table is loaded
+            (``srho_tab=True``), which is used as a fast path.
         use_tab : bool, optional
             If True (default), use pre-computed tables for the
             chosen basis.  Raises ``RuntimeError`` if the required
@@ -3716,6 +3720,10 @@ class hhe_z_mixtures():
             NaN where the solver fails.
         """
         _yp = self._to_yprime(_yp, _z)
+
+        # Fast path: use the pre-computed S-ρ table if loaded
+        if self._srho_rgi_p is not None:
+            return self._lookup_srho_table(_s_kb, _lgrho, _yp, _z)
 
         use_rhot = (basis == 'rhot')
 
@@ -3945,7 +3953,7 @@ class hhe_z_mixtures():
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # Step 4: Hampel outlier filter along ξ axis
+        # Step 4a: Hampel outlier filter along ξ axis
         for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
             if verbose:
                 print(f"Running Hampel outlier filter on {label} "
@@ -3962,6 +3970,48 @@ class hhe_z_mixtures():
                     n_out += n_rep
             if n_out > 0 and verbose:
                 print(f"  Replaced {n_out} outlier cells in {label}")
+
+        # Step 4b: Hampel outlier filter along ρ axis
+        # NaN-filled cells can be consistent along ξ but create
+        # cross-ρ artifacts that produce temperature inversions
+        # when sweeping ρ at fixed S.
+        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
+            if verbose:
+                print(f"Running Hampel outlier filter on {label} "
+                      f"along ρ axis ...")
+            n_out = 0
+            for ixi in range(n_xi):
+                for iy in range(nY):
+                    for iz in range(nZ):
+                        col = arr[ixi, :, iy, iz]
+                        cleaned, n_rep = hampel_filter_1d(
+                            col, window=5, n_sigma=3.0)
+                        if n_rep > 0:
+                            changed = (cleaned != col) & np.isfinite(col)
+                            col[changed] = cleaned[changed]
+                            n_out += n_rep
+            if n_out > 0 and verbose:
+                print(f"  Replaced {n_out} outlier cells in {label}")
+
+        # Step 5: enforce monotonicity along ξ
+        # Physical constraint: at fixed (ρ, Y', Z), higher S (higher ξ)
+        # must give higher T and higher P.  NaN filling and Hampel
+        # filtering can violate this at low ξ / low ρ.
+        n_mono = 0
+        for ir in range(nR):
+            for iy in range(nY):
+                for iz in range(nZ):
+                    for arr in [logt_tab, logp_tab]:
+                        col = arr[:, ir, iy, iz]
+                        if not np.all(np.isfinite(col)):
+                            continue
+                        for i in range(1, n_xi):
+                            if col[i] < col[i - 1]:
+                                col[i] = col[i - 1]
+                                n_mono += 1
+        if n_mono > 0 and verbose:
+            print(f"  Monotonicity: clamped {n_mono} cells "
+                  f"along ξ (logT + logP)")
 
         logp_f32 = logp_tab.astype(np.float32)
         logt_f32 = logt_tab.astype(np.float32)
