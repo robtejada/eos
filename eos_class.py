@@ -4528,21 +4528,21 @@ class hhe_z_mixtures():
     # in a single RGI evaluation — orders of magnitude faster than
     # the _vec per-element loop.
 
-    def _vec_fd_cp(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_cp(self, lgp, lgt, yp, z, h=0.1, **kw):
         return (self.get_s_pt_tab(lgp, lgt + h, yp, z)
                 - self.get_s_pt_tab(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
 
-    def _vec_fd_delta(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_delta(self, lgp, lgt, yp, z, h=0.1, **kw):
         return -(self.get_logrho_pt_tab(lgp, lgt + h, yp, z)
                  - self.get_logrho_pt_tab(lgp, lgt - h, yp, z)) / (2*h)
 
-    def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=0.1, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
         return (t2 - t1) / (2*h)
 
-    def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=0.1, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
@@ -4551,19 +4551,19 @@ class hhe_z_mixtures():
         result = (2*h) / (r2 - r1)
         return np.where(np.isfinite(result), result, np.nan)
 
-    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=0.1, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
         return (p2 - p1) / (2*h)
 
-    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=0.1, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0 - h, lgt, yp, z)
         p2 = self.get_logp_rhot(rho0 + h, lgt, yp, z)
         return (p2 - p1) / (2*h)
 
-    def _vec_fd_cv(self, lgp, lgt, yp, z, h=1e-2, **kw):
+    def _vec_fd_cv(self, lgp, lgt, yp, z, h=0.1, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
@@ -4599,7 +4599,7 @@ class hhe_z_mixtures():
 
     def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
         """Ledoux dS/dY|_{ρ,P} vectorized via identity with clamped c."""
-        ht = 1e-2
+        ht = 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
         logS_Tp = np.log10(self.get_s_pt_tab(lgp, lgt + ht, yp, z))
         logS_Tm = np.log10(self.get_s_pt_tab(lgp, lgt - ht, yp, z))
@@ -4618,7 +4618,7 @@ class hhe_z_mixtures():
 
     def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
         """Ledoux dS/dZ|_{ρ,P} vectorized via identity with clamped c."""
-        ht = 1e-2
+        ht = 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
         logS_Tp = np.log10(self.get_s_pt_tab(lgp, lgt + ht, yp, z))
         logS_Tm = np.log10(self.get_s_pt_tab(lgp, lgt - ht, yp, z))
@@ -4636,7 +4636,7 @@ class hhe_z_mixtures():
 
     def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dT/dY|_{S,ρ} vectorized via identity."""
-        ht, hp = 1e-2, 1e-2
+        ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
         a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
              - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
@@ -4657,7 +4657,7 @@ class hhe_z_mixtures():
 
     def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dT/dZ|_{S,ρ} vectorized via identity."""
-        ht, hp = 1e-2, 1e-2
+        ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
         a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
              - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
@@ -4678,7 +4678,7 @@ class hhe_z_mixtures():
 
     def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dU/dY|_{S,ρ} vectorized via identity."""
-        ht, hp = 1e-2, 1e-2
+        ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
         a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
              - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
@@ -4707,7 +4707,7 @@ class hhe_z_mixtures():
 
     def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dU/dZ|_{S,ρ} vectorized via identity."""
-        ht, hp = 1e-2, 1e-2
+        ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
         a = (np.log10(self._s_pt(lgp, lgt+ht, yp, z))
              - np.log10(self._s_pt(lgp, lgt-ht, yp, z))) / (2*ht)
