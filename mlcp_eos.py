@@ -26,8 +26,7 @@ def read_water_table(file_path):
     try:
         data = pd.read_csv(
             file_path,
-            delim_whitespace=True,  # Handle whitespace-separated values
-            # sep='\s+',
+            sep=r'\s+',  # Handle whitespace-separated values
             skiprows=1,  # Skip the header line
             names=[
                 "rho", "T", "P", "P_ni", "F_Ni", "U_Ni", "U", "CV_Ni", "S_Ni"

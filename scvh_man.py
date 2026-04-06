@@ -220,15 +220,15 @@ class eos:
     # these wrapper functions are the ones meant to be called externally.
     def get(self, logp, logt, y):
         '''return all eos results for a (logp, logt) pair at any H-He mixture.'''
-        if type(logp) is np.float64 or type(logp) is float: logp = np.array([logp])
-        if type(logt) is np.float64 or type(logt) is float: logt = np.array([logt])
-        if type(y) is np.float64 or type(y) is float: y = np.array([y])
+        if isinstance(logp, (np.floating, float)): logp = np.array([logp])
+        if isinstance(logt, (np.floating, float)): logt = np.array([logt])
+        if isinstance(y, (np.floating, float)): y = np.array([y])
         pair = (logp, logt)
         res = {}
-        if type(y) is np.ndarray:
+        if isinstance(y, np.ndarray):
             if not np.all(0. <= y) and np.all(y <= 1.):
                 raise ValueError('invalid helium mass fraction(s)')
-        elif type(y) is np.float64:
+        elif isinstance(y, (np.floating, float)):
             if not 0. <= y <= 1.:
                 raise ValueError('invalid helium mass fraction %f' % y)
         try:
@@ -283,9 +283,9 @@ class eos:
         # this is prohibitively slow -- 30 ms per zone times 10^3 zones is 30 seconds.
         # then a 100-step evolutionary model is taking close to an hour.
 
-        if type(logrho) is float or type(logrho) is np.float64: logrho = np.array([logrho])
-        if type(logt) is float or type(logt) is np.float64: logt = np.array([logt])
-        if type(y) is float or type(y) is np.float64: y = np.array([y])
+        if isinstance(logrho, (np.floating, float)): logrho = np.array([logrho])
+        if isinstance(logt, (np.floating, float)): logt = np.array([logt])
+        if isinstance(y, (np.floating, float)): y = np.array([y])
 
         assert len(logrho) == 1 and len(logt) == 1 and len(y) == 1, 'rhot_get only works for length-1 arrays at present.'
         def zero_me(logpval):
@@ -367,15 +367,15 @@ class eos:
             # print type(species_num)
             # print type(species_den)
 
-            if type(xh) is np.ndarray:
-                assert type(species_num) is np.ndarray, 'species are ndarray, but delta numerator is not.'
-                assert type(species_den) is np.ndarray, 'species are ndarray, but delta denominator is not.'
+            if isinstance(xh, np.ndarray):
+                assert isinstance(species_num, np.ndarray), 'species are ndarray, but delta numerator is not.'
+                assert isinstance(species_den, np.ndarray), 'species are ndarray, but delta denominator is not.'
                 # number density of free e- for one of the pure species is sometimes a tiny negative number.
                 # in cases where there are no free electrons, delta does not matter (prefactor vanishes);
                 # it's just crucial that it's > 0 and not a nan.
                 species_num[species_num <= 0.] = 1.
                 species_den[species_den <= 0.] = 1.
-            elif type(xh) is np.float64:
+            elif isinstance(xh, (np.floating, float)):
                 if species_num <= 0.: species_num = 1.
                 if species_den <= 0.: species_den = 1.
             else:
@@ -552,9 +552,9 @@ class eos:
         # special handling is required for cases where hydrogen (and thus helium) is totally neutral, or else dividing by zero
         hydrogen_is_neutral = den == 0.
 
-        if type(xh) is np.ndarray:
+        if isinstance(xh, np.ndarray):
             den[hydrogen_is_neutral] = 1. # kludge to guarantee that delta derivs are calculable. we'll zero them in the neutral case afterward.
-        elif type(xh) is np.float64:
+        elif isinstance(xh, (np.floating, float)):
             if hydrogen_is_neutral: den = 1.
         else:
             raise TypeError('type %s not recognized in get_hhe' % str(type(xh)))

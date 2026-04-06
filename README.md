@@ -20,7 +20,7 @@ and thus Github's Large File Storage is required.
 To download and use these tables, 
 
 1. ```git lfs install```
-2. ```git clone https://github.com/Rob685/eos.git```
+2. ```git clone https://github.com/robtejada/eos.git```
 
 # Importing the EOS tables and functions
 Initialization and usage example:
