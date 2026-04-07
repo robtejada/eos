@@ -291,14 +291,57 @@ class Fe_COMBINED_EOS:
         u_mix = (1.0 - w) * u_s + w * u_l
         return u_mix.reshape(P_arr.shape)
 
-    def get_alpha_pt(self, P, T, solid_tab=True, liquid_tab=True):
+    def get_alpha_pt(self, P, T, solid_tab=True, liquid_tab=True,
+                     dT_frac: float = 1e-3):
+        """
+        Thermal expansion alpha = -(1/rho) (drho/dT)_P via central
+        finite difference on the combined (blended) density.
+
+        Simply blending the individual solid/liquid alphas misses the
+        large positive contribution from the density jump at the melt
+        curve (dw/dT term), so we differentiate the full get_rho_pt
+        instead.
+
+        Uses adaptive dT: starts at max(T * dT_frac, 1 K) and widens
+        if the result is negative (which can happen when the stencil
+        straddles an EOS table boundary).
+        """
         P_arr, T_arr = self._as_arrays(P, T)
 
-        a_s = self.solid.get_alpha_pt(P_arr, T_arr, tab=solid_tab)
-        a_l = self.liquid.get_alpha_pt(P_arr, T_arr, tab=liquid_tab)
-        w = self._blend_weight_PT(P_arr, T_arr)
-        a_mix = (1.0 - w) * a_s + w * a_l
-        return a_mix.reshape(P_arr.shape)
+        dT = np.maximum(T_arr * dT_frac, 1.0)
+        rho_mid = self.get_rho_pt(P_arr, T_arr,
+                                  solid_tab=solid_tab, liquid_tab=liquid_tab)
+        rho_hi = self.get_rho_pt(P_arr, T_arr + dT,
+                                 solid_tab=solid_tab, liquid_tab=liquid_tab)
+        rho_lo = self.get_rho_pt(P_arr, T_arr - dT,
+                                 solid_tab=solid_tab, liquid_tab=liquid_tab)
+
+        alpha = -(1.0 / rho_mid) * (rho_hi - rho_lo) / (2.0 * dT)
+
+        # Adaptive widening: if any alpha < 0, retry those points with
+        # progressively larger dT.  Negative alpha near the melt curve
+        # can occur if the stencil sits in a narrow EOS table artefact.
+        neg = alpha < 0
+        if np.any(neg):
+            for scale in (5.0, 25.0, 100.0):
+                dT_wide = np.maximum(T_arr * dT_frac * scale, 1.0)
+                rho_hi_w = self.get_rho_pt(P_arr[neg], T_arr[neg] + dT_wide[neg],
+                                           solid_tab=solid_tab,
+                                           liquid_tab=liquid_tab)
+                rho_lo_w = self.get_rho_pt(P_arr[neg], T_arr[neg] - dT_wide[neg],
+                                           solid_tab=solid_tab,
+                                           liquid_tab=liquid_tab)
+                alpha_wide = -(1.0 / rho_mid[neg]) * (
+                    rho_hi_w - rho_lo_w) / (2.0 * dT_wide[neg])
+                alpha[neg] = alpha_wide
+                neg = alpha < 0
+                if not np.any(neg):
+                    break
+
+            # Final fallback: clamp any remaining negatives to zero.
+            alpha = np.maximum(alpha, 0.0)
+
+        return alpha.reshape(P_arr.shape)
 
     def get_cp_pt(self, P, T, solid_tab=True, liquid_tab=True):
         P_arr, T_arr = self._as_arrays(P, T)
