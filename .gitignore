@@ -81,3 +81,5 @@ methane_ammonia/methane_dft_pt.npz
 methane_ammonia/methane_dft_rhot.npz
 methane_ammonia/methane_setzmann_pt.npz
 diagnose_entropy_sign.py
+ch4_comb_eos.py
+nh3_comb_eos.py

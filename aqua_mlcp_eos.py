@@ -49,7 +49,8 @@ def read_water_table(file_path):
         return None
 
 # Path to your water_table.txt file
-file_path = "eos/mazevet/mlcp_water_table_new.txt"
+file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                         "mazevet", "mlcp_water_table_new.txt")
 
 # Read the data table
 data = read_water_table(file_path)

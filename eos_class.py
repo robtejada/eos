@@ -1326,6 +1326,13 @@ class hhe_z_mixtures():
         'srho': '{hhe}_{z}_srho_adaptive.npz',
     }
 
+    _TABLE_BASES_SQUARE = {
+        'sp':   '{hhe}_{z}_sp_square.npz',
+        'rhot': '{hhe}_{z}_rhot_square.npz',
+        'rhop': '{hhe}_{z}_rhop_square.npz',
+        'srho': '{hhe}_{z}_srho_square.npz',
+    }
+
     def __init__(self, hhe_eos_name='cd', hg=True,
                  smooth_hhe=True, smooth_z=True,
                  mu_h_vary=True,
@@ -1335,7 +1342,8 @@ class hhe_z_mixtures():
                  inv_tab=True,
                  srho_tab=False,
                  y_prime=True,
-                 logp_range=(5.0, 15.0), logp_step=0.05,
+                 xi_transform=False,
+                 logp_range=(6.0, 14.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
                  n_xi=150):
@@ -1389,6 +1397,7 @@ class hhe_z_mixtures():
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
         self.y_prime = y_prime
+        self.xi_transform = xi_transform
 
         # --- Forward-model mixer ---
         self.val = val_mixtures(
@@ -1437,6 +1446,14 @@ class hhe_z_mixtures():
         self._s_lo_srho_rgi = None
         self._s_hi_srho_rgi = None
 
+        # xi_transform tracking: None=no table, True=xi, False=square
+        self._sp_xi_transform = None
+        self._rhot_xi_transform = None
+        self._rhop_xi_transform = None
+        self._srho_xi_transform = None
+        self._svals_sp = None      # 1-D S grid for square SP tables
+        self._svals_srho = None    # 1-D S grid for square S-rho tables
+
         # --- Auto-load tables based on pt_tab and inv_tab flags ---
         self._auto_load_tables()
 
@@ -1445,8 +1462,14 @@ class hhe_z_mixtures():
     # =================================================================
 
     def _table_path(self, table_type):
-        """Return the expected file path for a given table type."""
+        """Return the expected file path for a given table type (xi-mapped)."""
         fname = self._TABLE_BASES[table_type].format(
+            hhe=self.hhe_eos_name, z=self.z_eos_label)
+        return os.path.join(CURR_DIR, self.hhe_eos_name, fname)
+
+    def _table_path_square(self, table_type):
+        """Return the expected file path for a square table type."""
+        fname = self._TABLE_BASES_SQUARE[table_type].format(
             hhe=self.hhe_eos_name, z=self.z_eos_label)
         return os.path.join(CURR_DIR, self.hhe_eos_name, fname)
 
@@ -1454,8 +1477,9 @@ class hhe_z_mixtures():
         """Try to load pre-computed tables from disk.
 
         Controlled by ``self.pt_tab`` (P-T basis table),
-        ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P tables), and
-        ``self.srho_tab`` (S-ρ table, loaded only when True).
+        ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P tables),
+        ``self.srho_tab`` (S-ρ table, loaded only when True), and
+        ``self.xi_transform`` (which naming convention to search).
         """
         # P-T basis table (controlled by pt_tab)
         if self.pt_tab:
@@ -1466,12 +1490,18 @@ class hhe_z_mixtures():
         # Inverted tables (controlled by inv_tab)
         if self.inv_tab:
             for basis in ('sp', 'rhot', 'rhop'):
-                path = self._table_path(basis)
+                if self.xi_transform:
+                    path = self._table_path(basis)
+                else:
+                    path = self._table_path_square(basis)
                 if os.path.isfile(path):
                     getattr(self, f'load_{basis}_table')(path)
             # S-ρ table only loaded when explicitly requested
             if self.srho_tab:
-                path = self._table_path('srho')
+                if self.xi_transform:
+                    path = self._table_path('srho')
+                else:
+                    path = self._table_path_square('srho')
                 if os.path.isfile(path):
                     self.load_srho_table(path)
 
@@ -2300,8 +2330,12 @@ class hhe_z_mixtures():
 
         # --- Fast path: pre-computed table ---
         if use_tab and self._logt_sp_rgi is not None:
-            result = self._lookup_sp_table(
-                _s_kb, _lgp, _yp, _z, self._logt_sp_rgi)
+            if self._sp_xi_transform:
+                result = self._lookup_sp_table(
+                    _s_kb, _lgp, _yp, _z, self._logt_sp_rgi)
+            else:
+                result = self._lookup_sp_square(
+                    _s_kb, _lgp, _yp, _z)
             result_arr = np.atleast_1d(result)
             if np.all(np.isfinite(result_arr)):
                 return result
@@ -2445,9 +2479,24 @@ class hhe_z_mixtures():
             return out.item()
         return out
 
+    def _lookup_sp_square(self, _s_kb, _lgp, _yp, _z):
+        """Query a square (S, logP, Y', Z) RGI table."""
+        _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgp  = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _yp_a = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a  = np.atleast_1d(np.asarray(_z, dtype=float))
+        _s_kb, _lgp, _yp_a, _z_a = np.broadcast_arrays(
+            _s_kb, _lgp, _yp_a, _z_a)
+        pts = np.column_stack((_s_kb.ravel(), _lgp.ravel(),
+                               _yp_a.ravel(), _z_a.ravel()))
+        out = self._logt_sp_rgi(pts).reshape(_s_kb.shape)
+        if out.size == 1:
+            return out.item()
+        return out
+
     def _load_from_arrays(self, xi_vals, logp, yvals, zvals,
                           logt_sp, s_lo, s_hi):
-        """Build RGI interpolators from arrays (shared by load and build)."""
+        """Build RGI interpolators from arrays (xi-mapped SP table)."""
         self.xi_vals = xi_vals
         self.logp_vals = logp
         self._yvals = yvals
@@ -2461,12 +2510,27 @@ class hhe_z_mixtures():
                                  logt_sp, **rgi_kw)
         self._s_lo_rgi = RGI((logp, yvals, zvals), s_lo, **rgi_kw)
         self._s_hi_rgi = RGI((logp, yvals, zvals), s_hi, **rgi_kw)
+        self._sp_xi_transform = True
+
+    def _load_sp_square_from_arrays(self, svals, logp, yvals, zvals,
+                                     logt_sp):
+        """Build RGI for a square (S, logP, Y', Z) table."""
+        self._svals_sp = svals
+        self.logp_vals = logp
+        self._yvals = yvals
+        self._zvals = zvals
+        self._s_lo = None
+        self._s_hi = None
+        self._s_lo_rgi = None
+        self._s_hi_rgi = None
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logt_sp_rgi = RGI((svals, logp, yvals, zvals),
+                                 logt_sp, **rgi_kw)
+        self._sp_xi_transform = False
 
     def load_sp_table(self, path):
-        """Load a pre-computed adaptive S-P table from NPZ.
-
-        Expected keys: xi_vals, logpvals, yvals, zvals,
-                        logt_sp, s_lo, s_hi, logt_min, logt_max.
+        """Load a pre-computed S-P table from NPZ (xi or square).
 
         logrho is not stored — it is computed on-the-fly from the
         forward model via ``get_logrho_sp``.
@@ -2474,10 +2538,23 @@ class hhe_z_mixtures():
         data = np.load(path)
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
-        self._load_from_arrays(
-            data['xi_vals'], data['logpvals'],
-            data['yvals'], data['zvals'],
-            data['logt_sp'], data['s_lo'], data['s_hi'])
+
+        # Detect format
+        if 'xi_transform' in data:
+            is_xi = bool(data['xi_transform'])
+        else:
+            is_xi = 'xi_vals' in data
+
+        if is_xi:
+            self._load_from_arrays(
+                data['xi_vals'], data['logpvals'],
+                data['yvals'], data['zvals'],
+                data['logt_sp'], data['s_lo'], data['s_hi'])
+        else:
+            self._load_sp_square_from_arrays(
+                data['svals'], data['logpvals'],
+                data['yvals'], data['zvals'],
+                data['logt_sp'])
 
     # =================================================================
     # NaN repair for tables
@@ -2612,15 +2689,10 @@ class hhe_z_mixtures():
 
     def build_sp_table(self, yvals, zvals,
                        _zm=0.0, _za=0.0, _zr=0.0,
-                       n_xi=None, verbose=True):
-        """Build the full logT(ξ, P, Y', Z) and logrho(ξ, P, Y', Z) tables.
-
-        For each (P, Y', Z) grid point the physical entropy range
-        [S_lo, S_hi] is computed from the T boundaries of the P-T
-        table.  ``n_xi`` evenly spaced ξ values in [0, 1] are then
-        mapped to physical S values within that range and inverted
-        via ``brentq`` to obtain logT.  logrho is computed from the
-        forward model at (P, T).
+                       n_xi=None, xi_transform=None,
+                       s_lo=4.0, s_hi=12.0, s_step=0.1,
+                       verbose=True):
+        """Build logT(S, P, Y', Z) table — square or ξ-mapped.
 
         Parameters
         ----------
@@ -2631,7 +2703,14 @@ class hhe_z_mixtures():
         _zm, _za, _zr : float
             Fixed nested metal sub-fractions.
         n_xi : int or None
-            Number of ξ grid points (default: ``self.n_xi``).
+            Number of ξ grid points for xi-mapped mode (default:
+            ``self.n_xi``).
+        xi_transform : bool or None
+            If False (default), build a square table on a uniform
+            (S, logP, Y', Z) grid.  If True, use ξ-mapped adaptive
+            tables.  None falls back to ``self.xi_transform``.
+        s_lo, s_hi, s_step : float
+            Entropy range and step [kb/baryon] for square tables.
         verbose : bool
             Print progress.
 
@@ -2649,6 +2728,15 @@ class hhe_z_mixtures():
         interpolators so ``get_logt_sp`` / ``get_logrho_sp`` use
         the fast table path).
         """
+        if xi_transform is None:
+            xi_transform = self.xi_transform
+
+        if not xi_transform:
+            return self._build_sp_table_square(
+                yvals, zvals, _zm, _za, _zr,
+                s_lo=s_lo, s_hi=s_hi, s_step=s_step,
+                verbose=verbose)
+
         if n_xi is None:
             n_xi = self.n_xi
 
@@ -2798,20 +2886,156 @@ class hhe_z_mixtures():
 
         # --- Step 5: package result ---
         result = {
-            'xi_vals':   xi_vals,
-            'logpvals':  logp,
-            'yvals':     yvals,
-            'zvals':     zvals,
-            'logt_sp':   logt_sp_f32,
-            's_lo':      s_lo_f32,
-            's_hi':      s_hi_f32,
-            'logt_min':  self.logt_min,
-            'logt_max':  self.logt_max,
+            'xi_vals':      xi_vals,
+            'logpvals':     logp,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logt_sp':      logt_sp_f32,
+            's_lo':         s_lo_f32,
+            's_hi':         s_hi_f32,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(True),
         }
 
         # --- Step 6: load into this instance ---
         self._load_from_arrays(xi_vals, logp, yvals, zvals,
                                logt_sp_f32, s_lo_f32, s_hi_f32)
+
+        if verbose:
+            n_total = logt_sp.size
+            n_good = np.isfinite(logt_sp).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan_before} were interpolated")
+
+        return result
+
+    def _build_sp_table_square(self, yvals, zvals,
+                               _zm=0.0, _za=0.0, _zr=0.0,
+                               s_lo=4.0, s_hi=12.0, s_step=0.1,
+                               verbose=True):
+        """Build logT on a uniform (S, logP, Y', Z) grid (no ξ mapping).
+
+        Parameters
+        ----------
+        s_lo, s_hi, s_step : float
+            Entropy range and step in kb/baryon.
+        """
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        svals = np.arange(s_lo, s_hi + s_step * 0.1, s_step)
+        logp = self.logp_vals
+
+        nS, nP, nY, nZ = len(svals), len(logp), len(yvals), len(zvals)
+
+        if verbose:
+            print(f"Building S-P square table: "
+                  f"S=[{svals[0]:.2f}, {svals[-1]:.2f}] "
+                  f"(dS={s_step:.3f}, {nS} pts), "
+                  f"logP=[{logp[0]:.2f}, {logp[-1]:.2f}] "
+                  f"(dlogP={logp[1]-logp[0]:.2f}, {nP} pts), "
+                  f"logT=[{self.logt_min:.1f}, {self.logt_max:.1f}]")
+            print(f"  Y' grid: {nY} pts [{yvals[0]:.3f} .. {yvals[-1]:.3f}], "
+                  f"Z grid: {nZ} pts [{zvals[0]:.3f} .. {zvals[-1]:.3f}]")
+            print(f"  Total cells: {nS}x{nP}x{nY}x{nZ} = "
+                  f"{nS*nP*nY*nZ:,}")
+
+        logt_sp = np.full((nS, nP, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T -> S,P (square)",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        lmin, lmax = self.logt_min, self.logt_max
+        prev_logt = np.full((nS, nP), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_logt[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                for ip in range(nP):
+                    lgp_i = logp[ip]
+
+                    for isv in range(nS):
+                        s_phys = svals[isv]
+
+                        def err(lgt, _s=s_phys, _p=lgp_i):
+                            try:
+                                s_test = self._s_pt(
+                                    _p, lgt, yp, zv, _zm, _za, _zr)
+                                return float(
+                                    s_test * erg_to_kbbar - _s)
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return np.nan
+
+                        guess = prev_logt[isv, ip]
+                        if not np.isfinite(guess):
+                            guess = 0.5 * (lmin + lmax)
+                        lgt_sol, ok = self._newton_1d(
+                            err, guess, 1.5, 7.0)
+                        if np.isfinite(lgt_sol):
+                            logt_sp[isv, ip, iy, iz] = lgt_sol
+                            prev_logt[isv, ip] = lgt_sol
+
+        pbar.close()
+
+        # --- NaN filling ---
+        n_nan_before = np.isnan(logt_sp).sum()
+        if n_nan_before > 0:
+            if verbose:
+                print(f"Filling {n_nan_before} NaN cells by "
+                      f"interpolation ...")
+            logt_sp = self._fill_table_nans(logt_sp)
+            n_nan_after = np.isnan(logt_sp).sum()
+            if verbose and n_nan_after > 0:
+                print(f"  WARNING: {n_nan_after} NaNs remain after "
+                      f"interpolation")
+
+        # --- Hampel outlier filter on logT along S axis ---
+        if verbose:
+            print("Running Hampel outlier filter on logT along S axis ...")
+        flat = logt_sp.reshape(nS, -1)
+        n_outliers = 0
+        for j in range(flat.shape[1]):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=5, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"  Replaced {n_outliers} outlier cells in logT")
+
+        # --- Cast to float32 ---
+        logt_sp_f32 = logt_sp.astype(np.float32)
+
+        if verbose:
+            mem_mb = logt_sp_f32.nbytes / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32)")
+
+        result = {
+            'svals':        svals.astype(np.float32),
+            'logpvals':     logp,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logt_sp':      logt_sp_f32,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(False),
+        }
+
+        # Load into this instance
+        self._load_sp_square_from_arrays(
+            svals, logp, yvals, zvals, logt_sp_f32)
 
         if verbose:
             n_total = logt_sp.size
@@ -2830,12 +3054,14 @@ class hhe_z_mixtures():
         result : dict
             Output of ``build_sp_table``.
         path : str or None
-            File path.  If None, uses the default auto-load path:
-            ``eos/{hhe_eos}/{hhe_eos}_{z_eos}_sp_adaptive.npz``.
+            File path.  If None, auto-selects based on xi_transform flag.
         """
         if path is None:
-            path = self._table_path('sp')
-            # Ensure the directory exists
+            is_xi = bool(result.get('xi_transform', True))
+            if is_xi:
+                path = self._table_path('sp')
+            else:
+                path = self._table_path_square('sp')
             os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **result)
         print(f"Saved {path}")
@@ -2853,10 +3079,14 @@ class hhe_z_mixtures():
         Set ``use_tab=False`` to force per-point Newton-Raphson
         even when a ρ-T table is loaded.
         """
-        # --- Fast path: ξ-mapped table ---
+        # --- Fast path: pre-computed table ---
         if use_tab and self._logp_rhot_rgi is not None:
-            return self._lookup_rhot_table(
-                _lgrho, _lgt, _yp, _z)
+            if self._rhot_xi_transform:
+                return self._lookup_rhot_table(
+                    _lgrho, _lgt, _yp, _z)
+            else:
+                return self._lookup_rhot_square(
+                    _lgrho, _lgt, _yp, _z)
 
         _yp = self._to_yprime(_yp, _z)
         # --- Slow path: Newton-Raphson per-point ---
@@ -2866,7 +3096,7 @@ class hhe_z_mixtures():
         _lgrho, _lgt = np.broadcast_arrays(_lgrho, _lgt)
         out = np.full_like(_lgrho, np.nan, dtype=float)
 
-        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+        lgp_lo, lgp_hi = 3, 16
 
         prev_sol = None
         for idx in np.ndindex(_lgrho.shape):
@@ -2973,37 +3203,77 @@ class hhe_z_mixtures():
             return out.item()
         return out
 
+    def _lookup_rhot_square(self, _lgrho, _lgt, _yp, _z):
+        """Query a square (logrho, logT, Y', Z) RGI table."""
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgt   = np.atleast_1d(np.asarray(_lgt, dtype=float))
+        _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a   = np.atleast_1d(np.asarray(_z, dtype=float))
+        _lgrho, _lgt, _yp_a, _z_a = np.broadcast_arrays(
+            _lgrho, _lgt, _yp_a, _z_a)
+        pts = np.column_stack((_lgrho.ravel(), _lgt.ravel(),
+                               _yp_a.ravel(), _z_a.ravel()))
+        out = self._logp_rhot_rgi(pts).reshape(_lgrho.shape)
+        if out.size == 1:
+            return out.item()
+        return out
+
     def load_rhot_table(self, path):
-        """Load a pre-computed ξ-mapped ρ-T → P table from NPZ."""
+        """Load a pre-computed ρ-T → P table from NPZ (xi or square)."""
         data = np.load(path)
         rgi_kw = dict(method='linear', bounds_error=False,
                       fill_value=None)
-        xi = data['xi_vals']
+
+        # Detect format
+        if 'xi_transform' in data:
+            is_xi = bool(data['xi_transform'])
+        else:
+            is_xi = 'xi_vals' in data
+
         logt = data['logtvals']
         yv = data['yvals']
         zv = data['zvals']
-
-        self._logp_rhot_rgi = RGI(
-            (xi, logt, yv, zv), data['logp_rhot'], **rgi_kw)
         self.logt_vals = logt
-        self._rho_lo_rhot = data['rho_lo_rhot']
-        self._rho_hi_rhot = data['rho_hi_rhot']
         self._yvals_rhot = yv
         self._zvals_rhot = zv
-        self._rho_lo_rhot_rgi = RGI(
-            (logt, yv, zv), self._rho_lo_rhot, **rgi_kw)
-        self._rho_hi_rhot_rgi = RGI(
-            (logt, yv, zv), self._rho_hi_rhot, **rgi_kw)
+
+        if is_xi:
+            xi = data['xi_vals']
+            self._logp_rhot_rgi = RGI(
+                (xi, logt, yv, zv), data['logp_rhot'], **rgi_kw)
+            self._rho_lo_rhot = data['rho_lo_rhot']
+            self._rho_hi_rhot = data['rho_hi_rhot']
+            self._rho_lo_rhot_rgi = RGI(
+                (logt, yv, zv), self._rho_lo_rhot, **rgi_kw)
+            self._rho_hi_rhot_rgi = RGI(
+                (logt, yv, zv), self._rho_hi_rhot, **rgi_kw)
+            self._rhot_xi_transform = True
+        else:
+            logrhovals = data['logrhovals']
+            self._logp_rhot_rgi = RGI(
+                (logrhovals, logt, yv, zv), data['logp_rhot'], **rgi_kw)
+            self._rhot_xi_transform = False
 
     def build_rhot_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         n_xi=None, verbose=True):
-        """Build logP(ξ_ρ, logT, Y', Z) table with ξ-mapping on ρ.
+                         n_xi=None, xi_transform=None,
+                         verbose=True):
+        """Build logP(logrho, logT, Y', Z) table — square or ξ-mapped.
 
-        At each (logT, Y', Z), the density range [ρ_lo, ρ_hi] comes
-        from evaluating ρ(P_min, T) and ρ(P_max, T).  ``n_xi`` evenly
-        spaced ξ values map this range to [0, 1].
+        Parameters
+        ----------
+        xi_transform : bool or None
+            False (default): square table on (logrho, logT, Y', Z).
+            True: ξ-mapped adaptive table.
+            None: falls back to ``self.xi_transform``.
         """
+        if xi_transform is None:
+            xi_transform = self.xi_transform
+
+        if not xi_transform:
+            return self._build_rhot_table_square(
+                yvals, zvals, _zm, _za, _zr, verbose=verbose)
+
         if n_xi is None:
             n_xi = self.n_xi
 
@@ -3124,6 +3394,7 @@ class hhe_z_mixtures():
             'rho_hi_rhot':  rho_hi.astype(np.float32),
             'logt_min':     self.logt_min,
             'logt_max':     self.logt_max,
+            'xi_transform': np.array(True),
         }
 
         # Load into this instance
@@ -3131,6 +3402,125 @@ class hhe_z_mixtures():
                       fill_value=None)
         self._logp_rhot_rgi = RGI(
             (xi_vals, logt, yvals, zvals), logp_f32, **rgi_kw)
+        self._rhot_xi_transform = True
+
+        if verbose:
+            n_total = logp_tab.size
+            n_good = np.isfinite(logp_tab).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan} were interpolated")
+
+        return result
+
+    def _build_rhot_table_square(self, yvals, zvals,
+                                  _zm=0.0, _za=0.0, _zr=0.0,
+                                  verbose=True):
+        """Build logP on a uniform (logrho, logT, Y', Z) grid."""
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        logrho = self.logrho_vals
+        logt = self.logt_vals
+        nR, nT, nY, nZ = len(logrho), len(logt), len(yvals), len(zvals)
+        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+
+        if verbose:
+            print(f"Building rho-T square table: "
+                  f"logrho=[{logrho[0]:.2f}, {logrho[-1]:.2f}] ({nR} pts), "
+                  f"logT=[{logt[0]:.2f}, {logt[-1]:.2f}] ({nT} pts)")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {nR}x{nT}x{nY}x{nZ} = "
+                  f"{nR*nT*nY*nZ:,}")
+
+        logp_tab = np.full((nR, nT, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T -> rho,T (square)",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        prev_logp = np.full((nR, nT), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_logp[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                for it in range(nT):
+                    lgt_i = logt[it]
+                    for ir in range(nR):
+                        rho_target = logrho[ir]
+
+                        def err(lgp, _rho=rho_target, _t=lgt_i):
+                            try:
+                                rho_test = self._logrho_pt(
+                                    lgp, _t, yp, zv, _zm, _za, _zr)
+                                return float(rho_test - _rho)
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return np.nan
+
+                        guess = prev_logp[ir, it]
+                        if not np.isfinite(guess):
+                            guess = 0.5 * (lgp_lo + lgp_hi)
+                        lgp_sol, ok = self._newton_1d(
+                            err, guess, lgp_lo, lgp_hi)
+                        if np.isfinite(lgp_sol):
+                            logp_tab[ir, it, iy, iz] = lgp_sol
+                            prev_logp[ir, it] = lgp_sol
+
+        pbar.close()
+
+        # --- NaN filling ---
+        n_nan = np.isnan(logp_tab).sum()
+        if n_nan > 0:
+            if verbose:
+                print(f"Filling {n_nan} NaN cells by interpolation ...")
+            logp_tab = self._fill_table_nans(logp_tab)
+
+        # --- Hampel outlier filter along rho axis ---
+        if verbose:
+            print("Running Hampel outlier filter on logP along rho axis ...")
+        flat = logp_tab.reshape(nR, -1)
+        n_outliers = 0
+        for j in range(flat.shape[1]):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=5, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"  Replaced {n_outliers} outlier cells in logP")
+
+        logp_f32 = logp_tab.astype(np.float32)
+
+        if verbose:
+            mem_mb = logp_f32.nbytes / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32)")
+
+        result = {
+            'logrhovals':   logrho,
+            'logtvals':     logt,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logp_rhot':    logp_f32,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(False),
+        }
+
+        # Load into this instance
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logp_rhot_rgi = RGI(
+            (logrho, logt, yvals, zvals), logp_f32, **rgi_kw)
+        self._rhot_xi_transform = False
 
         if verbose:
             n_total = logp_tab.size
@@ -3144,7 +3534,11 @@ class hhe_z_mixtures():
     def save_rhot_table(self, result, path=None):
         """Save a ρ-T table dict to NPZ."""
         if path is None:
-            path = self._table_path('rhot')
+            is_xi = bool(result.get('xi_transform', True))
+            if is_xi:
+                path = self._table_path('rhot')
+            else:
+                path = self._table_path_square('rhot')
             os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **result)
         print(f"Saved {path}")
@@ -3243,7 +3637,10 @@ class hhe_z_mixtures():
         _yp = self._to_yprime(_yp, _z)
         # Fast path: pre-computed table
         if self._logt_rhop_rgi is not None:
-            return self._lookup_rhop_table(_lgrho, _lgp, _yp, _z)
+            if self._rhop_xi_transform:
+                return self._lookup_rhop_table(_lgrho, _lgp, _yp, _z)
+            else:
+                return self._lookup_rhop_square(_lgrho, _lgp, _yp, _z)
 
         # Slow path: Newton-Raphson per point
         scalar = np.isscalar(_lgrho) and np.isscalar(_lgp)
@@ -3275,6 +3672,51 @@ class hhe_z_mixtures():
             return out.item()
         return out
 
+    def get_s_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
+                   _zm=0.0, _za=0.0, _zr=0.0, **kw):
+        """Entropy from (ρ, P) via 1-D root-finding.
+
+        Finds T such that ρ(P, T, Y', Z) = 10^logrho, then
+        evaluates S(P, T, Y', Z).
+
+        Parameters
+        ----------
+        _lgrho : float or array
+            log10 ρ [g/cm³].
+        _lgp : float or array
+            log10 P [dyn/cm²].
+        _yp : float
+            Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction.
+        _zm, _za, _zr : float
+            Nested metal sub-fractions.
+
+        Returns
+        -------
+        s_kb : float or array
+            Entropy in kb/baryon.  NaN where no solution.
+        """
+        logt = self.get_logt_rhop(
+            _lgrho, _lgp, _yp, _z, _zm, _za, _zr)
+        _yp = self._to_yprime(_yp, _z)
+
+        logt_arr = np.atleast_1d(logt)
+        _lgp_arr = np.atleast_1d(_lgp)
+        logt_arr, _lgp_arr = np.broadcast_arrays(logt_arr, _lgp_arr)
+
+        out = np.full_like(logt_arr, np.nan, dtype=float)
+        good = np.isfinite(logt_arr)
+        if good.any():
+            s_cgs = self._s_pt(
+                _lgp_arr[good], logt_arr[good], _yp, _z,
+                _zm, _za, _zr)
+            out[good] = s_cgs * erg_to_kbbar
+
+        if out.size == 1:
+            return out.item()
+        return out
+
     def _lookup_rhop_table(self, _lgrho, _lgp, _yp, _z):
         """Query the pre-computed (ξ, logP, Y', Z) ρ-P RGI."""
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
@@ -3296,15 +3738,41 @@ class hhe_z_mixtures():
             return out.item()
         return out
 
+    def _lookup_rhop_square(self, _lgrho, _lgp, _yp, _z):
+        """Query a square (logrho, logP, Y', Z) RGI table."""
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgp   = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a   = np.atleast_1d(np.asarray(_z, dtype=float))
+        _lgrho, _lgp, _yp_a, _z_a = np.broadcast_arrays(
+            _lgrho, _lgp, _yp_a, _z_a)
+        pts = np.column_stack((_lgrho.ravel(), _lgp.ravel(),
+                               _yp_a.ravel(), _z_a.ravel()))
+        out = self._logt_rhop_rgi(pts).reshape(_lgrho.shape)
+        if out.size == 1:
+            return out.item()
+        return out
+
     def build_rhop_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         n_xi=None, verbose=True):
-        """Build logT(ξ_ρ, logP, Y', Z) table with ξ-mapping on ρ.
+                         n_xi=None, xi_transform=None,
+                         verbose=True):
+        """Build logT(logrho, logP, Y', Z) table — square or ξ-mapped.
 
-        At each (logP, Y', Z), the density range [ρ_lo, ρ_hi] is
-        computed from the T boundaries.  ``n_xi`` evenly spaced ξ
-        values map this range to [0, 1].
+        Parameters
+        ----------
+        xi_transform : bool or None
+            False (default): square table on (logrho, logP, Y', Z).
+            True: ξ-mapped adaptive table.
+            None: falls back to ``self.xi_transform``.
         """
+        if xi_transform is None:
+            xi_transform = self.xi_transform
+
+        if not xi_transform:
+            return self._build_rhop_table_square(
+                yvals, zvals, _zm, _za, _zr, verbose=verbose)
+
         if n_xi is None:
             n_xi = self.n_xi
 
@@ -3416,15 +3884,16 @@ class hhe_z_mixtures():
             print(f"Table size: {mem_mb:.1f} MB (float32)")
 
         result = {
-            'xi_vals':     xi_vals,
-            'logpvals':    logp,
-            'yvals':       yvals,
-            'zvals':       zvals,
-            'logt_rhop':   logt_f32,
-            'rho_lo_rhop': rho_lo_f32,
-            'rho_hi_rhop': rho_hi_f32,
-            'logt_min':    self.logt_min,
-            'logt_max':    self.logt_max,
+            'xi_vals':      xi_vals,
+            'logpvals':     logp,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logt_rhop':    logt_f32,
+            'rho_lo_rhop':  rho_lo_f32,
+            'rho_hi_rhop':  rho_hi_f32,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(True),
         }
 
         # Load into this instance
@@ -3443,7 +3912,7 @@ class hhe_z_mixtures():
 
     def _load_rhop_from_arrays(self, xi_vals, logp, yvals, zvals,
                                 logt, rho_lo, rho_hi):
-        """Build ρ-P RGI interpolators."""
+        """Build ρ-P RGI interpolators (xi-mapped)."""
         rgi_kw = dict(method='linear', bounds_error=False,
                       fill_value=None)
         self._logt_rhop_rgi = RGI((xi_vals, logp, yvals, zvals),
@@ -3454,21 +3923,165 @@ class hhe_z_mixtures():
         self._zvals_rhop = zvals
         self._rho_lo_rhop_rgi = RGI((logp, yvals, zvals), rho_lo, **rgi_kw)
         self._rho_hi_rhop_rgi = RGI((logp, yvals, zvals), rho_hi, **rgi_kw)
+        self._rhop_xi_transform = True
 
     def load_rhop_table(self, path):
-        """Load a ρ-P → T table from NPZ."""
+        """Load a ρ-P → T table from NPZ (xi or square)."""
         data = np.load(path)
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
-        self._load_rhop_from_arrays(
-            data['xi_vals'], data['logpvals'],
-            data['yvals'], data['zvals'],
-            data['logt_rhop'], data['rho_lo_rhop'], data['rho_hi_rhop'])
+
+        # Detect format
+        if 'xi_transform' in data:
+            is_xi = bool(data['xi_transform'])
+        else:
+            is_xi = 'xi_vals' in data
+
+        if is_xi:
+            self._load_rhop_from_arrays(
+                data['xi_vals'], data['logpvals'],
+                data['yvals'], data['zvals'],
+                data['logt_rhop'], data['rho_lo_rhop'], data['rho_hi_rhop'])
+        else:
+            rgi_kw = dict(method='linear', bounds_error=False,
+                          fill_value=None)
+            logrhovals = data['logrhovals']
+            logp = data['logpvals']
+            yv = data['yvals']
+            zv = data['zvals']
+            self._logt_rhop_rgi = RGI(
+                (logrhovals, logp, yv, zv), data['logt_rhop'], **rgi_kw)
+            self._yvals_rhop = yv
+            self._zvals_rhop = zv
+            self._rhop_xi_transform = False
+
+    def _build_rhop_table_square(self, yvals, zvals,
+                                  _zm=0.0, _za=0.0, _zr=0.0,
+                                  verbose=True):
+        """Build logT on a uniform (logrho, logP, Y', Z) grid."""
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        logrho = self.logrho_vals
+        logp = self.logp_vals
+        nR, nP, nY, nZ = len(logrho), len(logp), len(yvals), len(zvals)
+
+        if verbose:
+            print(f"Building rho-P square table: "
+                  f"logrho=[{logrho[0]:.2f}, {logrho[-1]:.2f}] ({nR} pts), "
+                  f"logP=[{logp[0]:.2f}, {logp[-1]:.2f}] ({nP} pts)")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {nR}x{nP}x{nY}x{nZ} = "
+                  f"{nR*nP*nY*nZ:,}")
+
+        logt_tab = np.full((nR, nP, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc="Inverting P,T -> rho,P (square)",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        prev_logt = np.full((nR, nP), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_logt[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                for ip in range(nP):
+                    lgp_i = logp[ip]
+                    for ir in range(nR):
+                        rho_target = logrho[ir]
+
+                        def err(lgt, _rho=rho_target, _p=lgp_i):
+                            try:
+                                return float(self._logrho_pt(
+                                    _p, lgt, yp, zv, _zm, _za, _zr)
+                                    - _rho)
+                            except (ZeroDivisionError,
+                                    FloatingPointError):
+                                return np.nan
+
+                        guess = prev_logt[ir, ip]
+                        if not np.isfinite(guess):
+                            guess = 0.5 * (1.5 + 7.0)
+                        lgt_sol, ok = self._newton_1d(
+                            err, guess, 1.5, 7.0)
+                        if np.isfinite(lgt_sol):
+                            logt_tab[ir, ip, iy, iz] = lgt_sol
+                            prev_logt[ir, ip] = lgt_sol
+
+        pbar.close()
+
+        # --- NaN filling ---
+        n_nan = np.isnan(logt_tab).sum()
+        if n_nan > 0:
+            if verbose:
+                print(f"Filling {n_nan} NaN cells by interpolation ...")
+            logt_tab = self._fill_table_nans(logt_tab)
+
+        # --- Hampel outlier filter along rho axis ---
+        if verbose:
+            print("Running Hampel outlier filter on logT along rho axis ...")
+        flat = logt_tab.reshape(nR, -1)
+        n_outliers = 0
+        for j in range(flat.shape[1]):
+            col = flat[:, j]
+            cleaned, n_rep = hampel_filter_1d(
+                col, window=5, n_sigma=3.0)
+            if n_rep > 0:
+                changed = (cleaned != col) & np.isfinite(col)
+                flat[changed, j] = cleaned[changed]
+                n_outliers += n_rep
+        if n_outliers > 0 and verbose:
+            print(f"  Replaced {n_outliers} outlier cells in logT")
+
+        logt_f32 = logt_tab.astype(np.float32)
+
+        if verbose:
+            mem_mb = logt_f32.nbytes / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32)")
+
+        result = {
+            'logrhovals':   logrho,
+            'logpvals':     logp,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logt_rhop':    logt_f32,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(False),
+        }
+
+        # Load into this instance
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._logt_rhop_rgi = RGI(
+            (logrho, logp, yvals, zvals), logt_f32, **rgi_kw)
+        self._yvals_rhop = yvals
+        self._zvals_rhop = zvals
+        self._rhop_xi_transform = False
+
+        if verbose:
+            n_total = logt_tab.size
+            n_good = np.isfinite(logt_tab).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan} were interpolated")
+
+        return result
 
     def save_rhop_table(self, result, path=None):
         """Save a ρ-P table to NPZ."""
         if path is None:
-            path = self._table_path('rhop')
+            is_xi = bool(result.get('xi_transform', True))
+            if is_xi:
+                path = self._table_path('rhop')
+            else:
+                path = self._table_path_square('rhop')
             os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **result)
         print(f"Saved {path}")
@@ -3723,7 +4336,10 @@ class hhe_z_mixtures():
 
         # Fast path: use the pre-computed S-ρ table if loaded
         if self._srho_rgi_p is not None:
-            return self._lookup_srho_table(_s_kb, _lgrho, _yp, _z)
+            if self._srho_xi_transform:
+                return self._lookup_srho_table(_s_kb, _lgrho, _yp, _z)
+            else:
+                return self._lookup_srho_square(_s_kb, _lgrho, _yp, _z)
 
         use_rhot = (basis == 'rhot')
 
@@ -3805,29 +4421,52 @@ class hhe_z_mixtures():
             return lgp_out.item(), lgt_out.item()
         return lgp_out, lgt_out
 
+    def _lookup_srho_square(self, _s_kb, _lgrho, _yp, _z):
+        """Query a square (S, logrho, Y', Z) RGI table."""
+        _s_kb  = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _yp_a  = np.atleast_1d(np.asarray(_yp, dtype=float))
+        _z_a   = np.atleast_1d(np.asarray(_z, dtype=float))
+        _s_kb, _lgrho, _yp_a, _z_a = np.broadcast_arrays(
+            _s_kb, _lgrho, _yp_a, _z_a)
+        pts = np.column_stack((_s_kb.ravel(), _lgrho.ravel(),
+                               _yp_a.ravel(), _z_a.ravel()))
+        lgp_out = self._srho_rgi_p(pts).reshape(_s_kb.shape)
+        lgt_out = self._srho_rgi_t(pts).reshape(_s_kb.shape)
+        if lgp_out.size == 1:
+            return lgp_out.item(), lgt_out.item()
+        return lgp_out, lgt_out
+
     def build_srho_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         n_xi=None, basis='rhot', use_tab=True,
+                         n_xi=None, xi_transform=None,
+                         s_lo=4.0, s_hi=12.0, s_step=0.1,
+                         basis='rhot', use_tab=True,
                          verbose=True):
-        """Build logP and logT tables on a (ξ, logrho, Y', Z) grid.
-
-        The ξ coordinate normalises the entropy axis at each
-        (logrho, Y', Z) from 0 (S_lo) to 1 (S_hi), matching the
-        S-P rhomboid approach.
+        """Build logP and logT tables on (S, logrho, Y', Z) — square or ξ.
 
         Parameters
         ----------
+        xi_transform : bool or None
+            False (default): square table on (S, logrho, Y', Z).
+            True: ξ-mapped adaptive table.
+            None: falls back to ``self.xi_transform``.
+        s_lo, s_hi, s_step : float
+            Entropy range and step [kb/baryon] for square tables.
         basis : str, optional
-            ``'rhot'`` (default): 1-D root-find in T via ρ-T
-            inversion.  ``'sp'``: 1-D root-find in P via S-P
-            inversion.
+            ``'rhot'`` (default) or ``'sp'``: 1-D decomposition basis.
         use_tab : bool, optional
-            If True (default), require pre-computed tables for the
-            chosen basis (ρ-T or S-P).  Raises ``RuntimeError``
-            if the table is not loaded.
-            If False, use per-point Newton-Raphson for the inner
-            inversion (slower but no table dependency).
+            Use pre-computed tables for the inner inversion.
         """
+        if xi_transform is None:
+            xi_transform = self.xi_transform
+
+        if not xi_transform:
+            return self._build_srho_table_square(
+                yvals, zvals, _zm, _za, _zr,
+                s_lo=s_lo, s_hi=s_hi, s_step=s_step,
+                basis=basis, use_tab=use_tab, verbose=verbose)
+
         use_rhot = (basis == 'rhot')
         if use_tab:
             if use_rhot and self._logp_rhot_rgi is None:
@@ -4021,16 +4660,17 @@ class hhe_z_mixtures():
             print(f"Table size: {mem_mb:.1f} MB (float32, P+T)")
 
         result = {
-            'xi_vals':    xi_vals,
-            'logrhovals': logrho,
-            'yvals':      yvals,
-            'zvals':      zvals,
-            'logp_srho':  logp_f32,
-            'logt_srho':  logt_f32,
-            's_lo_srho':  self._s_lo_srho,
-            's_hi_srho':  self._s_hi_srho,
-            'logt_min':   self.logt_min,
-            'logt_max':   self.logt_max,
+            'xi_vals':      xi_vals,
+            'logrhovals':   logrho,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logp_srho':    logp_f32,
+            'logt_srho':    logt_f32,
+            's_lo_srho':    self._s_lo_srho,
+            's_hi_srho':    self._s_hi_srho,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(True),
         }
 
         # Load into this instance
@@ -4050,7 +4690,7 @@ class hhe_z_mixtures():
 
     def _load_srho_from_arrays(self, xi_vals, logrho, yvals, zvals,
                                 logp, logt, s_lo, s_hi):
-        """Build S-ρ RGI interpolators from arrays."""
+        """Build S-ρ RGI interpolators from arrays (xi-mapped)."""
         rgi_kw = dict(method='linear', bounds_error=False,
                       fill_value=None)
         self._srho_rgi_p = RGI((xi_vals, logrho, yvals, zvals),
@@ -4063,22 +4703,231 @@ class hhe_z_mixtures():
         self._zvals_srho = zvals
         self._s_lo_srho_rgi = RGI((logrho, yvals, zvals), s_lo, **rgi_kw)
         self._s_hi_srho_rgi = RGI((logrho, yvals, zvals), s_hi, **rgi_kw)
+        self._srho_xi_transform = True
 
     def load_srho_table(self, path):
-        """Load a pre-computed S-ρ table from NPZ."""
+        """Load a pre-computed S-ρ table from NPZ (xi or square)."""
         data = np.load(path)
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
-        self._load_srho_from_arrays(
-            data['xi_vals'], data['logrhovals'],
-            data['yvals'], data['zvals'],
-            data['logp_srho'], data['logt_srho'],
-            data['s_lo_srho'], data['s_hi_srho'])
+
+        # Detect format
+        if 'xi_transform' in data:
+            is_xi = bool(data['xi_transform'])
+        else:
+            is_xi = 'xi_vals' in data
+
+        if is_xi:
+            self._load_srho_from_arrays(
+                data['xi_vals'], data['logrhovals'],
+                data['yvals'], data['zvals'],
+                data['logp_srho'], data['logt_srho'],
+                data['s_lo_srho'], data['s_hi_srho'])
+        else:
+            rgi_kw = dict(method='linear', bounds_error=False,
+                          fill_value=None)
+            svals = data['svals']
+            logrho = data['logrhovals']
+            yv = data['yvals']
+            zv = data['zvals']
+            self._srho_rgi_p = RGI(
+                (svals, logrho, yv, zv), data['logp_srho'], **rgi_kw)
+            self._srho_rgi_t = RGI(
+                (svals, logrho, yv, zv), data['logt_srho'], **rgi_kw)
+            self._svals_srho = svals
+            self._yvals_srho = yv
+            self._zvals_srho = zv
+            self._s_lo_srho = None
+            self._s_hi_srho = None
+            self._s_lo_srho_rgi = None
+            self._s_hi_srho_rgi = None
+            self._srho_xi_transform = False
+
+    def _build_srho_table_square(self, yvals, zvals,
+                                  _zm=0.0, _za=0.0, _zr=0.0,
+                                  s_lo=4.0, s_hi=12.0, s_step=0.1,
+                                  basis='rhot', use_tab=True,
+                                  verbose=True):
+        """Build logP, logT on a uniform (S, logrho, Y', Z) grid."""
+        use_rhot = (basis == 'rhot')
+
+        if use_tab:
+            if use_rhot and self._logp_rhot_rgi is None:
+                raise RuntimeError(
+                    "build_srho_table (square) with basis='rhot' and "
+                    "use_tab=True requires a pre-computed rho-T table.")
+            if not use_rhot and self._logt_sp_rgi is None:
+                raise RuntimeError(
+                    "build_srho_table (square) with basis='sp' and "
+                    "use_tab=True requires a pre-computed S-P table.")
+
+        yvals = np.asarray(yvals, dtype=float)
+        zvals = np.asarray(zvals, dtype=float)
+        svals = np.arange(s_lo, s_hi + s_step * 0.1, s_step)
+        logrho = self.logrho_vals
+        nS, nR, nY, nZ = len(svals), len(logrho), len(yvals), len(zvals)
+
+        if verbose:
+            print(f"Building S-rho square table: "
+                  f"S=[{svals[0]:.2f}, {svals[-1]:.2f}] ({nS} pts), "
+                  f"logrho=[{logrho[0]:.2f}, {logrho[-1]:.2f}] ({nR} pts)")
+            print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
+            print(f"  Total cells: {nS}x{nR}x{nY}x{nZ} = "
+                  f"{nS*nR*nY*nZ:,}")
+
+        logp_tab = np.full((nS, nR, nY, nZ), np.nan, dtype=float)
+        logt_tab = np.full((nS, nR, nY, nZ), np.nan, dtype=float)
+
+        total = nY * nZ
+        pbar = tqdm(total=total,
+                     desc=f"Inverting S,rho -> P,T (square, {basis})",
+                     disable=not verbose,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                '[{elapsed}<{remaining}]')
+
+        prev_z = np.full((nS, nR), np.nan)
+
+        for iy, yp in enumerate(yvals):
+            prev_z[:] = np.nan
+
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                for ir in range(nR):
+                    rho_target = logrho[ir]
+                    prev_s = np.nan
+
+                    for isv in range(nS):
+                        s_phys = svals[isv]
+
+                        prev_guess = (prev_s
+                                      if np.isfinite(prev_s)
+                                      else prev_z[isv, ir])
+
+                        if use_rhot:
+                            lgp, lgt = self._srho_via_rhot(
+                                s_phys, rho_target, yp, zv,
+                                _zm, _za, _zr,
+                                prev_lgt=(prev_guess
+                                          if np.isfinite(prev_guess)
+                                          else None),
+                                use_tab=use_tab)
+                        else:
+                            lgp, lgt = self._srho_via_sp(
+                                s_phys, rho_target, yp, zv,
+                                _zm, _za, _zr,
+                                prev_lgp=(prev_guess
+                                          if np.isfinite(prev_guess)
+                                          else None),
+                                use_tab=use_tab)
+
+                        if np.isfinite(lgp) and np.isfinite(lgt):
+                            logp_tab[isv, ir, iy, iz] = lgp
+                            logt_tab[isv, ir, iy, iz] = lgt
+                            warm = lgt if use_rhot else lgp
+                            prev_z[isv, ir] = warm
+                            prev_s = warm
+
+        pbar.close()
+
+        # --- NaN filling ---
+        n_nan = np.isnan(logp_tab).sum()
+        if n_nan > 0:
+            if verbose:
+                print(f"Filling {n_nan} NaN cells by interpolation ...")
+            logp_tab = self._fill_table_nans(logp_tab)
+            logt_tab = self._fill_table_nans(logt_tab)
+
+        # --- Hampel outlier filter along S axis ---
+        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
+            if verbose:
+                print(f"Running Hampel outlier filter on {label} "
+                      f"along S axis ...")
+            flat = arr.reshape(nS, -1)
+            n_out = 0
+            for j in range(flat.shape[1]):
+                col = flat[:, j]
+                cleaned, n_rep = hampel_filter_1d(
+                    col, window=5, n_sigma=3.0)
+                if n_rep > 0:
+                    changed = (cleaned != col) & np.isfinite(col)
+                    flat[changed, j] = cleaned[changed]
+                    n_out += n_rep
+            if n_out > 0 and verbose:
+                print(f"  Replaced {n_out} outlier cells in {label}")
+
+        # --- Hampel along rho axis ---
+        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
+            if verbose:
+                print(f"Running Hampel outlier filter on {label} "
+                      f"along rho axis ...")
+            n_out = 0
+            for isv in range(nS):
+                for iy in range(nY):
+                    for iz in range(nZ):
+                        col = arr[isv, :, iy, iz]
+                        cleaned, n_rep = hampel_filter_1d(
+                            col, window=5, n_sigma=3.0)
+                        if n_rep > 0:
+                            changed = (cleaned != col) & np.isfinite(col)
+                            col[changed] = cleaned[changed]
+                            n_out += n_rep
+            if n_out > 0 and verbose:
+                print(f"  Replaced {n_out} outlier cells in {label}")
+
+        logp_f32 = logp_tab.astype(np.float32)
+        logt_f32 = logt_tab.astype(np.float32)
+
+        if verbose:
+            mem_mb = (logp_f32.nbytes + logt_f32.nbytes) / 1e6
+            print(f"Table size: {mem_mb:.1f} MB (float32, P+T)")
+
+        result = {
+            'svals':        svals.astype(np.float32),
+            'logrhovals':   logrho,
+            'yvals':        yvals,
+            'zvals':        zvals,
+            'logp_srho':    logp_f32,
+            'logt_srho':    logt_f32,
+            'logt_min':     self.logt_min,
+            'logt_max':     self.logt_max,
+            'xi_transform': np.array(False),
+        }
+
+        # Load into this instance
+        rgi_kw = dict(method='linear', bounds_error=False,
+                      fill_value=None)
+        self._srho_rgi_p = RGI(
+            (svals, logrho, yvals, zvals), logp_f32, **rgi_kw)
+        self._srho_rgi_t = RGI(
+            (svals, logrho, yvals, zvals), logt_f32, **rgi_kw)
+        self._svals_srho = svals
+        self._yvals_srho = yvals
+        self._zvals_srho = zvals
+        self._s_lo_srho = None
+        self._s_hi_srho = None
+        self._s_lo_srho_rgi = None
+        self._s_hi_srho_rgi = None
+        self._srho_xi_transform = False
+
+        if verbose:
+            n_total = logp_tab.size
+            n_good = np.isfinite(logp_tab).sum()
+            print(f"Done. {n_good}/{n_total} cells finite "
+                  f"({100*n_good/n_total:.1f}%), "
+                  f"{n_nan} were interpolated")
+
+        return result
 
     def save_srho_table(self, result, path=None):
         """Save an S-ρ table to NPZ."""
         if path is None:
-            path = self._table_path('srho')
+            is_xi = bool(result.get('xi_transform', True))
+            if is_xi:
+                path = self._table_path('srho')
+            else:
+                path = self._table_path_square('srho')
             os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **result)
         print(f"Saved {path}")
