@@ -1346,7 +1346,8 @@ class hhe_z_mixtures():
                  logp_range=(6.0, 14.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
-                 n_xi=150):
+                 n_xi=150,
+                 interp_method='linear'):
         """
         Parameters
         ----------
@@ -1389,6 +1390,14 @@ class hhe_z_mixtures():
             Step in logrho.
         n_xi : int
             Number of normalised entropy grid points.
+        interp_method : str
+            Interpolation method for inversion-table RGIs.
+            'linear' (default): multilinear, C⁰ — fast but noisy
+            FD derivatives at grid cell boundaries.
+            'cubic': tensor-product cubic spline, C² — smooth FD
+            derivatives but ~2-4× slower.
+            Only affects inversion tables (S-P, ρ-T, ρ-P, S-ρ).
+            The PT forward-model table always uses 'linear'.
         """
 
         self.hhe_eos_name = hhe_eos_name
@@ -1398,6 +1407,7 @@ class hhe_z_mixtures():
         self.srho_tab = srho_tab
         self.y_prime = y_prime
         self.xi_transform = xi_transform
+        self._interp_method = interp_method
 
         # --- Forward-model mixer ---
         self.val = val_mixtures(
@@ -2504,12 +2514,14 @@ class hhe_z_mixtures():
         self._s_lo = s_lo
         self._s_hi = s_hi
 
-        rgi_kw = dict(method='linear', bounds_error=False,
-                      fill_value=None)
+        inv_rgi_kw = dict(method=self._interp_method, bounds_error=False,
+                          fill_value=None)
+        bnd_rgi_kw = dict(method='linear', bounds_error=False,
+                          fill_value=None)
         self._logt_sp_rgi = RGI((xi_vals, logp, yvals, zvals),
-                                 logt_sp, **rgi_kw)
-        self._s_lo_rgi = RGI((logp, yvals, zvals), s_lo, **rgi_kw)
-        self._s_hi_rgi = RGI((logp, yvals, zvals), s_hi, **rgi_kw)
+                                 logt_sp, **inv_rgi_kw)
+        self._s_lo_rgi = RGI((logp, yvals, zvals), s_lo, **bnd_rgi_kw)
+        self._s_hi_rgi = RGI((logp, yvals, zvals), s_hi, **bnd_rgi_kw)
         self._sp_xi_transform = True
 
     def _load_sp_square_from_arrays(self, svals, logp, yvals, zvals,
@@ -2523,7 +2535,7 @@ class hhe_z_mixtures():
         self._s_hi = None
         self._s_lo_rgi = None
         self._s_hi_rgi = None
-        rgi_kw = dict(method='linear', bounds_error=False,
+        rgi_kw = dict(method=self._interp_method, bounds_error=False,
                       fill_value=None)
         self._logt_sp_rgi = RGI((svals, logp, yvals, zvals),
                                  logt_sp, **rgi_kw)
@@ -3221,8 +3233,10 @@ class hhe_z_mixtures():
     def load_rhot_table(self, path):
         """Load a pre-computed ρ-T → P table from NPZ (xi or square)."""
         data = np.load(path)
-        rgi_kw = dict(method='linear', bounds_error=False,
-                      fill_value=None)
+        inv_rgi_kw = dict(method=self._interp_method, bounds_error=False,
+                          fill_value=None)
+        bnd_rgi_kw = dict(method='linear', bounds_error=False,
+                          fill_value=None)
 
         # Detect format
         if 'xi_transform' in data:
@@ -3240,18 +3254,18 @@ class hhe_z_mixtures():
         if is_xi:
             xi = data['xi_vals']
             self._logp_rhot_rgi = RGI(
-                (xi, logt, yv, zv), data['logp_rhot'], **rgi_kw)
+                (xi, logt, yv, zv), data['logp_rhot'], **inv_rgi_kw)
             self._rho_lo_rhot = data['rho_lo_rhot']
             self._rho_hi_rhot = data['rho_hi_rhot']
             self._rho_lo_rhot_rgi = RGI(
-                (logt, yv, zv), self._rho_lo_rhot, **rgi_kw)
+                (logt, yv, zv), self._rho_lo_rhot, **bnd_rgi_kw)
             self._rho_hi_rhot_rgi = RGI(
-                (logt, yv, zv), self._rho_hi_rhot, **rgi_kw)
+                (logt, yv, zv), self._rho_hi_rhot, **bnd_rgi_kw)
             self._rhot_xi_transform = True
         else:
             logrhovals = data['logrhovals']
             self._logp_rhot_rgi = RGI(
-                (logrhovals, logt, yv, zv), data['logp_rhot'], **rgi_kw)
+                (logrhovals, logt, yv, zv), data['logp_rhot'], **inv_rgi_kw)
             self._rhot_xi_transform = False
 
     def build_rhot_table(self, yvals, zvals,
@@ -3398,7 +3412,7 @@ class hhe_z_mixtures():
         }
 
         # Load into this instance
-        rgi_kw = dict(method='linear', bounds_error=False,
+        rgi_kw = dict(method=self._interp_method, bounds_error=False,
                       fill_value=None)
         self._logp_rhot_rgi = RGI(
             (xi_vals, logt, yvals, zvals), logp_f32, **rgi_kw)
@@ -3516,7 +3530,7 @@ class hhe_z_mixtures():
         }
 
         # Load into this instance
-        rgi_kw = dict(method='linear', bounds_error=False,
+        rgi_kw = dict(method=self._interp_method, bounds_error=False,
                       fill_value=None)
         self._logp_rhot_rgi = RGI(
             (logrho, logt, yvals, zvals), logp_f32, **rgi_kw)
@@ -3612,29 +3626,13 @@ class hhe_z_mixtures():
         rhi = self._rho_hi_rhop_rgi(pts).reshape(np.atleast_1d(_lgp).shape)
         return rlo + np.atleast_1d(_xi) * (rhi - rlo)
 
-    def get_logt_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
-        """Temperature from (ρ, P) via 1-D root-finding or table.
+    def _logt_rhop_noconv(self, _lgrho, _lgp, _yp, _z=0.0,
+                          _zm=0.0, _za=0.0, _zr=0.0):
+        """Core logT(ρ, P) inversion — assumes _yp is already Y'.
 
-        Inverts ρ(P, T, Y', Z) = 10^logrho to find logT.
-
-        Parameters
-        ----------
-        _lgrho : float or array
-            log10 ρ [g/cm³].
-        _lgp : float or array
-            log10 P [dyn/cm²].
-        _yp : float
-            Y' = Y/(1-Z).
-        _z : float
-            Total metal mass fraction.
-
-        Returns
-        -------
-        logt : float or array
-            log10 T [K].  NaN where no solution.
+        Used internally by derivative methods where Y' conversion
+        has already been applied by the caller.
         """
-        _yp = self._to_yprime(_yp, _z)
         # Fast path: pre-computed table
         if self._logt_rhop_rgi is not None:
             if self._rhop_xi_transform:
@@ -3671,6 +3669,32 @@ class hhe_z_mixtures():
         if scalar:
             return out.item()
         return out
+
+    def get_logt_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
+                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
+        """Temperature from (ρ, P) via 1-D root-finding or table.
+
+        Inverts ρ(P, T, Y', Z) = 10^logrho to find logT.
+
+        Parameters
+        ----------
+        _lgrho : float or array
+            log10 ρ [g/cm³].
+        _lgp : float or array
+            log10 P [dyn/cm²].
+        _yp : float
+            Y' = Y/(1-Z).
+        _z : float
+            Total metal mass fraction.
+
+        Returns
+        -------
+        logt : float or array
+            log10 T [K].  NaN where no solution.
+        """
+        _yp = self._to_yprime(_yp, _z)
+        return self._logt_rhop_noconv(
+            _lgrho, _lgp, _yp, _z, _zm, _za, _zr)
 
     def get_s_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
                    _zm=0.0, _za=0.0, _zr=0.0, **kw):
@@ -3913,16 +3937,18 @@ class hhe_z_mixtures():
     def _load_rhop_from_arrays(self, xi_vals, logp, yvals, zvals,
                                 logt, rho_lo, rho_hi):
         """Build ρ-P RGI interpolators (xi-mapped)."""
-        rgi_kw = dict(method='linear', bounds_error=False,
-                      fill_value=None)
+        inv_rgi_kw = dict(method=self._interp_method, bounds_error=False,
+                          fill_value=None)
+        bnd_rgi_kw = dict(method='linear', bounds_error=False,
+                          fill_value=None)
         self._logt_rhop_rgi = RGI((xi_vals, logp, yvals, zvals),
-                                   logt, **rgi_kw)
+                                   logt, **inv_rgi_kw)
         self._rho_lo_rhop = rho_lo
         self._rho_hi_rhop = rho_hi
         self._yvals_rhop = yvals
         self._zvals_rhop = zvals
-        self._rho_lo_rhop_rgi = RGI((logp, yvals, zvals), rho_lo, **rgi_kw)
-        self._rho_hi_rhop_rgi = RGI((logp, yvals, zvals), rho_hi, **rgi_kw)
+        self._rho_lo_rhop_rgi = RGI((logp, yvals, zvals), rho_lo, **bnd_rgi_kw)
+        self._rho_hi_rhop_rgi = RGI((logp, yvals, zvals), rho_hi, **bnd_rgi_kw)
         self._rhop_xi_transform = True
 
     def load_rhop_table(self, path):
@@ -3943,7 +3969,7 @@ class hhe_z_mixtures():
                 data['yvals'], data['zvals'],
                 data['logt_rhop'], data['rho_lo_rhop'], data['rho_hi_rhop'])
         else:
-            rgi_kw = dict(method='linear', bounds_error=False,
+            rgi_kw = dict(method=self._interp_method, bounds_error=False,
                           fill_value=None)
             logrhovals = data['logrhovals']
             logp = data['logpvals']
@@ -4057,7 +4083,7 @@ class hhe_z_mixtures():
         }
 
         # Load into this instance
-        rgi_kw = dict(method='linear', bounds_error=False,
+        rgi_kw = dict(method=self._interp_method, bounds_error=False,
                       fill_value=None)
         self._logt_rhop_rgi = RGI(
             (logrho, logp, yvals, zvals), logt_f32, **rgi_kw)
@@ -4691,18 +4717,20 @@ class hhe_z_mixtures():
     def _load_srho_from_arrays(self, xi_vals, logrho, yvals, zvals,
                                 logp, logt, s_lo, s_hi):
         """Build S-ρ RGI interpolators from arrays (xi-mapped)."""
-        rgi_kw = dict(method='linear', bounds_error=False,
-                      fill_value=None)
+        inv_rgi_kw = dict(method=self._interp_method, bounds_error=False,
+                          fill_value=None)
+        bnd_rgi_kw = dict(method='linear', bounds_error=False,
+                          fill_value=None)
         self._srho_rgi_p = RGI((xi_vals, logrho, yvals, zvals),
-                                logp, **rgi_kw)
+                                logp, **inv_rgi_kw)
         self._srho_rgi_t = RGI((xi_vals, logrho, yvals, zvals),
-                                logt, **rgi_kw)
+                                logt, **inv_rgi_kw)
         self._s_lo_srho = s_lo
         self._s_hi_srho = s_hi
         self._yvals_srho = yvals
         self._zvals_srho = zvals
-        self._s_lo_srho_rgi = RGI((logrho, yvals, zvals), s_lo, **rgi_kw)
-        self._s_hi_srho_rgi = RGI((logrho, yvals, zvals), s_hi, **rgi_kw)
+        self._s_lo_srho_rgi = RGI((logrho, yvals, zvals), s_lo, **bnd_rgi_kw)
+        self._s_hi_srho_rgi = RGI((logrho, yvals, zvals), s_hi, **bnd_rgi_kw)
         self._srho_xi_transform = True
 
     def load_srho_table(self, path):
@@ -4724,7 +4752,7 @@ class hhe_z_mixtures():
                 data['logp_srho'], data['logt_srho'],
                 data['s_lo_srho'], data['s_hi_srho'])
         else:
-            rgi_kw = dict(method='linear', bounds_error=False,
+            rgi_kw = dict(method=self._interp_method, bounds_error=False,
                           fill_value=None)
             svals = data['svals']
             logrho = data['logrhovals']
@@ -4896,7 +4924,7 @@ class hhe_z_mixtures():
         }
 
         # Load into this instance
-        rgi_kw = dict(method='linear', bounds_error=False,
+        rgi_kw = dict(method=self._interp_method, bounds_error=False,
                       fill_value=None)
         self._srho_rgi_p = RGI(
             (svals, logrho, yvals, zvals), logp_f32, **rgi_kw)
@@ -5127,13 +5155,42 @@ class hhe_z_mixtures():
 
         return out
 
-    # ----- Individual getter methods -----
-    # All accept scalar or array (lgp, lgt). When arrays are passed,
-    # the derivative is computed element-wise.
+    # =================================================================
+    # Derivative computation: table usage rules
+    # =================================================================
     #
-    # method='identity' (default): thermodynamic identity from P-T basis
-    # method='finite_difference': direct FD on the appropriate inverted
-    #   basis (uses pre-computed tables if loaded, otherwise on-the-fly)
+    # All derivative getters accept scalar or array (lgp, lgt) and
+    # compute element-wise.  Two methods are available:
+    #
+    #   method='finite_difference' (default)
+    #     Uses the natural-basis inversion table for constrained FD.
+    #     Falls back to on-the-fly Newton-Raphson when the table is
+    #     not loaded.
+    #
+    #   method='identity'
+    #     Uses thermodynamic identity / chain rule from _pt_derivs().
+    #     Always calls the VAL forward model directly.
+    #
+    # Which table each derivative basis uses:
+    #
+    #   PT-basis (cp, delta, dsdy_pt, dsdz_pt):
+    #     _s_pt() / _logrho_pt() → PT table if pt_tab=True, else VAL.
+    #
+    #   ρ-P basis (dsdy_rhop, dsdz_rhop):
+    #     _logt_rhop_noconv() → ρ-P table if inv_tab=True, else Newton.
+    #     Then _s_pt() → PT table or VAL.
+    #
+    #   S-P basis (nabla_ad, gamma1, dtds_sp):
+    #     get_logt_sp() → S-P table if inv_tab=True, else brentq.
+    #
+    #   ρ-T basis (chi_T, chi_rho, chi_Y, chi_Z, cv):
+    #     get_logp_rhot() → ρ-T table if inv_tab=True, else Newton.
+    #
+    #   S-ρ basis (dtdy_srho, dtdz_srho, dudy_srho, dudz_srho):
+    #     get_logp_logt_srho() → S-ρ table if srho_tab=True, else
+    #     1-D decomposition via ρ-T or S-P tables (inv_tab=True),
+    #     else raw Newton-Raphson.
+    # =================================================================
 
     def _vec(self, func, lgp, lgt, *args, **kw):
         """Vectorize a scalar function over (lgp, lgt).
@@ -5446,42 +5503,33 @@ class hhe_z_mixtures():
         p2 = self.get_logp_rhot(rho0, lgt, yp, z + h)
         return (p2 - p1) * log10_to_loge / (2*h)
 
-    def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
-        """Ledoux dS/dY|_{ρ,P} vectorized via identity with clamped c."""
-        ht = 0.1
-        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
-        logS_Tp = np.log10(self.get_s_pt_tab(lgp, lgt + ht, yp, z))
-        logS_Tm = np.log10(self.get_s_pt_tab(lgp, lgt - ht, yp, z))
-        a = (logS_Tp - logS_Tm) / (2 * ht)
-        rho_Tp = self.get_logrho_pt_tab(lgp, lgt + ht, yp, z)
-        rho_Tm = self.get_logrho_pt_tab(lgp, lgt - ht, yp, z)
-        c = (rho_Tp - rho_Tm) / (2 * ht)
-        S_Y = (self.get_s_pt_tab(lgp, lgt, yp + h, z)
-               - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2 * h)
-        rho_Y = (self.get_logrho_pt_tab(lgp, lgt, yp + h, z)
-                 - self.get_logrho_pt_tab(lgp, lgt, yp - h, z)) / (2 * h)
-        # Clamp c to avoid 1/c singularity at dissociation
-        c_safe = np.where(np.abs(c) > 0.02, c, np.sign(c) * 0.02)
-        c_safe = np.where(c_safe == 0, 0.02, c_safe)
-        return S_Y - S0 * a * log10_to_loge * rho_Y / c_safe
+    def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.1, **kw):
+        """dS/dY|_{ρ,P} vectorized via constrained FD with ρ-P table.
 
-    def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.01, **kw):
-        """Ledoux dS/dZ|_{ρ,P} vectorized via identity with clamped c."""
-        ht = 0.1
-        S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
-        logS_Tp = np.log10(self.get_s_pt_tab(lgp, lgt + ht, yp, z))
-        logS_Tm = np.log10(self.get_s_pt_tab(lgp, lgt - ht, yp, z))
-        a = (logS_Tp - logS_Tm) / (2 * ht)
-        rho_Tp = self.get_logrho_pt_tab(lgp, lgt + ht, yp, z)
-        rho_Tm = self.get_logrho_pt_tab(lgp, lgt - ht, yp, z)
-        c = (rho_Tp - rho_Tm) / (2 * ht)
-        S_Z = (self.get_s_pt_tab(lgp, lgt, yp, z + h)
-               - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2 * h)
-        rho_Z = (self.get_logrho_pt_tab(lgp, lgt, yp, z + h)
-                 - self.get_logrho_pt_tab(lgp, lgt, yp, z - h)) / (2 * h)
-        c_safe = np.where(np.abs(c) > 0.02, c, np.sign(c) * 0.02)
-        c_safe = np.where(c_safe == 0, 0.02, c_safe)
-        return S_Z - S0 * a * log10_to_loge * rho_Z / c_safe
+        At each point, finds T at constant (ρ, P) for Y ± h using
+        the ρ-P inversion table (or Newton fallback), then
+        finite-differences S(P, T, Y, Z).
+        """
+        rho0 = self._logrho_pt(lgp, lgt, yp, z)
+        lgt_p = self._logt_rhop_noconv(rho0, lgp, yp + h, z)
+        lgt_m = self._logt_rhop_noconv(rho0, lgp, yp - h, z)
+        s_p = self._s_pt(lgp, lgt_p, yp + h, z)
+        s_m = self._s_pt(lgp, lgt_m, yp - h, z)
+        return (s_p - s_m) / (2 * h)
+
+    def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.1, **kw):
+        """dS/dZ|_{ρ,P} vectorized via constrained FD with ρ-P table.
+
+        At each point, finds T at constant (ρ, P) for Z ± h using
+        the ρ-P inversion table (or Newton fallback), then
+        finite-differences S(P, T, Y, Z).
+        """
+        rho0 = self._logrho_pt(lgp, lgt, yp, z)
+        lgt_p = self._logt_rhop_noconv(rho0, lgp, yp, z + h)
+        lgt_m = self._logt_rhop_noconv(rho0, lgp, yp, z - h)
+        s_p = self._s_pt(lgp, lgt_p, yp, z + h)
+        s_m = self._s_pt(lgp, lgt_m, yp, z - h)
+        return (s_p - s_m) / (2 * h)
 
     def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
         """dT/dY|_{S,ρ} vectorized via identity."""
@@ -5663,57 +5711,52 @@ class hhe_z_mixtures():
         return self._dispatch('dsdz_pt', lgp, lgt, yp, z, method, **kw)
 
     def _ledoux_dsdy_fd(self, lgp, lgt, yp, z, _zm, _za, _zr, dy):
-        """Direct finite-difference fallback for dS/dY|_{ρ,P}.
+        """dS/dY|_{ρ,P} via constrained FD using the ρ-P table.
 
-        Finds T(Y±dY) at constant (P, ρ) via brentq, then
-        differentiates S.
+        Holds (ρ, P) constant, finds T(Y±dY) via the pre-computed
+        ρ-P inversion table (when inv_tab=True) or Newton-Raphson
+        fallback (when inv_tab=False), then finite-differences S.
         """
         rho0 = self._logrho_pt(lgp, lgt, yp, z, _zm, _za, _zr)
         if dy is None:
             dy = self._adaptive_dx(yp)
-
-        def get_t(yp_i):
-            def err(lgt_i):
-                try:
-                    return self._logrho_pt(
-                        lgp, lgt_i, yp_i, z, _zm, _za, _zr) - rho0
-                except (ZeroDivisionError, FloatingPointError):
-                    return 1e30
-            return brentq(err, self.logt_min, self.logt_max, xtol=1e-8)
-
         try:
-            lgt_p = get_t(yp + dy)
-            lgt_m = get_t(yp - dy)
+            lgt_p = self._logt_rhop_noconv(rho0, lgp, yp + dy, z,
+                                           _zm, _za, _zr)
+            lgt_m = self._logt_rhop_noconv(rho0, lgp, yp - dy, z,
+                                           _zm, _za, _zr)
+            if not (np.isfinite(lgt_p) and np.isfinite(lgt_m)):
+                return np.nan
             return (self._s_pt(lgp, lgt_p, yp + dy, z, _zm, _za, _zr) -
                     self._s_pt(lgp, lgt_m, yp - dy, z, _zm, _za, _zr)) / (2 * dy)
         except (ValueError, RuntimeError, ZeroDivisionError):
             return np.nan
 
     def _ledoux_dsdz_fd(self, lgp, lgt, yp, z, _zm, _za, _zr, dz):
-        """Direct finite-difference fallback for dS/dZ|_{ρ,P}."""
+        """dS/dZ|_{ρ,P} via constrained FD using the ρ-P table.
+
+        Holds (ρ, P) constant, finds T(Z±dZ) via the pre-computed
+        ρ-P inversion table (when inv_tab=True) or Newton-Raphson
+        fallback (when inv_tab=False), then finite-differences S.
+        """
         rho0 = self._logrho_pt(lgp, lgt, yp, z, _zm, _za, _zr)
         if dz is None:
             dz = self._adaptive_dx(z)
-
-        def get_t(z_i):
-            def err(lgt_i):
-                try:
-                    return self._logrho_pt(
-                        lgp, lgt_i, yp, z_i, _zm, _za, _zr) - rho0
-                except (ZeroDivisionError, FloatingPointError):
-                    return 1e30
-            return brentq(err, self.logt_min, self.logt_max, xtol=1e-8)
-
         try:
-            lgt_p = get_t(z + dz)
-            lgt_m = get_t(z - dz)
+            lgt_p = self._logt_rhop_noconv(rho0, lgp, yp, z + dz,
+                                           _zm, _za, _zr)
+            lgt_m = self._logt_rhop_noconv(rho0, lgp, yp, z - dz,
+                                           _zm, _za, _zr)
+            if not (np.isfinite(lgt_p) and np.isfinite(lgt_m)):
+                return np.nan
             return (self._s_pt(lgp, lgt_p, yp, z + dz, _zm, _za, _zr) -
                     self._s_pt(lgp, lgt_m, yp, z - dz, _zm, _za, _zr)) / (2 * dz)
         except (ValueError, RuntimeError, ZeroDivisionError):
             return np.nan
 
-    def _dsdy_rhop_scalar(self, lgp, lgt, yp, z=0.0,
-                          _zm=0.0, _za=0.0, _zr=0.0, c_guard=0.02, **kw):
+    def _dsdy_rhop_id(self, lgp, lgt, yp, z=0.0,
+                      _zm=0.0, _za=0.0, _zr=0.0, c_guard=0.02, **kw):
+        """Identity: S_Y − S·a·ln(10)·ρ_Y / c, with FD fallback near c≈0."""
         kw['composition'] = True
         d = self._pt_derivs(lgp, lgt, yp, z, _zm=_zm, _za=_za, _zr=_zr, **kw)
         if abs(d['c']) > c_guard:
@@ -5724,20 +5767,15 @@ class hhe_z_mixtures():
     def get_dsdy_rhop(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """Ledoux: dS/dY|_{ρ,P}  [erg/(g·K) per Y].
 
+        method='finite_difference': constrained FD at constant (ρ,P)
+            using the ρ-P inversion table (or Newton fallback).
         method='identity': S_Y − S·a·ln(10)·ρ_Y / c (with c_guard fallback)
-        method='finite_difference': direct constrained FD at constant (ρ,P)
         """
-        yp = self._to_yprime(yp, z)
-        if method == 'finite_difference':
-            return self._vec(lambda p, t, yp, z, **k:
-                self._ledoux_dsdy_fd(p, t, yp, z,
-                    k.get('_zm', 0.), k.get('_za', 0.), k.get('_zr', 0.),
-                    k.get('dy', None)),
-                lgp, lgt, yp, z, **kw)
-        return self._vec(self._dsdy_rhop_scalar, lgp, lgt, yp, z, **kw)
+        return self._dispatch('dsdy_rhop', lgp, lgt, yp, z, method, **kw)
 
-    def _dsdz_rhop_scalar(self, lgp, lgt, yp, z=0.0,
-                          _zm=0.0, _za=0.0, _zr=0.0, c_guard=0.02, **kw):
+    def _dsdz_rhop_id(self, lgp, lgt, yp, z=0.0,
+                      _zm=0.0, _za=0.0, _zr=0.0, c_guard=0.02, **kw):
+        """Identity: S_Z − S·a·ln(10)·ρ_Z / c, with FD fallback near c≈0."""
         kw['composition'] = True
         d = self._pt_derivs(lgp, lgt, yp, z, _zm=_zm, _za=_za, _zr=_zr, **kw)
         if abs(d['c']) > c_guard:
@@ -5748,17 +5786,11 @@ class hhe_z_mixtures():
     def get_dsdz_rhop(self, lgp, lgt, yp, z=0.0, _frock=0.0, method='finite_difference', **kw):
         """Ledoux: dS/dZ|_{ρ,P}  [erg/(g·K) per Z].
 
+        method='finite_difference': constrained FD at constant (ρ,P)
+            using the ρ-P inversion table (or Newton fallback).
         method='identity': S_Z − S·a·ln(10)·ρ_Z / c (with c_guard fallback)
-        method='finite_difference': direct constrained FD at constant (ρ,P)
         """
-        yp = self._to_yprime(yp, z)
-        if method == 'finite_difference':
-            return self._vec(lambda p, t, yp, z, **k:
-                self._ledoux_dsdz_fd(p, t, yp, z,
-                    k.get('_zm', 0.), k.get('_za', 0.), k.get('_zr', 0.),
-                    k.get('dz', None)),
-                lgp, lgt, yp, z, **kw)
-        return self._vec(self._dsdz_rhop_scalar, lgp, lgt, yp, z, **kw)
+        return self._dispatch('dsdz_rhop', lgp, lgt, yp, z, method, **kw)
 
     def _dtdy_srho_scalar(self, lgp, lgt, yp, z, **kw):
         kw['composition'] = True
@@ -6180,10 +6212,10 @@ class hhe_z_mixtures():
 
     def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z,
                             _frock=0.0, **kw):
-        """dS/dY|_{ρ,P} (Ledoux).  Old interface takes (S, ρ).
+        """dS/dY|_{ρ,P} (Ledoux).  Takes (S, ρ) basis inputs.
 
-        Vectorized: inverts (S,ρ)→(P,T) via table, then uses
-        the vectorized Ledoux identity on the resulting (P,T).
+        Inverts (S,ρ) → (P,T), then computes dS/dY|_{ρ,P} via
+        constrained FD using the ρ-P table for T(ρ, P, Y±dY, Z).
         """
         _y = self._to_yprime(_y, _z)
         lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
@@ -6191,10 +6223,10 @@ class hhe_z_mixtures():
 
     def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z,
                             _frock=0.0, **kw):
-        """dS/dZ|_{ρ,P} (Ledoux).  Old interface takes (S, ρ).
+        """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) basis inputs.
 
-        Vectorized: inverts (S,ρ)→(P,T) via table, then uses
-        the vectorized Ledoux identity on the resulting (P,T).
+        Inverts (S,ρ) → (P,T), then computes dS/dZ|_{ρ,P} via
+        constrained FD using the ρ-P table for T(ρ, P, Y, Z±dZ).
         """
         _y = self._to_yprime(_y, _z)
         lgp, lgt = self.get_logp_logt_srho(_s, _lgrho, _y, _z)
