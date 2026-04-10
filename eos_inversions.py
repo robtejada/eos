@@ -43,21 +43,21 @@ DEFAULTS = {
     'mu_h_vary':  False,
 
     # P-T grid
-    'logp_lo':    3.0, # 1 bar
-    'logp_hi':    16.0, # 1000 Mbar
+    'logp_lo':    3.0, # 1 mbar
+    'logp_hi':    15.0, # 1000 Mbar
     'logp_step':  0.05,
-    'logt_lo':    1.5,
+    'logt_lo':    1.3,
     'logt_hi':    6.0,
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -6.0,
     'logrho_hi':  1.6,
-    'logrho_step': 0.1,
+    'logrho_step': 0.01,
 
     # S grid for square tables (SP, S-rho) — ADJUST THESE VALUES
     's_lo':       2.0,    # kb/baryon — lower entropy bound
     's_hi':       12.0,   # kb/baryon — upper entropy bound
-    's_step':     0.1,    # kb/baryon — entropy step
+    's_step':     0.05,    # kb/baryon — entropy step
 
     # ξ resolution (for xi-mapped tables only, used with --xi_transform)
     'n_xi':       150,
@@ -68,7 +68,7 @@ DEFAULTS = {
     'y_step':     0.05,
     'z_lo':       0.00,
     'z_hi':       1.0,
-    'z_step':     0.02,
+    'z_step':     0.01,
 }
 
 
