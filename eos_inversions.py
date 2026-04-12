@@ -51,8 +51,8 @@ DEFAULTS = {
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -6.0,
-    'logrho_hi':  1.6,
-    'logrho_step': 0.01,
+    'logrho_hi':  1.65,
+    'logrho_step': 0.05,
 
     # S grid for square tables (SP, S-rho) — ADJUST THESE VALUES
     's_lo':       2.0,    # kb/baryon — lower entropy bound
