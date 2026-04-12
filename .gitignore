@@ -84,3 +84,4 @@ diagnose_entropy_sign.py
 diagnose_cubic_vs_linear.py
 ch4_comb_eos.py
 nh3_comb_eos.py
+verify_derivatives.py
