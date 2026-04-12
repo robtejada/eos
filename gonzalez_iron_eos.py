@@ -254,35 +254,72 @@ class Fe_GONZALEZ_EOS:
         w = self._blend_weight(P_arr, T_arr)
         return (1.0 - w) * u_s + w * u_l
 
-    def get_alpha_pt(self, P, T):
-        """Thermal expansivity [1/K]."""
+    def get_alpha_pt(self, P, T, dT_frac=0.1):
+        """
+        Thermal expansivity [1/K].
+
+            alpha = -(1/rho) * (drho/dT)_P
+
+        Computed via centered finite difference on the blended get_rho_pt.
+        """
         P_arr, T_arr = self._as_arrays(P, T)
-        a_s = self.solid.get_alpha_pt(P_arr, T_arr)
-        a_l = self.liquid.get_alpha_pt(P_arr, T_arr)
-        w = self._blend_weight(P_arr, T_arr)
-        return (1.0 - w) * a_s + w * a_l
+        dT = np.maximum(T_arr * dT_frac, 1.0)
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False)
+        rho_hi = self.get_rho_pt(P_arr, T_arr + dT, tab=False)
+        rho_lo = self.get_rho_pt(P_arr, T_arr - dT, tab=False)
+        return -(1.0 / rho) * (rho_hi - rho_lo) / (2.0 * dT)
 
-    def get_cp_pt(self, P, T):
-        """Heat capacity at constant pressure [erg/g/K]."""
+    def get_cp_pt(self, P, T, dT_frac=0.1):
+        """
+        Heat capacity at constant pressure [erg/g/K].
+
+            Cp = T * (dS/dT)_P
+
+        Computed via centered finite difference on the blended get_s_pt.
+        """
         P_arr, T_arr = self._as_arrays(P, T)
-        cp_s = self.solid.get_CP_pt(P_arr, T_arr)
-        cp_l = self.liquid.get_CP_pt(P_arr, T_arr)
-        w = self._blend_weight(P_arr, T_arr)
-        return (1.0 - w) * cp_s + w * cp_l
+        dT = np.maximum(T_arr * dT_frac, 1.0)
+        s_hi = self.get_s_pt(P_arr, T_arr + dT, tab=False)
+        s_lo = self.get_s_pt(P_arr, T_arr - dT, tab=False)
+        dS_dT = (s_hi - s_lo) / (2.0 * dT)
+        return T_arr * dS_dT
 
-    def get_CP_pt(self, P, T):
-        return self.get_cp_pt(P, T)
+    def get_CP_pt(self, P, T, **kwargs):
+        return self.get_cp_pt(P, T, **kwargs)
 
-    def get_cv_pt(self, P, T):
-        """Heat capacity at constant volume [erg/g/K]."""
+    def get_cv_pt(self, P, T, dT_frac=0.1, dP_frac=0.1):
+        """
+        Heat capacity at constant volume [erg/g/K].
+
+            Cv = Cp - T * alpha^2 / (rho * beta_T)
+
+        where beta_T = (1/rho) * (drho/dP)_T is isothermal compressibility.
+        All finite differences on the blended getters.
+        """
         P_arr, T_arr = self._as_arrays(P, T)
-        cv_s = self.solid.get_CV_pt(P_arr, T_arr)
-        cv_l = self.liquid.get_CV_pt(P_arr, T_arr)
-        w = self._blend_weight(P_arr, T_arr)
-        return (1.0 - w) * cv_s + w * cv_l
+        rho = self.get_rho_pt(P_arr, T_arr, tab=False)
+        cp = self.get_cp_pt(P_arr, T_arr, dT_frac=dT_frac)
+        alpha = self.get_alpha_pt(P_arr, T_arr, dT_frac=dT_frac)
 
-    def get_CV_pt(self, P, T):
-        return self.get_cv_pt(P, T)
+        # Isothermal compressibility: beta_T = (1/rho) * (drho/dP)_T
+        dP = np.maximum(P_arr * dP_frac, 0.1)  # GPa
+        rho_hi = self.get_rho_pt(P_arr + dP, T_arr, tab=False)
+        rho_lo = self.get_rho_pt(P_arr - dP, T_arr, tab=False)
+        drho_dP = (rho_hi - rho_lo) / (2.0 * dP)
+
+        # Convert dP from GPa to dyn/cm^2 for unit consistency with rho (g/cm^3) and S (erg/g/K)
+        GPA_TO_DYNCM2 = 1e10
+        drho_dP_cgs = drho_dP / GPA_TO_DYNCM2  # (g/cm^3) / (dyn/cm^2)
+        beta_T = drho_dP_cgs / rho  # 1 / (dyn/cm^2) = cm^2/dyn
+
+        # Cv = Cp - T * alpha^2 / (rho * beta_T)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cv = cp - T_arr * alpha**2 / (rho * beta_T)
+
+        return cv
+
+    def get_CV_pt(self, P, T, **kwargs):
+        return self.get_cv_pt(P, T, **kwargs)
 
     # ------------------------------------------------------------------
     # SP interface  (S in kB/baryon, P in GPa)
@@ -483,6 +520,73 @@ class Fe_GONZALEZ_EOS:
             ax.set_title(label)
             fig.colorbar(pcm, ax=ax, pad=0.02)
             ax.legend(loc="upper right")
+
+        fig.tight_layout()
+        return fig
+
+    def plot_isentropes(
+        self,
+        s_vals=None,
+        P_range_GPa=(100, 5500),
+        n_P=100,
+        figsize=(8, 6),
+        cmap_name="cosmic",
+        show_melt=True,
+    ):
+        """
+        Plot isentropes T(S, P) colored by entropy, with a colorbar.
+
+        Parameters
+        ----------
+        s_vals : array-like, optional
+            Entropy values in kB/baryon. Default: np.arange(0.2, 0.35, 0.01).
+        P_range_GPa : tuple
+            (P_min, P_max) in GPa.
+        n_P : int
+            Number of pressure points per isentrope.
+        figsize : tuple
+            Figure size.
+        cmap_name : str
+            cmasher colormap name (without 'cmr.' prefix).
+        show_melt : bool
+            If True, overlay the melt curve.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        import cmasher as cmr
+
+        if s_vals is None:
+            s_vals = np.arange(0.2, 0.35, 0.01)
+        s_vals = np.asarray(s_vals, dtype=float)
+
+        cmap = getattr(cmr, cmap_name)
+        norm = mcolors.Normalize(vmin=s_vals[0], vmax=s_vals[-1])
+        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+
+        P_grid = np.logspace(np.log10(P_range_GPa[0]), np.log10(P_range_GPa[1]), n_P)
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        for s_val in s_vals:
+            T_res = self.get_t_sp(s_val, P_grid)
+            ax.plot(P_grid, T_res, color=cmap(norm(s_val)), linewidth=1.5)
+
+        if show_melt:
+            Tm = self.get_T_melt(P_grid)
+            ax.plot(P_grid, Tm, "k--", linewidth=1.5, label="Melt curve")
+            ax.legend(loc="upper left", fontsize=10)
+
+        cb = fig.colorbar(sm, ax=ax, pad=0.02)
+        cb.set_label(r"Entropy $S$ [k$_B$/baryon]", fontsize=12)
+
+        ax.set_xlabel("Pressure [GPa]", fontsize=12)
+        ax.set_ylabel("Temperature [K]", fontsize=12)
+        ax.set_title("Gonzalez Iron EOS — Isentropes", fontsize=13)
 
         fig.tight_layout()
         return fig
