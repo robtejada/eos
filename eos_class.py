@@ -178,6 +178,7 @@ class z_eos:
       - 'methane'  : CH4 EOS (Setzmann + DFT blend), P-T basis only
       - 'ammonia'  : NH3 EOS (Gao + DFT blend), P-T basis only
       - 'mg2sio4'  : Mg2SiO4 forsterite ANEOS, P-T basis only
+      - 'iron'     : Fe combined EOS (Gonzalez-Cataldo & Militzer 2023), P-T basis only
 
     The ``aqua_version`` parameter selects which AQUA table to load:
       - 'revised'  : Cano Amoros et al. — revised entropies (default), P-T only
@@ -207,6 +208,7 @@ class z_eos:
         'methane': 16.043,   # CH4
         'ammonia': 17.031,   # NH3
         'mg2sio4': 140.69,   # Mg2SiO4 (forsterite)
+        'iron':    55.845,   # Fe
     }
 
     def __init__(self, species='water', smooth_z=False, aqua_version='revised'):
@@ -231,9 +233,11 @@ class z_eos:
             self._load_ch4_nh3('ammonia', smooth_z)
         elif species == 'mg2sio4':
             self._load_mg2sio4(smooth_z)
+        elif species == 'iron':
+            self._load_iron_gonzalez(smooth_z)
         else:
             raise ValueError(f"Unknown z_eos species '{species}'. "
-                             f"Use 'water', 'methane', 'ammonia', or 'mg2sio4'.")
+                             f"Use 'water', 'methane', 'ammonia', 'mg2sio4', or 'iron'.")
 
     # -----------------------------------------------------------------
     # AQUA loader
@@ -476,6 +480,54 @@ class z_eos:
         self.logu_pt_rgi = RGI((logp_cgs, logt_1d), self.logu_pt, **rgi_kw)
 
     # -----------------------------------------------------------------
+    # Iron (Gonzalez-Cataldo & Militzer 2023) loader
+    # -----------------------------------------------------------------
+    def _load_iron_gonzalez(self, smooth_z):
+        """Load pre-computed combined solid+liquid iron EOS table.
+
+        Table: gonzalez_iron_eos/gonzalez_iron_combined_pt.npz
+        Keys: p_vals (GPa), t_vals (K), rho_grid (g/cm³),
+              s_grid (erg/g/K), u_grid (erg/g) — all already CGS.
+        """
+        data = np.load(f'{CURR_DIR}/gonzalez_iron_eos/gonzalez_iron_combined_pt.npz')
+
+        P_GPa = np.asarray(data['p_vals'], dtype=float)
+        T_K = np.asarray(data['t_vals'], dtype=float)
+        n_P, n_T = P_GPa.size, T_K.size
+
+        rho_raw = np.asarray(data['rho_grid'], dtype=float)
+        s_raw = np.asarray(data['s_grid'], dtype=float)
+        u_raw = np.asarray(data['u_grid'], dtype=float)
+
+        # Table is stored as (n_P, n_T) by construction.
+        # Skip the n_T==n_P shape ambiguity check — axis order is known.
+
+        # Convert axes to log CGS
+        logp_cgs = np.log10(P_GPa * self._GPa_to_dyncm2)
+        logt_1d = np.log10(T_K)
+
+        # Convert rho, S to log form (handle negative/zero from extrapolation)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            logrho_raw = np.where(rho_raw > 0, np.log10(rho_raw), np.nan)
+            logs_raw = np.where(s_raw > 0, np.log10(s_raw), np.nan)
+
+        # Store — grid is (n_P, n_T), axes (logP, logT), same as mg2sio4
+        self.logpvals_pt = logp_cgs
+        self.logtvals_pt = logt_1d
+        self.logrho_pt = logrho_raw
+        self.logs_pt = logs_raw
+
+        # U is stored in LINEAR form (erg/g) — iron U can be negative
+        # due to the DFT reference state, so log10 is not appropriate.
+        self.u_pt = u_raw
+
+        # RGI axes: (logP, logT) like AQUA / mg2sio4
+        rgi_kw = dict(method='linear', bounds_error=False, fill_value=None)
+        self.logrho_pt_rgi = RGI((logp_cgs, logt_1d), self.logrho_pt, **rgi_kw)
+        self.logs_pt_rgi = RGI((logp_cgs, logt_1d), self.logs_pt, **rgi_kw)
+        self.u_pt_rgi = RGI((logp_cgs, logt_1d), self.u_pt, **rgi_kw)
+
+    # -----------------------------------------------------------------
     # AQUA smoothing
     # -----------------------------------------------------------------
     def _smooth_aqua_lowp_lowt(self):
@@ -517,7 +569,7 @@ class z_eos:
 
     def _interpolate_pt(self, interpolator, _lgp, _lgt):
         # AQUA/Mg2SiO4 RGI axes: (logP, logT); CH4/NH3 RGI axes: (logT, logP)
-        if self.species in ('water', 'mg2sio4'):
+        if self.species in ('water', 'mg2sio4', 'iron'):
             args = (_lgp, _lgt)
         else:
             args = (_lgt, _lgp)
@@ -544,7 +596,22 @@ class z_eos:
         return self._interpolate_pt(self.logs_pt_rgi, lgp, lgt)
 
     def get_logu_pt(self, lgp, lgt):
+        if self.species == 'iron':
+            raise AttributeError(
+                "Iron U is stored in linear form (can be negative). "
+                "Use get_u_pt() instead of get_logu_pt().")
         return self._interpolate_pt(self.logu_pt_rgi, lgp, lgt)
+
+    def get_u_pt(self, lgp, lgt):
+        """Internal energy in linear form (erg/g).
+
+        Works for all species.  For iron the RGI stores linear U
+        directly (allows negative values); for other species it
+        exponentiates the log10 table.
+        """
+        if self.species == 'iron':
+            return self._interpolate_pt(self.u_pt_rgi, lgp, lgt)
+        return 10.0 ** self._interpolate_pt(self.logu_pt_rgi, lgp, lgt)
 
     def get_logp_rhot(self, lgrho, lgt):
         if not hasattr(self, 'logp_rhot_rgi'):
@@ -1096,13 +1163,15 @@ class val_mixtures:
         u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
         if f_w > 0 and 'water' in self.z:
-            u_mix = u_mix + f_w * 10.0 ** self.z['water'].get_logu_pt(_lgp, _lgt)
+            u_mix = u_mix + f_w * self.z['water'].get_u_pt(_lgp, _lgt)
         if f_m > 0 and 'methane' in self.z:
-            u_mix = u_mix + f_m * 10.0 ** self.z['methane'].get_logu_pt(_lgp, _lgt)
+            u_mix = u_mix + f_m * self.z['methane'].get_u_pt(_lgp, _lgt)
         if f_a > 0 and 'ammonia' in self.z:
-            u_mix = u_mix + f_a * 10.0 ** self.z['ammonia'].get_logu_pt(_lgp, _lgt)
+            u_mix = u_mix + f_a * self.z['ammonia'].get_u_pt(_lgp, _lgt)
         if f_r > 0 and 'mg2sio4' in self.z:
-            u_mix = u_mix + f_r * 10.0 ** self.z['mg2sio4'].get_logu_pt(_lgp, _lgt)
+            u_mix = u_mix + f_r * self.z['mg2sio4'].get_u_pt(_lgp, _lgt)
+        if f_r > 0 and 'iron' in self.z:
+            u_mix = u_mix + f_r * self.z['iron'].get_u_pt(_lgp, _lgt)  # iron shares rock fraction for now
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return u_mix.item()

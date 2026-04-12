@@ -94,7 +94,8 @@ class Fe_GONZALEZ_EOS:
     """
 
     erg_to_kbbar: float = ERG_GK_TO_KBBAR
-    _DEFAULT_TABLE = "gonzalez_iron_combined_pt.npz"
+    _DEFAULT_PT_TABLE = "gonzalez_iron_combined_pt.npz"
+    _DEFAULT_SP_TABLE = "gonzalez_iron_combined_sp.npz"
 
     def __init__(
         self,
@@ -103,6 +104,7 @@ class Fe_GONZALEZ_EOS:
         data_dir=None,
         tab: bool = False,
         tab_path: Optional[Union[str, Path]] = None,
+        sp_tab_path: Optional[Union[str, Path]] = None,
         **fe_eos_kwargs,
     ):
         self.dT = float(dT)
@@ -120,32 +122,38 @@ class Fe_GONZALEZ_EOS:
         self.T_min = min(self.solid.T_min, self.liquid.T_min)
         self.T_max = max(self.solid.T_max, self.liquid.T_max)
 
-        # --- Pre-computed combined table ---
+        # --- Pre-computed combined PT table ---
         self._has_tab = False
         if tab:
             self._load_table(tab_path)
 
+        # --- Pre-computed SP inversion table ---
+        self._has_sp_tab = False
+        self._load_sp_table(sp_tab_path)
+
+    def _find_table(self, filename, explicit_path=None):
+        """Resolve a table path: explicit > data_dir > cwd fallback."""
+        if explicit_path is not None:
+            return Path(explicit_path)
+        this_dir = Path(__file__).resolve().parent
+        candidates = [
+            this_dir / "gonzalez_iron_eos" / filename,
+            Path.cwd() / "eos" / "gonzalez_iron_eos" / filename,
+        ]
+        for cand in candidates:
+            if cand.is_file():
+                return cand
+        return None
+
     def _load_table(self, tab_path=None):
         """Load the pre-computed combined PT table and build RGI interpolators."""
-        if tab_path is None:
-            this_dir = Path(__file__).resolve().parent
-            candidates = [
-                this_dir / "gonzalez_iron_eos" / self._DEFAULT_TABLE,
-                Path.cwd() / "eos" / "gonzalez_iron_eos" / self._DEFAULT_TABLE,
-            ]
-            for cand in candidates:
-                if cand.is_file():
-                    tab_path = cand
-                    break
-            if tab_path is None:
-                raise FileNotFoundError(
-                    f"Could not find {self._DEFAULT_TABLE}. "
-                    "Generate it first or pass tab_path explicitly."
-                )
-        else:
-            tab_path = Path(tab_path)
-
-        data = np.load(tab_path)
+        resolved = self._find_table(self._DEFAULT_PT_TABLE, tab_path)
+        if resolved is None:
+            raise FileNotFoundError(
+                f"Could not find {self._DEFAULT_PT_TABLE}. "
+                "Generate it first or pass tab_path explicitly."
+            )
+        data = np.load(resolved)
         self._tab_p = np.asarray(data["p_vals"], dtype=float)  # GPa
         self._tab_t = np.asarray(data["t_vals"], dtype=float)  # K
 
@@ -155,10 +163,46 @@ class Fe_GONZALEZ_EOS:
         self._tab_u_rgi = RGI((self._tab_p, self._tab_t), data["u_grid"], **rgi_kw)
         self._has_tab = True
 
+    def _load_sp_table(self, sp_tab_path=None):
+        """Load the pre-computed SP inversion table and build RGI interpolators.
+
+        If no table is found, sets ``_has_sp_tab = False`` silently so
+        that the direct inversion path is used instead.
+        """
+        resolved = self._find_table(self._DEFAULT_SP_TABLE, sp_tab_path)
+        if resolved is None:
+            self._has_sp_tab = False
+            return
+
+        data = np.load(resolved)
+        self._sp_s = np.asarray(data["svals_sp"], dtype=float)   # kB/baryon
+        self._sp_p = np.asarray(data["pvals_sp"], dtype=float)   # GPa
+
+        rgi_kw = dict(method="linear", bounds_error=False, fill_value=None)
+        self._sp_t_rgi = RGI(
+            (self._sp_s, self._sp_p), data["t_grid_sp"], **rgi_kw)
+        self._sp_rho_rgi = RGI(
+            (self._sp_s, self._sp_p), data["rho_grid_sp"], **rgi_kw)
+        self._sp_u_rgi = RGI(
+            (self._sp_s, self._sp_p), data["u_grid_sp"], **rgi_kw)
+        self._sp_cp_rgi = RGI(
+            (self._sp_s, self._sp_p), data["cp_grid_sp"], **rgi_kw)
+        self._sp_cv_rgi = RGI(
+            (self._sp_s, self._sp_p), data["cv_grid_sp"], **rgi_kw)
+        self._sp_alpha_rgi = RGI(
+            (self._sp_s, self._sp_p), data["alpha_grid_sp"], **rgi_kw)
+
+        self._has_sp_tab = True
+
     def _query_tab(self, rgi, P_arr, T_arr):
         """Evaluate a tabulated RGI interpolator at (P, T) points."""
         pts = np.stack((P_arr.ravel(), T_arr.ravel()), axis=-1)
         return rgi(pts).reshape(P_arr.shape)
+
+    def _query_sp_tab(self, rgi, S_arr, P_arr):
+        """Evaluate a tabulated SP RGI interpolator at (S, P) points."""
+        pts = np.stack((S_arr.ravel(), P_arr.ravel()), axis=-1)
+        return rgi(pts).reshape(S_arr.shape)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -329,6 +373,7 @@ class Fe_GONZALEZ_EOS:
         self,
         S,
         P,
+        tab=True,
         s_units="kbbar",
         bounds_T=(100.0, 2e5),
         secant_maxiter=30,
@@ -343,10 +388,14 @@ class Fe_GONZALEZ_EOS:
             Entropy target. Units set by *s_units*.
         P : float or array
             Pressure in GPa.
+        tab : bool
+            If True (default) and the SP table is loaded, use the
+            pre-computed table for fast interpolation. If False, use
+            direct secant + brenth inversion.
         s_units : {"kbbar", "cgs"}
             "kbbar" means kB/baryon (default); "cgs" means erg/g/K.
         bounds_T : tuple
-            (T_min, T_max) in K for the root bracket.
+            (T_min, T_max) in K for the root bracket (inversion only).
 
         Returns
         -------
@@ -355,10 +404,17 @@ class Fe_GONZALEZ_EOS:
         """
         S_arr, P_arr = self._as_arrays(S, P)
 
-        if str(s_units).lower() == "kbbar":
-            S_cgs = S_arr / self.erg_to_kbbar  # -> erg/g/K
+        if str(s_units).lower() == "cgs":
+            S_kb = S_arr * self.erg_to_kbbar
         else:
-            S_cgs = S_arr.copy()
+            S_kb = S_arr.copy()
+
+        # --- tabulated path ---
+        if tab and self._has_sp_tab:
+            return self._query_sp_tab(self._sp_t_rgi, S_kb, P_arr)
+
+        # --- direct inversion path ---
+        S_cgs = S_kb / self.erg_to_kbbar  # -> erg/g/K
 
         T_lo, T_hi = map(float, bounds_T)
         y_lo, y_hi = np.log(T_lo), np.log(T_hi)
@@ -424,17 +480,65 @@ class Fe_GONZALEZ_EOS:
 
         return out
 
-    def get_rho_sp(self, S, P, **kwargs):
+    def get_rho_sp(self, S, P, tab=True, s_units="kbbar", **kwargs):
         """Density [g/cm^3] at given (S, P)."""
-        T = self.get_t_sp(S, P, **kwargs)
-        _, P_arr = self._as_arrays(S, P)
+        S_arr, P_arr = self._as_arrays(S, P)
+        if str(s_units).lower() == "cgs":
+            S_kb = S_arr * self.erg_to_kbbar
+        else:
+            S_kb = S_arr.copy()
+        if tab and self._has_sp_tab:
+            return self._query_sp_tab(self._sp_rho_rgi, S_kb, P_arr)
+        T = self.get_t_sp(S, P, tab=False, s_units=s_units, **kwargs)
         return self.get_rho_pt(P_arr, T)
 
-    def get_u_sp(self, S, P, **kwargs):
+    def get_u_sp(self, S, P, tab=True, s_units="kbbar", **kwargs):
         """Internal energy [erg/g] at given (S, P)."""
-        T = self.get_t_sp(S, P, **kwargs)
-        _, P_arr = self._as_arrays(S, P)
+        S_arr, P_arr = self._as_arrays(S, P)
+        if str(s_units).lower() == "cgs":
+            S_kb = S_arr * self.erg_to_kbbar
+        else:
+            S_kb = S_arr.copy()
+        if tab and self._has_sp_tab:
+            return self._query_sp_tab(self._sp_u_rgi, S_kb, P_arr)
+        T = self.get_t_sp(S, P, tab=False, s_units=s_units, **kwargs)
         return self.get_u_pt(P_arr, T)
+
+    def get_cp_sp(self, S, P, tab=True, s_units="kbbar", **kwargs):
+        """Heat capacity at constant pressure [erg/g/K] at given (S, P)."""
+        S_arr, P_arr = self._as_arrays(S, P)
+        if str(s_units).lower() == "cgs":
+            S_kb = S_arr * self.erg_to_kbbar
+        else:
+            S_kb = S_arr.copy()
+        if tab and self._has_sp_tab:
+            return self._query_sp_tab(self._sp_cp_rgi, S_kb, P_arr)
+        T = self.get_t_sp(S, P, tab=False, s_units=s_units, **kwargs)
+        return self.get_cp_pt(P_arr, T)
+
+    def get_cv_sp(self, S, P, tab=True, s_units="kbbar", **kwargs):
+        """Heat capacity at constant volume [erg/g/K] at given (S, P)."""
+        S_arr, P_arr = self._as_arrays(S, P)
+        if str(s_units).lower() == "cgs":
+            S_kb = S_arr * self.erg_to_kbbar
+        else:
+            S_kb = S_arr.copy()
+        if tab and self._has_sp_tab:
+            return self._query_sp_tab(self._sp_cv_rgi, S_kb, P_arr)
+        T = self.get_t_sp(S, P, tab=False, s_units=s_units, **kwargs)
+        return self.get_cv_pt(P_arr, T)
+
+    def get_alpha_sp(self, S, P, tab=True, s_units="kbbar", **kwargs):
+        """Thermal expansivity [1/K] at given (S, P)."""
+        S_arr, P_arr = self._as_arrays(S, P)
+        if str(s_units).lower() == "cgs":
+            S_kb = S_arr * self.erg_to_kbbar
+        else:
+            S_kb = S_arr.copy()
+        if tab and self._has_sp_tab:
+            return self._query_sp_tab(self._sp_alpha_rgi, S_kb, P_arr)
+        T = self.get_t_sp(S, P, tab=False, s_units=s_units, **kwargs)
+        return self.get_alpha_pt(P_arr, T)
 
     # ------------------------------------------------------------------
     # Plotting
@@ -781,3 +885,197 @@ class Fe_GONZALEZ_EOS:
             fig.savefig(save_path, dpi=200, bbox_inches="tight")
 
         return fig
+
+    # ------------------------------------------------------------------
+    # SP table builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fill_nans_logP(P_grid, arr, name="", s_val=None):
+        """Fill NaN values by linear interpolation along the logP axis.
+
+        Parameters
+        ----------
+        P_grid : 1-D array
+            Pressure grid in GPa (used for log-space interpolation).
+        arr : 1-D array
+            Property values to fill.
+        name : str
+            Label for warning messages.
+        s_val : float, optional
+            Entropy value for warning messages.
+
+        Returns
+        -------
+        arr_filled : 1-D array
+            Array with NaN values replaced by log-P interpolation.
+        """
+        arr = np.array(arr, dtype=float)
+        bad = ~np.isfinite(arr)
+        if not bad.any():
+            return arr
+        good = ~bad
+        if good.sum() < 2:
+            raise RuntimeError(
+                f"Too few valid points in {name} at s={s_val}: "
+                f"{good.sum()}/{len(arr)}"
+            )
+        logP = np.log10(P_grid)
+        arr[bad] = np.interp(logP[bad], logP[good], arr[good])
+        return arr
+
+    def build_sp_table(
+        self,
+        s_grid=None,
+        P_grid=None,
+        save_path=None,
+        closure_check=True,
+        closure_rtol=0.05,
+    ):
+        """Build a pre-computed S-P inversion table.
+
+        For every isentrope in *s_grid*, inverts T(S, P) via
+        ``get_t_sp``, then evaluates rho, U, Cp, Cv, and alpha on the
+        found T(S,P).  NaN values from failed inversions are filled by
+        log-P interpolation.
+
+        Parameters
+        ----------
+        s_grid : array-like, optional
+            Entropy values in kB/baryon.
+            Default: ``np.arange(0.15, 0.36, 0.003)``.
+        P_grid : array-like, optional
+            Pressure values in GPa.
+            Default: ``np.logspace(1, np.log10(5500), 100)``.
+        save_path : str or Path, optional
+            Where to save the ``.npz`` file.  Default:
+            ``eos/gonzalez_iron_eos/gonzalez_iron_combined_sp.npz``.
+        closure_check : bool
+            If True (default), verify S round-trip closure for each
+            isentrope and raise on non-finite closure.
+        closure_rtol : float
+            Warn (but don't raise) if max relative closure error exceeds
+            this value. Default 0.05 (5%).
+
+        Returns
+        -------
+        dict
+            The saved arrays keyed by their NPZ names.
+        """
+        from tqdm import tqdm
+
+        if s_grid is None:
+            s_grid = np.arange(0.15, 0.36, 0.001)
+        s_grid = np.asarray(s_grid, dtype=float)
+
+        if P_grid is None:
+            P_grid = np.logspace(1, np.log10(5500), 500)
+        P_grid = np.asarray(P_grid, dtype=float)
+
+        if save_path is None:
+            this_dir = Path(__file__).resolve().parent
+            save_path = (
+                this_dir / "gonzalez_iron_eos"
+                / "gonzalez_iron_combined_sp.npz"
+            )
+        save_path = Path(save_path)
+
+        t_res = []
+        rho_res = []
+        u_res = []
+        cp_res = []
+        cv_res = []
+        alpha_res = []
+
+        for s in tqdm(s_grid, desc="Computing T(s,P) and properties"):
+            # Invert S(P,T) -> T(S,P)
+            T_res = self.get_t_sp(s, P_grid)
+            T_res = self._fill_nans_logP(P_grid, T_res, name="T_sp", s_val=s)
+
+            # Evaluate all properties at the found T(S,P)
+            rho = self.get_rho_pt(P_grid, T_res)
+            rho = self._fill_nans_logP(P_grid, rho, name="rho_pt", s_val=s)
+
+            u_val = self.get_u_pt(P_grid, T_res)
+            u_val = self._fill_nans_logP(P_grid, u_val, name="u_pt", s_val=s)
+
+            cp = self.get_cp_pt(P_grid, T_res)
+            cp = self._fill_nans_logP(P_grid, cp, name="cp_pt", s_val=s)
+
+            cv = self.get_cv_pt(P_grid, T_res)
+            cv = self._fill_nans_logP(P_grid, cv, name="cv_pt", s_val=s)
+
+            alpha = self.get_alpha_pt(P_grid, T_res)
+            alpha = self._fill_nans_logP(
+                P_grid, alpha, name="alpha_pt", s_val=s
+            )
+
+            # Optional closure check: S(P, T(S,P)) ≈ S
+            if closure_check:
+                s_comp = self.get_s_pt(P_grid, T_res) * self.erg_to_kbbar
+                rel_closure = np.max(
+                    np.abs(
+                        (s_comp - s) / np.maximum(np.abs(s), 1e-12)
+                    )
+                )
+                if not np.isfinite(rel_closure):
+                    raise RuntimeError(
+                        f"S-closure non-finite at s={s:.4f} kB/baryon"
+                    )
+                if rel_closure > closure_rtol:
+                    import warnings
+                    warnings.warn(
+                        f"s={s:.4f}: max |closure|={rel_closure:.3e} "
+                        f"exceeds rtol={closure_rtol:.3e}"
+                    )
+
+            t_res.append(T_res)
+            rho_res.append(rho)
+            u_res.append(u_val)
+            cp_res.append(cp)
+            cv_res.append(cv)
+            alpha_res.append(alpha)
+
+        t_res = np.array(t_res)
+        rho_res = np.array(rho_res)
+        u_res = np.array(u_res)
+        cp_res = np.array(cp_res)
+        cv_res = np.array(cv_res)
+        alpha_res = np.array(alpha_res)
+
+        # Final sanity check
+        all_fields = {
+            "t_grid_sp": t_res,
+            "rho_grid_sp": rho_res,
+            "u_grid_sp": u_res,
+            "cp_grid_sp": cp_res,
+            "cv_grid_sp": cv_res,
+            "alpha_grid_sp": alpha_res,
+        }
+        for k, arr in all_fields.items():
+            nbad = np.sum(~np.isfinite(arr))
+            if nbad:
+                raise RuntimeError(
+                    f"{k} has {nbad} non-finite values before save."
+                )
+
+        # Save
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            str(save_path),
+            svals_sp=s_grid,
+            pvals_sp=P_grid,
+            **all_fields,
+        )
+        print(f"Saved SP table to {save_path}")
+        print(f"  S grid: {len(s_grid)} values, "
+              f"[{s_grid[0]:.3f}, {s_grid[-1]:.3f}] kB/baryon")
+        print(f"  P grid: {len(P_grid)} values, "
+              f"[{P_grid[0]:.1f}, {P_grid[-1]:.1f}] GPa")
+        print(f"  Table shape: ({len(s_grid)}, {len(P_grid)})")
+
+        return {
+            "svals_sp": s_grid,
+            "pvals_sp": P_grid,
+            **all_fields,
+        }
