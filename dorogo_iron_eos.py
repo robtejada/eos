@@ -1769,5 +1769,5 @@ class Fe_EOS(Fe_EOS_analytic):
         P in GPa. Return T_melt(P) in K.
         """
         P_arr = self._as_array_single(P)
-        Tm = 1900 * (P_arr / 31.3 + 1) ** (1/1.99) # Zhang et al. 2015
+        Tm = 1900 * (P_arr / 31.3 + 1) ** (1/1.99) # Modified Zhang et al. 2015
         return Tm.reshape(P_arr.shape)

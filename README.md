@@ -1,11 +1,11 @@
-(!!!) IF YOU ENCOUNTER GIT LFS STORAGE ISSUES: Anyone can download a .zip file version stored here: https://drive.google.com/drive/u/1/folders/1V13BQLZ9_VKWoZQp6T5i7OXp8zreIrt7 and the following Zenodo: https://zenodo.org/records/15659606.
+(!!!) IF YOU ENCOUNTER GIT LFS STORAGE ISSUES: Anyone can download a .zip file version stored here: https://drive.google.com/drive/u/1/folders/1V13BQLZ9_VKWoZQp6T5i7OXp8zreIrt7 and the following Zenodo: https://zenodo.org/records/19556111.
 
 If you download the Google Drive zipfile: This zip file contains the entire EOS data and code presented in Tejada Arevalo et al. (2024). I realized that some users have encountered problems with Git LFS in the GitHub repository (https://github.com/Rob685/eos/tree/main), so this is another option for obtaining the EOS data. 
 
 Importantly, this is the [second release](https://zenodo.org/records/14194431) with an updated eos mixtures module called `eos_class.py`. This class handles all the available H-He-Z mixtures, with Z primarily being the water EOS of Haldemann et al (2020; AQUA). 
 
 # H-He EOS quantities for planetary evolution [![DOI](https://zenodo.org/badge/639560032.svg)](https://zenodo.org/doi/10.5281/zenodo.10659248) 
-### EOS zip downloadable file (if GIT LFS Storage is limited): [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15659606.svg)](https://doi.org/10.5281/zenodo.15659606)
+### EOS zip downloadable file (if GIT LFS Storage is limited): [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19556111.svg)](https://doi.org/10.5281/zenodo.19556111)
 
 
 This repository contains H-He EOSes from [Saumon et al. (1995; SCvH)](https://ui.adsabs.harvard.edu/abs/1995ApJS...99..713S/abstract), [Militzer & Hubbard (2013; MH13)](https://iopscience.iop.org/article/10.1088/0004-637X/774/2/148/meta), [Chabrier et al. (2019; CMS19)](https://iopscience.iop.org/article/10.3847/1538-4357/aaf99f/meta), [Chabrier & Debras (2021; CD21)](https://iopscience.iop.org/article/10.3847/1538-4357/abfc48/meta), and [Mazevet et al. (2022; MLS22)](https://www.aanda.org/articles/aa/abs/2022/08/aa35764-19/aa35764-19.html). The CMS and MLS EOSes are supplemented by the work of [Howard et al. (2023a)](https://www.aanda.org/articles/aa/pdf/2023/04/aa44851-22.pdf) to account for the non-ideal entropy and volume interactions they calculated from MH13 and CD21. Moreover, we calculate H-He-Z mixutures using a water EOS from [Haldemann et al. (2020)](https://www.aanda.org/articles/aa/full_html/2020/11/aa38367-20/aa38367-20.html), iron, and post-perovskite EOSes from Jisheng Zhang (private communication). 
