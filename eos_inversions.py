@@ -51,13 +51,13 @@ DEFAULTS = {
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -6.0,
-    'logrho_hi':  1.65,
-    'logrho_step': 0.05,
+    'logrho_hi':  1.66,
+    'logrho_step': 0.1,
 
     # S grid for square tables (SP, S-rho) — ADJUST THESE VALUES
     's_lo':       2.0,    # kb/baryon — lower entropy bound
     's_hi':       12.0,   # kb/baryon — upper entropy bound
-    's_step':     0.05,    # kb/baryon — entropy step
+    's_step':     0.1,    # kb/baryon — entropy step
 
     # ξ resolution (for xi-mapped tables only, used with --xi_transform)
     'n_xi':       150,
@@ -68,7 +68,7 @@ DEFAULTS = {
     'y_step':     0.05,
     'z_lo':       0.00,
     'z_hi':       1.0,
-    'z_step':     0.01,
+    'z_step':     0.02,
 }
 
 
