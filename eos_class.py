@@ -1115,16 +1115,16 @@ class val_mixtures:
 
         v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
-        if f_w > 0 and 'water' in self.z:
+        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
             rho_w = 10.0 ** self.z['water'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_w / rho_w
-        if f_m > 0 and 'methane' in self.z:
+        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
             rho_m = 10.0 ** self.z['methane'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_m / rho_m
-        if f_a > 0 and 'ammonia' in self.z:
+        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
             rho_a = 10.0 ** self.z['ammonia'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_a / rho_a
-        if f_r > 0 and 'mg2sio4' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
             rho_r = 10.0 ** self.z['mg2sio4'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_r / rho_r
 
@@ -1143,13 +1143,13 @@ class val_mixtures:
 
         s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
-        if f_w > 0 and 'water' in self.z:
+        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
             s_mix = s_mix + f_w * 10.0 ** self.z['water'].get_logs_pt(_lgp, _lgt)
-        if f_m > 0 and 'methane' in self.z:
+        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
             s_mix = s_mix + f_m * 10.0 ** self.z['methane'].get_logs_pt(_lgp, _lgt)
-        if f_a > 0 and 'ammonia' in self.z:
+        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
             s_mix = s_mix + f_a * 10.0 ** self.z['ammonia'].get_logs_pt(_lgp, _lgt)
-        if f_r > 0 and 'mg2sio4' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
             s_mix = s_mix + f_r * 10.0 ** self.z['mg2sio4'].get_logs_pt(_lgp, _lgt)
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
@@ -1162,15 +1162,15 @@ class val_mixtures:
 
         u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
-        if f_w > 0 and 'water' in self.z:
+        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
             u_mix = u_mix + f_w * self.z['water'].get_u_pt(_lgp, _lgt)
-        if f_m > 0 and 'methane' in self.z:
+        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
             u_mix = u_mix + f_m * self.z['methane'].get_u_pt(_lgp, _lgt)
-        if f_a > 0 and 'ammonia' in self.z:
+        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
             u_mix = u_mix + f_a * self.z['ammonia'].get_u_pt(_lgp, _lgt)
-        if f_r > 0 and 'mg2sio4' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
             u_mix = u_mix + f_r * self.z['mg2sio4'].get_u_pt(_lgp, _lgt)
-        if f_r > 0 and 'iron' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'iron' in self.z:
             u_mix = u_mix + f_r * self.z['iron'].get_u_pt(_lgp, _lgt)  # iron shares rock fraction for now
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
@@ -1410,6 +1410,7 @@ class hhe_z_mixtures():
                  pt_tab=True,
                  inv_tab=True,
                  srho_tab=False,
+                 sp_rhop_smooth=False,
                  y_prime=True,
                  xi_transform=False,
                  logp_range=(6.0, 14.0), logp_step=0.05,
@@ -1447,6 +1448,11 @@ class hhe_z_mixtures():
             ``inv_tab=True``.  Default False — the S-ρ inversion
             uses the 1-D decomposition via the ρ-T or S-P tables
             instead of the pre-computed 2-D S-ρ table.
+        sp_rhop_smooth : bool
+            Temporary flag.  If True, load the Gaussian-smoothed
+            S-P and ρ-P tables (``*_smooth.npz``) instead of the
+            default ones.  Only affects auto-loading when
+            ``inv_tab=True``.
         logp_range : tuple (lo, hi)
             log10 P [dyn/cm²] bounds for the S-P grid.
         logp_step : float
@@ -1474,6 +1480,7 @@ class hhe_z_mixtures():
         self.pt_tab = pt_tab
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
+        self.sp_rhop_smooth = sp_rhop_smooth
         self.y_prime = y_prime
         self.xi_transform = xi_transform
         self._interp_method = interp_method
@@ -1573,6 +1580,9 @@ class hhe_z_mixtures():
                     path = self._table_path(basis)
                 else:
                     path = self._table_path_square(basis)
+                # Temporary: load smoothed SP/rhoP tables
+                if self.sp_rhop_smooth and basis in ('sp', 'rhop'):
+                    path = path.replace('.npz', '_smooth.npz')
                 if os.path.isfile(path):
                     getattr(self, f'load_{basis}_table')(path)
             # S-ρ table only loaded when explicitly requested
@@ -2375,6 +2385,9 @@ class hhe_z_mixtures():
         Set ``use_tab=False`` to force per-point Newton-Raphson
         even when an S-P table is loaded.
 
+        Accepts ``_frock`` as a legacy alias for ``_zr`` (rock
+        fraction within Z).
+
         Parameters
         ----------
         _s_kb : float or array
@@ -2395,6 +2408,9 @@ class hhe_z_mixtures():
         logt : float or array
             log10 T [K].  NaN where S is outside the physical domain.
         """
+        # Legacy alias: _frock -> _zr
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
         _yp = self._to_yprime(_yp, _z)
 
         def _make_err(s_i, p_i, yp_i, z_i, zm_i, za_i, zr_i):
@@ -2477,7 +2493,13 @@ class hhe_z_mixtures():
 
     def get_logrho_sp(self, _s_kb, _lgp, _yp, _z=0.0,
                       _zm=0.0, _za=0.0, _zr=0.0, **kw):
-        """Density from (S, P) — calls get_logt_sp then forward model."""
+        """Density from (S, P) — calls get_logt_sp then forward model.
+
+        Accepts ``_frock`` as a legacy alias for ``_zr``.
+        """
+        # Legacy alias: _frock -> _zr
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
         _yp = self._to_yprime(_yp, _z)
         logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm, _za, _zr)
         logt_arr = np.atleast_1d(logt)
@@ -5507,13 +5529,17 @@ class hhe_z_mixtures():
     # in a single RGI evaluation — orders of magnitude faster than
     # the _vec per-element loop.
 
-    def _vec_fd_cp(self, lgp, lgt, yp, z, h=0.1, **kw):
-        return (self.get_s_pt_tab(lgp, lgt + h, yp, z)
-                - self.get_s_pt_tab(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
+    def _vec_fd_cp(self, lgp, lgt, yp, z, h=0.1,
+                   post_smooth_sigma=2.0, **kw):
+        result = (self.get_s_pt_tab(lgp, lgt + h, yp, z)
+                  - self.get_s_pt_tab(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_delta(self, lgp, lgt, yp, z, h=0.1, **kw):
-        return -(self.get_logrho_pt_tab(lgp, lgt + h, yp, z)
-                 - self.get_logrho_pt_tab(lgp, lgt - h, yp, z)) / (2*h)
+    def _vec_fd_delta(self, lgp, lgt, yp, z, h=0.1,
+                      post_smooth_sigma=2.0, **kw):
+        result = -(self.get_logrho_pt_tab(lgp, lgt + h, yp, z)
+                   - self.get_logrho_pt_tab(lgp, lgt - h, yp, z)) / (2*h)
+        return self._post_smooth(result, post_smooth_sigma)
 
     @staticmethod
     def _post_smooth(result, sigma):
@@ -5536,7 +5562,7 @@ class hhe_z_mixtures():
         return np.where(good, smoothed, arr)
 
     def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=0.1,
-                         post_smooth_sigma=0.0, **kw):
+                         post_smooth_sigma=2.0, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
@@ -5544,7 +5570,7 @@ class hhe_z_mixtures():
                                  post_smooth_sigma)
 
     def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=0.1,
-                       post_smooth_sigma=0.0, **kw):
+                       post_smooth_sigma=2.0, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
@@ -5554,54 +5580,72 @@ class hhe_z_mixtures():
         result = np.where(np.isfinite(result), result, np.nan)
         return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=0.1,
+                      post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
-        return (p2 - p1) / (2*h)
+        return self._post_smooth((p2 - p1) / (2*h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=0.1,
+                        post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0 - h, lgt, yp, z)
         p2 = self.get_logp_rhot(rho0 + h, lgt, yp, z)
-        return (p2 - p1) / (2*h)
+        return self._post_smooth((p2 - p1) / (2*h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_cv(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_cv(self, lgp, lgt, yp, z, h=0.1,
+                   post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
         s1 = self._s_pt(p1, lgt - h, yp, z)
         s2 = self._s_pt(p2, lgt + h, yp, z)
-        return (s2 - s1) / (2*h*log10_to_loge)
+        return self._post_smooth((s2 - s1) / (2*h*log10_to_loge),
+                                 post_smooth_sigma)
 
-    def _vec_fd_dsdy_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
-        return (self.get_s_pt_tab(lgp, lgt, yp + h, z)
-                - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2*h)
+    def _vec_fd_dsdy_pt(self, lgp, lgt, yp, z, h=0.01,
+                        post_smooth_sigma=2.0, **kw):
+        result = (self.get_s_pt_tab(lgp, lgt, yp + h, z)
+                  - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2*h)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dsdz_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
-        return (self.get_s_pt_tab(lgp, lgt, yp, z + h)
-                - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2*h)
+    def _vec_fd_dsdz_pt(self, lgp, lgt, yp, z, h=0.01,
+                        post_smooth_sigma=2.0, **kw):
+        result = (self.get_s_pt_tab(lgp, lgt, yp, z + h)
+                  - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2*h)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dtds_sp(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_dtds_sp(self, lgp, lgt, yp, z, h=0.1,
+                        post_smooth_sigma=2.0, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = 10 ** self.get_logt_sp(s_kb - h, lgp, yp, z)
         t2 = 10 ** self.get_logt_sp(s_kb + h, lgp, yp, z)
-        return (t2 - t1) / (2*h / erg_to_kbbar)
+        return self._post_smooth((t2 - t1) / (2*h / erg_to_kbbar),
+                                 post_smooth_sigma)
 
-    def _vec_fd_chi_Y(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_chi_Y(self, lgp, lgt, yp, z, h=0.01,
+                      post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt, yp - h, z)
         p2 = self.get_logp_rhot(rho0, lgt, yp + h, z)
-        return (p2 - p1) * log10_to_loge / (2*h)
+        return self._post_smooth(
+            (p2 - p1) * log10_to_loge / (2*h),
+            post_smooth_sigma)
 
-    def _vec_fd_chi_Z(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_chi_Z(self, lgp, lgt, yp, z, h=0.01,
+                      post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt, yp, z - h)
         p2 = self.get_logp_rhot(rho0, lgt, yp, z + h)
-        return (p2 - p1) * log10_to_loge / (2*h)
+        return self._post_smooth(
+            (p2 - p1) * log10_to_loge / (2*h),
+            post_smooth_sigma)
 
     def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.1,
-                          post_smooth_sigma=0.0, **kw):
+                          post_smooth_sigma=2.0, **kw):
         """dS/dY|_{ρ,P} vectorized via constrained FD with ρ-P table.
 
         At each point, finds T at constant (ρ, P) for Y ± h using
@@ -5617,7 +5661,7 @@ class hhe_z_mixtures():
                                  post_smooth_sigma)
 
     def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.1,
-                          post_smooth_sigma=0.0, **kw):
+                          post_smooth_sigma=2.0, **kw):
         """dS/dZ|_{ρ,P} vectorized via constrained FD with ρ-P table.
 
         At each point, finds T at constant (ρ, P) for Z ± h using
@@ -5632,7 +5676,8 @@ class hhe_z_mixtures():
         return self._post_smooth((s_p - s_m) / (2 * h),
                                  post_smooth_sigma)
 
-    def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dT/dY|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5651,9 +5696,11 @@ class hhe_z_mixtures():
         T = 10.0 ** lgt
         det = b*c - a*d
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
-        return T * (d*S_Y - S0*b*log10_to_loge*rho_Y) / (S0 * det)
+        result = T * (d*S_Y - S0*b*log10_to_loge*rho_Y) / (S0 * det)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dT/dZ|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5672,9 +5719,11 @@ class hhe_z_mixtures():
         T = 10.0 ** lgt
         det = b*c - a*d
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
-        return T * (d*S_Z - S0*b*log10_to_loge*rho_Z) / (S0 * det)
+        result = T * (d*S_Z - S0*b*log10_to_loge*rho_Z) / (S0 * det)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dU/dY|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5701,9 +5750,11 @@ class hhe_z_mixtures():
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
         dTdY = T * (d*S_Y - S0*b*ln10*rho_Y) / (S0 * det)
         dPdY = P * (S0*a*ln10*rho_Y - c*S_Y) / (S0 * det)
-        return U_P * dPdY/(P*ln10) + U_T * dTdY/(T*ln10) + U_Y
+        result = U_P * dPdY/(P*ln10) + U_T * dTdY/(T*ln10) + U_Y
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dU/dZ|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5730,7 +5781,8 @@ class hhe_z_mixtures():
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
         dTdZ = T * (d*S_Z - S0*b*ln10*rho_Z) / (S0 * det)
         dPdZ = P * (S0*a*ln10*rho_Z - c*S_Z) / (S0 * det)
-        return U_P * dPdZ/(P*ln10) + U_T * dTdZ/(T*ln10) + U_Z
+        result = U_P * dPdZ/(P*ln10) + U_T * dTdZ/(T*ln10) + U_Z
+        return self._post_smooth(result, post_smooth_sigma)
 
     _VEC_FD_MAP = {
         'cp': '_vec_fd_cp', 'delta': '_vec_fd_delta',
