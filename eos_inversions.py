@@ -51,13 +51,13 @@ DEFAULTS = {
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -6.0,
-    'logrho_hi':  1.65,
-    'logrho_step': 0.05,
+    'logrho_hi':  1.66,
+    'logrho_step': 0.1,
 
     # S grid for square tables (SP, S-rho) — ADJUST THESE VALUES
     's_lo':       2.0,    # kb/baryon — lower entropy bound
     's_hi':       12.0,   # kb/baryon — upper entropy bound
-    's_step':     0.05,    # kb/baryon — entropy step
+    's_step':     0.1,    # kb/baryon — entropy step
 
     # ξ resolution (for xi-mapped tables only, used with --xi_transform)
     'n_xi':       150,
@@ -68,7 +68,7 @@ DEFAULTS = {
     'y_step':     0.05,
     'z_lo':       0.00,
     'z_hi':       1.0,
-    'z_step':     0.01,
+    'z_step':     0.02,
 }
 
 
@@ -165,6 +165,13 @@ def build_parser():
                         "inversion (default: True). Set to False "
                         "to use per-point Newton-Raphson.")
 
+    # Post-inversion smoothing
+    p.add_argument('--smooth_sigma', type=float, default=0.0,
+                   help="Gaussian smoothing sigma (grid cells) "
+                        "applied to inversion tables after Hampel "
+                        "filtering along the two physical axes. "
+                        "Recommended: 0.5. (default: 0.0 = off)")
+
     # Output
     p.add_argument('--output', type=str, default=None,
                    help='Output path (default: auto from hhe_eos/z_eos)')
@@ -207,6 +214,8 @@ def main():
     if args.basis == 'srho':
         print(f"  srho basis:  {args.srho_basis}")
         print(f"  srho use_tab:{args.srho_use_tab}")
+    if args.smooth_sigma > 0:
+        print(f"  smooth_sigma:{args.smooth_sigma}")
     nY, nZ = len(yvals), len(zvals)
     print(f"  Y' grid:     [{yvals[0]:.3f}, {yvals[-1]:.3f}] step {args.y_step} ({nY} pts)")
     print(f"  Z grid:      [{zvals[0]:.3f}, {zvals[-1]:.3f}] step {args.z_step} ({nZ} pts)")
@@ -305,17 +314,20 @@ def main():
         result = eos.build_sp_table(yvals, zvals, n_xi=args.n_xi,
                                     xi_transform=args.xi_transform,
                                     s_lo=args.s_lo, s_hi=args.s_hi,
-                                    s_step=args.s_step)
+                                    s_step=args.s_step,
+                                    smooth_sigma=args.smooth_sigma)
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
         result = eos.build_rhot_table(yvals, zvals, n_xi=args.n_xi,
-                                      xi_transform=args.xi_transform)
+                                      xi_transform=args.xi_transform,
+                                      smooth_sigma=args.smooth_sigma)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':
         result = eos.build_rhop_table(yvals, zvals, n_xi=args.n_xi,
-                                      xi_transform=args.xi_transform)
+                                      xi_transform=args.xi_transform,
+                                      smooth_sigma=args.smooth_sigma)
         eos.save_rhop_table(result, path=args.output)
 
     elif args.basis == 'srho':
@@ -351,7 +363,8 @@ def main():
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
                                       basis=args.srho_basis,
-                                      use_tab=args.srho_use_tab)
+                                      use_tab=args.srho_use_tab,
+                                      smooth_sigma=args.smooth_sigma)
         eos.save_srho_table(result, path=args.output)
 
     elapsed = time.time() - t0

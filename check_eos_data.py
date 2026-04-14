@@ -47,7 +47,7 @@ def verify_eos_data(eos_dir=None):
         "The EOS data tables are missing or are unresolved Git LFS\n"
         "pointer stubs.  ORCHARD cannot run without them.\n"
         "\n"
-        "To download the EOS data from Zenodo (~9.9 GB), run:\n"
+        "To download the EOS data from Zenodo (~27 GB), run:\n"
         "\n"
         "    python setup_eos.py\n"
         "\n"

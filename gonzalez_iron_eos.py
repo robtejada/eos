@@ -94,6 +94,9 @@ class Fe_GONZALEZ_EOS:
     """
 
     erg_to_kbbar: float = ERG_GK_TO_KBBAR
+    L: float = 1.2e6 * float((u.J / u.kg).to("erg/g"))  # latent heat of fusion iron (Anderson & Duba 1997) [erg/g]
+    dyn_to_GPa = float((u.dyn / u.cm**2).to("GPa"))
+    GPa_to_dyncm2 = float(u.GPa.to("dyn/cm^2"))
     _DEFAULT_PT_TABLE = "gonzalez_iron_combined_pt.npz"
     _DEFAULT_SP_TABLE = "gonzalez_iron_combined_sp.npz"
 
@@ -539,6 +542,19 @@ class Fe_GONZALEZ_EOS:
             return self._query_sp_tab(self._sp_alpha_rgi, S_kb, P_arr)
         T = self.get_t_sp(S, P, tab=False, s_units=s_units, **kwargs)
         return self.get_alpha_pt(P_arr, T)
+
+    # ------------------------------------------------------------------
+    # Capitalized aliases expected by ORCHARD (hydrostatic.py, transport.py)
+    # ------------------------------------------------------------------
+
+    def get_T_sp(self, S, P, **kwargs):
+        return self.get_t_sp(S, P, **kwargs)
+
+    def get_CP_sp(self, S, P, **kwargs):
+        return self.get_cp_sp(S, P, **kwargs)
+
+    def get_CV_sp(self, S, P, **kwargs):
+        return self.get_cv_sp(S, P, **kwargs)
 
     # ------------------------------------------------------------------
     # Plotting

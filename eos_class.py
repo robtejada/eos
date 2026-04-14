@@ -1115,16 +1115,16 @@ class val_mixtures:
 
         v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
-        if f_w > 0 and 'water' in self.z:
+        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
             rho_w = 10.0 ** self.z['water'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_w / rho_w
-        if f_m > 0 and 'methane' in self.z:
+        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
             rho_m = 10.0 ** self.z['methane'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_m / rho_m
-        if f_a > 0 and 'ammonia' in self.z:
+        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
             rho_a = 10.0 ** self.z['ammonia'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_a / rho_a
-        if f_r > 0 and 'mg2sio4' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
             rho_r = 10.0 ** self.z['mg2sio4'].get_logrho_pt(_lgp, _lgt)
             v_mix = v_mix + f_r / rho_r
 
@@ -1143,13 +1143,13 @@ class val_mixtures:
 
         s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
-        if f_w > 0 and 'water' in self.z:
+        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
             s_mix = s_mix + f_w * 10.0 ** self.z['water'].get_logs_pt(_lgp, _lgt)
-        if f_m > 0 and 'methane' in self.z:
+        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
             s_mix = s_mix + f_m * 10.0 ** self.z['methane'].get_logs_pt(_lgp, _lgt)
-        if f_a > 0 and 'ammonia' in self.z:
+        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
             s_mix = s_mix + f_a * 10.0 ** self.z['ammonia'].get_logs_pt(_lgp, _lgt)
-        if f_r > 0 and 'mg2sio4' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
             s_mix = s_mix + f_r * 10.0 ** self.z['mg2sio4'].get_logs_pt(_lgp, _lgt)
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
@@ -1162,15 +1162,15 @@ class val_mixtures:
 
         u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
 
-        if f_w > 0 and 'water' in self.z:
+        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
             u_mix = u_mix + f_w * self.z['water'].get_u_pt(_lgp, _lgt)
-        if f_m > 0 and 'methane' in self.z:
+        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
             u_mix = u_mix + f_m * self.z['methane'].get_u_pt(_lgp, _lgt)
-        if f_a > 0 and 'ammonia' in self.z:
+        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
             u_mix = u_mix + f_a * self.z['ammonia'].get_u_pt(_lgp, _lgt)
-        if f_r > 0 and 'mg2sio4' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
             u_mix = u_mix + f_r * self.z['mg2sio4'].get_u_pt(_lgp, _lgt)
-        if f_r > 0 and 'iron' in self.z:
+        if np.any(np.asarray(f_r) > 0) and 'iron' in self.z:
             u_mix = u_mix + f_r * self.z['iron'].get_u_pt(_lgp, _lgt)  # iron shares rock fraction for now
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
@@ -1410,6 +1410,7 @@ class hhe_z_mixtures():
                  pt_tab=True,
                  inv_tab=True,
                  srho_tab=False,
+                 sp_rhop_smooth=False,
                  y_prime=True,
                  xi_transform=False,
                  logp_range=(6.0, 14.0), logp_step=0.05,
@@ -1447,6 +1448,11 @@ class hhe_z_mixtures():
             ``inv_tab=True``.  Default False — the S-ρ inversion
             uses the 1-D decomposition via the ρ-T or S-P tables
             instead of the pre-computed 2-D S-ρ table.
+        sp_rhop_smooth : bool
+            Temporary flag.  If True, load the Gaussian-smoothed
+            S-P and ρ-P tables (``*_smooth.npz``) instead of the
+            default ones.  Only affects auto-loading when
+            ``inv_tab=True``.
         logp_range : tuple (lo, hi)
             log10 P [dyn/cm²] bounds for the S-P grid.
         logp_step : float
@@ -1474,6 +1480,7 @@ class hhe_z_mixtures():
         self.pt_tab = pt_tab
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
+        self.sp_rhop_smooth = sp_rhop_smooth
         self.y_prime = y_prime
         self.xi_transform = xi_transform
         self._interp_method = interp_method
@@ -1573,6 +1580,9 @@ class hhe_z_mixtures():
                     path = self._table_path(basis)
                 else:
                     path = self._table_path_square(basis)
+                # Temporary: load smoothed SP/rhoP tables
+                if self.sp_rhop_smooth and basis in ('sp', 'rhop'):
+                    path = path.replace('.npz', '_smooth.npz')
                 if os.path.isfile(path):
                     getattr(self, f'load_{basis}_table')(path)
             # S-ρ table only loaded when explicitly requested
@@ -2375,6 +2385,9 @@ class hhe_z_mixtures():
         Set ``use_tab=False`` to force per-point Newton-Raphson
         even when an S-P table is loaded.
 
+        Accepts ``_frock`` as a legacy alias for ``_zr`` (rock
+        fraction within Z).
+
         Parameters
         ----------
         _s_kb : float or array
@@ -2395,6 +2408,9 @@ class hhe_z_mixtures():
         logt : float or array
             log10 T [K].  NaN where S is outside the physical domain.
         """
+        # Legacy alias: _frock -> _zr
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
         _yp = self._to_yprime(_yp, _z)
 
         def _make_err(s_i, p_i, yp_i, z_i, zm_i, za_i, zr_i):
@@ -2477,7 +2493,13 @@ class hhe_z_mixtures():
 
     def get_logrho_sp(self, _s_kb, _lgp, _yp, _z=0.0,
                       _zm=0.0, _za=0.0, _zr=0.0, **kw):
-        """Density from (S, P) — calls get_logt_sp then forward model."""
+        """Density from (S, P) — calls get_logt_sp then forward model.
+
+        Accepts ``_frock`` as a legacy alias for ``_zr``.
+        """
+        # Legacy alias: _frock -> _zr
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
         _yp = self._to_yprime(_yp, _z)
         logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm, _za, _zr)
         logt_arr = np.atleast_1d(logt)
@@ -2764,6 +2786,61 @@ class hhe_z_mixtures():
 
         return out
 
+    @staticmethod
+    def _hampel_nd(table, axes=None, window=5, n_sigma=3.0,
+                   verbose=True):
+        """Run Hampel outlier filter along multiple axes of an N-D table.
+
+        For each axis in *axes*, the table is reshaped so that axis is
+        the leading dimension, then ``hampel_filter_1d`` is applied to
+        every 1-D column along that axis.  Axes with fewer than
+        ``2*window + 1`` points are silently skipped.
+
+        Parameters
+        ----------
+        table : ndarray
+            N-D array to filter **in-place**.
+        axes : list of int or None
+            Axes to filter.  ``None`` means all axes.
+        window : int
+            Half-window for Hampel filter (full window = 2*window+1).
+        n_sigma : float
+            Number of MAD-scaled sigmas for outlier detection.
+        verbose : bool
+            Print per-axis outlier counts.
+
+        Returns
+        -------
+        n_total : int
+            Total number of replaced cells across all axes.
+        """
+        if axes is None:
+            axes = list(range(table.ndim))
+        n_total = 0
+        for ax in axes:
+            n_ax = table.shape[ax]
+            if n_ax < 2 * window + 1:
+                continue
+            # moveaxis returns a view; reshape may copy
+            view = np.moveaxis(table, ax, 0)
+            orig_shape = view.shape
+            flat = view.reshape(n_ax, -1).copy()
+            n_out = 0
+            for j in range(flat.shape[1]):
+                col = flat[:, j]
+                cleaned, n_rep = hampel_filter_1d(
+                    col, window=window, n_sigma=n_sigma)
+                if n_rep > 0:
+                    changed = (cleaned != col) & np.isfinite(col)
+                    flat[changed, j] = cleaned[changed]
+                    n_out += n_rep
+            # Write back
+            np.moveaxis(table, ax, 0)[:] = flat.reshape(orig_shape)
+            n_total += n_out
+            if verbose and n_out > 0:
+                print(f"  Axis {ax}: replaced {n_out} outlier cells")
+        return n_total
+
     # =================================================================
     # Table generation
     # =================================================================
@@ -2772,6 +2849,7 @@ class hhe_z_mixtures():
                        _zm=0.0, _za=0.0, _zr=0.0,
                        n_xi=None, xi_transform=None,
                        s_lo=4.0, s_hi=12.0, s_step=0.1,
+                       smooth_sigma=0.0,
                        verbose=True):
         """Build logT(S, P, Y', Z) table — square or ξ-mapped.
 
@@ -2816,6 +2894,7 @@ class hhe_z_mixtures():
             return self._build_sp_table_square(
                 yvals, zvals, _zm, _za, _zr,
                 s_lo=s_lo, s_hi=s_hi, s_step=s_step,
+                smooth_sigma=smooth_sigma,
                 verbose=verbose)
 
         if n_xi is None:
@@ -2940,21 +3019,12 @@ class hhe_z_mixtures():
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # --- Step 4: Hampel outlier filter on logT along ξ axis ---
+        # --- Step 4: Hampel outlier filter on logT along all axes ---
         if verbose:
-            print("Running Hampel outlier filter on logT along ξ axis ...")
-        flat = logt_sp.reshape(n_xi, -1)
-        n_outliers = 0
-        for j in range(flat.shape[1]):
-            col = flat[:, j]
-            cleaned, n_rep = hampel_filter_1d(
-                col, window=5, n_sigma=3.0)
-            if n_rep > 0:
-                changed = (cleaned != col) & np.isfinite(col)
-                flat[changed, j] = cleaned[changed]
-                n_outliers += n_rep
-        if n_outliers > 0 and verbose:
-            print(f"  Replaced {n_outliers} outlier cells in logT")
+            print("Running Hampel outlier filter on logT "
+                  "along all axes ...")
+        self._hampel_nd(logt_sp, axes=[0, 1, 2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
 
         # --- Step 5: cast to float32 to halve memory ---
         logt_sp_f32 = logt_sp.astype(np.float32)
@@ -2995,6 +3065,7 @@ class hhe_z_mixtures():
     def _build_sp_table_square(self, yvals, zvals,
                                _zm=0.0, _za=0.0, _zr=0.0,
                                s_lo=4.0, s_hi=12.0, s_step=0.1,
+                               smooth_sigma=0.0,
                                verbose=True):
         """Build logT on a uniform (S, logP, Y', Z) grid (no ξ mapping).
 
@@ -3002,6 +3073,10 @@ class hhe_z_mixtures():
         ----------
         s_lo, s_hi, s_step : float
             Entropy range and step in kb/baryon.
+        smooth_sigma : float
+            If > 0, apply a light Gaussian smoothing (in grid-cell
+            units) along the S and logP axes after Hampel filtering.
+            Recommended starting value: 0.5.
         """
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
@@ -3031,40 +3106,18 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        lmin, lmax = self.logt_min, self.logt_max
-        prev_logt = np.full((nS, nP), np.nan)
-
         for iy, yp in enumerate(yvals):
-            prev_logt[:] = np.nan
-
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
 
                 for ip in range(nP):
-                    lgp_i = logp[ip]
-
-                    for isv in range(nS):
-                        s_phys = svals[isv]
-
-                        def err(lgt, _s=s_phys, _p=lgp_i):
-                            try:
-                                s_test = self._s_pt(
-                                    _p, lgt, yp, zv, _zm, _za, _zr)
-                                return float(
-                                    s_test * erg_to_kbbar - _s)
-                            except (ZeroDivisionError,
-                                    FloatingPointError):
-                                return np.nan
-
-                        guess = prev_logt[isv, ip]
-                        if not np.isfinite(guess):
-                            guess = 0.5 * (lmin + lmax)
-                        lgt_sol, ok = self._newton_1d(
-                            err, guess, 1.5, 7.0)
-                        if np.isfinite(lgt_sol):
-                            logt_sp[isv, ip, iy, iz] = lgt_sol
-                            prev_logt[isv, ip] = lgt_sol
+                    lgp_arr = np.full(nS, logp[ip])
+                    lgt_col = self.get_logt_sp(
+                        svals, lgp_arr, yp, zv,
+                        _zm=_zm, _za=_za, _zr=_zr,
+                        use_tab=False)
+                    logt_sp[:, ip, iy, iz] = np.atleast_1d(lgt_col)
 
         pbar.close()
 
@@ -3080,21 +3133,29 @@ class hhe_z_mixtures():
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # --- Hampel outlier filter on logT along S axis ---
+        # --- Hampel outlier filter on logT along all axes ---
         if verbose:
-            print("Running Hampel outlier filter on logT along S axis ...")
-        flat = logt_sp.reshape(nS, -1)
-        n_outliers = 0
-        for j in range(flat.shape[1]):
-            col = flat[:, j]
-            cleaned, n_rep = hampel_filter_1d(
-                col, window=5, n_sigma=3.0)
-            if n_rep > 0:
-                changed = (cleaned != col) & np.isfinite(col)
-                flat[changed, j] = cleaned[changed]
-                n_outliers += n_rep
-        if n_outliers > 0 and verbose:
-            print(f"  Replaced {n_outliers} outlier cells in logT")
+            print("Running Hampel outlier filter on logT "
+                  "along all axes ...")
+        self._hampel_nd(logt_sp, axes=[0, 1, 2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
+
+        # --- Optional Gaussian smoothing along S and P axes ---
+        if smooth_sigma > 0:
+            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
+            mask = np.isfinite(logt_sp)
+            filled = np.where(mask, logt_sp, 0.0)
+            weight = mask.astype(float)
+            smoothed = gaussian_filter(filled, sigma=sigma_4d,
+                                       mode='nearest')
+            weight_s = gaussian_filter(weight, sigma=sigma_4d,
+                                       mode='nearest')
+            logt_sp = np.where(
+                mask, smoothed / np.maximum(weight_s, 1e-10),
+                np.nan)
+            if verbose:
+                print(f"Applied Gaussian smoothing with "
+                      f"sigma={sigma_4d}")
 
         # --- Cast to float32 ---
         logt_sp_f32 = logt_sp.astype(np.float32)
@@ -3340,6 +3401,7 @@ class hhe_z_mixtures():
     def build_rhot_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          n_xi=None, xi_transform=None,
+                         smooth_sigma=0.0,
                          verbose=True):
         """Build logP(logrho, logT, Y', Z) table — square or ξ-mapped.
 
@@ -3349,13 +3411,17 @@ class hhe_z_mixtures():
             False (default): square table on (logrho, logT, Y', Z).
             True: ξ-mapped adaptive table.
             None: falls back to ``self.xi_transform``.
+        smooth_sigma : float
+            If > 0, apply light Gaussian smoothing after Hampel.
         """
         if xi_transform is None:
             xi_transform = self.xi_transform
 
         if not xi_transform:
             return self._build_rhot_table_square(
-                yvals, zvals, _zm, _za, _zr, verbose=verbose)
+                yvals, zvals, _zm, _za, _zr,
+                smooth_sigma=smooth_sigma,
+                verbose=verbose)
 
         if n_xi is None:
             n_xi = self.n_xi
@@ -3445,21 +3511,12 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
 
-        # Step 4: Hampel outlier filter on logP along ξ axis
+        # Step 4: Hampel outlier filter on logP along all axes
         if verbose:
-            print("Running Hampel outlier filter on logP along ξ axis ...")
-        flat = logp_tab.reshape(n_xi, -1)
-        n_outliers = 0
-        for j in range(flat.shape[1]):
-            col = flat[:, j]
-            cleaned, n_rep = hampel_filter_1d(
-                col, window=5, n_sigma=3.0)
-            if n_rep > 0:
-                changed = (cleaned != col) & np.isfinite(col)
-                flat[changed, j] = cleaned[changed]
-                n_outliers += n_rep
-        if n_outliers > 0 and verbose:
-            print(f"  Replaced {n_outliers} outlier cells in logP")
+            print("Running Hampel outlier filter on logP "
+                  "along all axes ...")
+        self._hampel_nd(logp_tab, axes=[0, 1, 2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
 
         logp_f32 = logp_tab.astype(np.float32)
 
@@ -3498,8 +3555,16 @@ class hhe_z_mixtures():
 
     def _build_rhot_table_square(self, yvals, zvals,
                                   _zm=0.0, _za=0.0, _zr=0.0,
+                                  smooth_sigma=0.0,
                                   verbose=True):
-        """Build logP on a uniform (logrho, logT, Y', Z) grid."""
+        """Build logP on a uniform (logrho, logT, Y', Z) grid.
+
+        Parameters
+        ----------
+        smooth_sigma : float
+            If > 0, apply a light Gaussian smoothing (in grid-cell
+            units) along the rho and logT axes after Hampel filtering.
+        """
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
         logrho = self.logrho_vals
@@ -3524,37 +3589,19 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        prev_logp = np.full((nR, nT), np.nan)
-
         for iy, yp in enumerate(yvals):
-            prev_logp[:] = np.nan
-
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
 
                 for it in range(nT):
-                    lgt_i = logt[it]
-                    for ir in range(nR):
-                        rho_target = logrho[ir]
-
-                        def err(lgp, _rho=rho_target, _t=lgt_i):
-                            try:
-                                rho_test = self._logrho_pt(
-                                    lgp, _t, yp, zv, _zm, _za, _zr)
-                                return float(rho_test - _rho)
-                            except (ZeroDivisionError,
-                                    FloatingPointError):
-                                return np.nan
-
-                        guess = prev_logp[ir, it]
-                        if not np.isfinite(guess):
-                            guess = 0.5 * (lgp_lo + lgp_hi)
-                        lgp_sol, ok = self._newton_1d(
-                            err, guess, lgp_lo, lgp_hi)
-                        if np.isfinite(lgp_sol):
-                            logp_tab[ir, it, iy, iz] = lgp_sol
-                            prev_logp[ir, it] = lgp_sol
+                    lgt_arr = np.full(nR, logt[it])
+                    lgp_col = self.get_logp_rhot(
+                        logrho, lgt_arr, yp, zv,
+                        _zm=_zm, _za=_za, _zr=_zr,
+                        use_tab=False)
+                    logp_tab[:, it, iy, iz] = np.atleast_1d(
+                        lgp_col)
 
         pbar.close()
 
@@ -3565,21 +3612,29 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
 
-        # --- Hampel outlier filter along rho axis ---
+        # --- Hampel outlier filter on logP along all axes ---
         if verbose:
-            print("Running Hampel outlier filter on logP along rho axis ...")
-        flat = logp_tab.reshape(nR, -1)
-        n_outliers = 0
-        for j in range(flat.shape[1]):
-            col = flat[:, j]
-            cleaned, n_rep = hampel_filter_1d(
-                col, window=5, n_sigma=3.0)
-            if n_rep > 0:
-                changed = (cleaned != col) & np.isfinite(col)
-                flat[changed, j] = cleaned[changed]
-                n_outliers += n_rep
-        if n_outliers > 0 and verbose:
-            print(f"  Replaced {n_outliers} outlier cells in logP")
+            print("Running Hampel outlier filter on logP "
+                  "along all axes ...")
+        self._hampel_nd(logp_tab, axes=[0, 1, 2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
+
+        # --- Optional Gaussian smoothing along rho and T axes ---
+        if smooth_sigma > 0:
+            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
+            mask = np.isfinite(logp_tab)
+            filled = np.where(mask, logp_tab, 0.0)
+            weight = mask.astype(float)
+            smoothed = gaussian_filter(filled, sigma=sigma_4d,
+                                       mode='nearest')
+            weight_s = gaussian_filter(weight, sigma=sigma_4d,
+                                       mode='nearest')
+            logp_tab = np.where(
+                mask, smoothed / np.maximum(weight_s, 1e-10),
+                np.nan)
+            if verbose:
+                print(f"Applied Gaussian smoothing with "
+                      f"sigma={sigma_4d}")
 
         logp_f32 = logp_tab.astype(np.float32)
 
@@ -3849,6 +3904,7 @@ class hhe_z_mixtures():
     def build_rhop_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          n_xi=None, xi_transform=None,
+                         smooth_sigma=0.0,
                          verbose=True):
         """Build logT(logrho, logP, Y', Z) table — square or ξ-mapped.
 
@@ -3858,13 +3914,17 @@ class hhe_z_mixtures():
             False (default): square table on (logrho, logP, Y', Z).
             True: ξ-mapped adaptive table.
             None: falls back to ``self.xi_transform``.
+        smooth_sigma : float
+            If > 0, apply light Gaussian smoothing after Hampel.
         """
         if xi_transform is None:
             xi_transform = self.xi_transform
 
         if not xi_transform:
             return self._build_rhop_table_square(
-                yvals, zvals, _zm, _za, _zr, verbose=verbose)
+                yvals, zvals, _zm, _za, _zr,
+                smooth_sigma=smooth_sigma,
+                verbose=verbose)
 
         if n_xi is None:
             n_xi = self.n_xi
@@ -3952,21 +4012,12 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # Step 4: Hampel outlier filter on logT along ξ axis
+        # Step 4: Hampel outlier filter on logT along all axes
         if verbose:
-            print("Running Hampel outlier filter on logT along ξ axis ...")
-        flat = logt_tab.reshape(n_xi, -1)
-        n_outliers = 0
-        for j in range(flat.shape[1]):
-            col = flat[:, j]
-            cleaned, n_rep = hampel_filter_1d(
-                col, window=5, n_sigma=3.0)
-            if n_rep > 0:
-                changed = (cleaned != col) & np.isfinite(col)
-                flat[changed, j] = cleaned[changed]
-                n_outliers += n_rep
-        if n_outliers > 0 and verbose:
-            print(f"  Replaced {n_outliers} outlier cells in logT")
+            print("Running Hampel outlier filter on logT "
+                  "along all axes ...")
+        self._hampel_nd(logt_tab, axes=[0, 1, 2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
 
         logt_f32 = logt_tab.astype(np.float32)
         rho_lo_f32 = rho_lo.astype(np.float32)
@@ -4052,8 +4103,16 @@ class hhe_z_mixtures():
 
     def _build_rhop_table_square(self, yvals, zvals,
                                   _zm=0.0, _za=0.0, _zr=0.0,
+                                  smooth_sigma=0.0,
                                   verbose=True):
-        """Build logT on a uniform (logrho, logP, Y', Z) grid."""
+        """Build logT on a uniform (logrho, logP, Y', Z) grid.
+
+        Parameters
+        ----------
+        smooth_sigma : float
+            If > 0, apply a light Gaussian smoothing (in grid-cell
+            units) along the rho and logP axes after Hampel filtering.
+        """
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
         logrho = self.logrho_vals
@@ -4077,37 +4136,24 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        prev_logt = np.full((nR, nP), np.nan)
+        # Temporarily disable rhoP table to force Newton path
+        saved_rgi = self._logt_rhop_rgi
+        self._logt_rhop_rgi = None
+        try:
+            for iy, yp in enumerate(yvals):
+                for iz, zv in enumerate(zvals):
+                    pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                    pbar.update(1)
 
-        for iy, yp in enumerate(yvals):
-            prev_logt[:] = np.nan
-
-            for iz, zv in enumerate(zvals):
-                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
-                pbar.update(1)
-
-                for ip in range(nP):
-                    lgp_i = logp[ip]
-                    for ir in range(nR):
-                        rho_target = logrho[ir]
-
-                        def err(lgt, _rho=rho_target, _p=lgp_i):
-                            try:
-                                return float(self._logrho_pt(
-                                    _p, lgt, yp, zv, _zm, _za, _zr)
-                                    - _rho)
-                            except (ZeroDivisionError,
-                                    FloatingPointError):
-                                return np.nan
-
-                        guess = prev_logt[ir, ip]
-                        if not np.isfinite(guess):
-                            guess = 0.5 * (1.5 + 7.0)
-                        lgt_sol, ok = self._newton_1d(
-                            err, guess, 1.5, 7.0)
-                        if np.isfinite(lgt_sol):
-                            logt_tab[ir, ip, iy, iz] = lgt_sol
-                            prev_logt[ir, ip] = lgt_sol
+                    for ip in range(nP):
+                        lgp_arr = np.full(nR, logp[ip])
+                        lgt_col = self._logt_rhop_noconv(
+                            logrho, lgp_arr, yp, zv,
+                            _zm=_zm, _za=_za, _zr=_zr)
+                        logt_tab[:, ip, iy, iz] = np.atleast_1d(
+                            lgt_col)
+        finally:
+            self._logt_rhop_rgi = saved_rgi
 
         pbar.close()
 
@@ -4118,21 +4164,29 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # --- Hampel outlier filter along rho axis ---
+        # --- Hampel outlier filter on logT along all axes ---
         if verbose:
-            print("Running Hampel outlier filter on logT along rho axis ...")
-        flat = logt_tab.reshape(nR, -1)
-        n_outliers = 0
-        for j in range(flat.shape[1]):
-            col = flat[:, j]
-            cleaned, n_rep = hampel_filter_1d(
-                col, window=5, n_sigma=3.0)
-            if n_rep > 0:
-                changed = (cleaned != col) & np.isfinite(col)
-                flat[changed, j] = cleaned[changed]
-                n_outliers += n_rep
-        if n_outliers > 0 and verbose:
-            print(f"  Replaced {n_outliers} outlier cells in logT")
+            print("Running Hampel outlier filter on logT "
+                  "along all axes ...")
+        self._hampel_nd(logt_tab, axes=[0, 1, 2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
+
+        # --- Optional Gaussian smoothing along rho and P axes ---
+        if smooth_sigma > 0:
+            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
+            mask = np.isfinite(logt_tab)
+            filled = np.where(mask, logt_tab, 0.0)
+            weight = mask.astype(float)
+            smoothed = gaussian_filter(filled, sigma=sigma_4d,
+                                       mode='nearest')
+            weight_s = gaussian_filter(weight, sigma=sigma_4d,
+                                       mode='nearest')
+            logt_tab = np.where(
+                mask, smoothed / np.maximum(weight_s, 1e-10),
+                np.nan)
+            if verbose:
+                print(f"Applied Gaussian smoothing with "
+                      f"sigma={sigma_4d}")
 
         logt_f32 = logt_tab.astype(np.float32)
 
@@ -4537,6 +4591,7 @@ class hhe_z_mixtures():
                          n_xi=None, xi_transform=None,
                          s_lo=4.0, s_hi=12.0, s_step=0.1,
                          basis='rhot', use_tab=True,
+                         smooth_sigma=0.0,
                          verbose=True):
         """Build logP and logT tables on (S, logrho, Y', Z) — square or ξ.
 
@@ -4552,6 +4607,8 @@ class hhe_z_mixtures():
             ``'rhot'`` (default) or ``'sp'``: 1-D decomposition basis.
         use_tab : bool, optional
             Use pre-computed tables for the inner inversion.
+        smooth_sigma : float
+            If > 0, apply light Gaussian smoothing after Hampel.
         """
         if xi_transform is None:
             xi_transform = self.xi_transform
@@ -4560,7 +4617,9 @@ class hhe_z_mixtures():
             return self._build_srho_table_square(
                 yvals, zvals, _zm, _za, _zr,
                 s_lo=s_lo, s_hi=s_hi, s_step=s_step,
-                basis=basis, use_tab=use_tab, verbose=verbose)
+                basis=basis, use_tab=use_tab,
+                smooth_sigma=smooth_sigma,
+                verbose=verbose)
 
         use_rhot = (basis == 'rhot')
         if use_tab:
@@ -4687,45 +4746,13 @@ class hhe_z_mixtures():
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # Step 4a: Hampel outlier filter along ξ axis
+        # Step 4: Hampel outlier filter along all axes
         for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
             if verbose:
                 print(f"Running Hampel outlier filter on {label} "
-                      f"along ξ axis ...")
-            flat = arr.reshape(n_xi, -1)
-            n_out = 0
-            for j in range(flat.shape[1]):
-                col = flat[:, j]
-                cleaned, n_rep = hampel_filter_1d(
-                    col, window=5, n_sigma=3.0)
-                if n_rep > 0:
-                    changed = (cleaned != col) & np.isfinite(col)
-                    flat[changed, j] = cleaned[changed]
-                    n_out += n_rep
-            if n_out > 0 and verbose:
-                print(f"  Replaced {n_out} outlier cells in {label}")
-
-        # Step 4b: Hampel outlier filter along ρ axis
-        # NaN-filled cells can be consistent along ξ but create
-        # cross-ρ artifacts that produce temperature inversions
-        # when sweeping ρ at fixed S.
-        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
-            if verbose:
-                print(f"Running Hampel outlier filter on {label} "
-                      f"along ρ axis ...")
-            n_out = 0
-            for ixi in range(n_xi):
-                for iy in range(nY):
-                    for iz in range(nZ):
-                        col = arr[ixi, :, iy, iz]
-                        cleaned, n_rep = hampel_filter_1d(
-                            col, window=5, n_sigma=3.0)
-                        if n_rep > 0:
-                            changed = (cleaned != col) & np.isfinite(col)
-                            col[changed] = cleaned[changed]
-                            n_out += n_rep
-            if n_out > 0 and verbose:
-                print(f"  Replaced {n_out} outlier cells in {label}")
+                      f"along all axes ...")
+            self._hampel_nd(arr, axes=[0, 1, 2, 3],
+                            window=5, n_sigma=3.0, verbose=verbose)
 
         # Step 5: enforce monotonicity along ξ
         # Physical constraint: at fixed (ρ, Y', Z), higher S (higher ξ)
@@ -4844,8 +4871,16 @@ class hhe_z_mixtures():
                                   _zm=0.0, _za=0.0, _zr=0.0,
                                   s_lo=4.0, s_hi=12.0, s_step=0.1,
                                   basis='rhot', use_tab=True,
+                                  smooth_sigma=0.0,
                                   verbose=True):
-        """Build logP, logT on a uniform (S, logrho, Y', Z) grid."""
+        """Build logP, logT on a uniform (S, logrho, Y', Z) grid.
+
+        Parameters
+        ----------
+        smooth_sigma : float
+            If > 0, apply a light Gaussian smoothing (in grid-cell
+            units) along the S and rho axes after Hampel filtering.
+        """
         use_rhot = (basis == 'rhot')
 
         if use_tab:
@@ -4936,42 +4971,33 @@ class hhe_z_mixtures():
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # --- Hampel outlier filter along S axis ---
+        # --- Hampel outlier filter along all axes ---
         for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
             if verbose:
                 print(f"Running Hampel outlier filter on {label} "
-                      f"along S axis ...")
-            flat = arr.reshape(nS, -1)
-            n_out = 0
-            for j in range(flat.shape[1]):
-                col = flat[:, j]
-                cleaned, n_rep = hampel_filter_1d(
-                    col, window=5, n_sigma=3.0)
-                if n_rep > 0:
-                    changed = (cleaned != col) & np.isfinite(col)
-                    flat[changed, j] = cleaned[changed]
-                    n_out += n_rep
-            if n_out > 0 and verbose:
-                print(f"  Replaced {n_out} outlier cells in {label}")
+                      f"along all axes ...")
+            self._hampel_nd(arr, axes=[0, 1, 2, 3],
+                            window=5, n_sigma=3.0, verbose=verbose)
 
-        # --- Hampel along rho axis ---
-        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
+        # --- Optional Gaussian smoothing along S and rho axes ---
+        if smooth_sigma > 0:
+            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
+            for arr, label in [(logp_tab, 'logP'),
+                               (logt_tab, 'logT')]:
+                mask = np.isfinite(arr)
+                filled = np.where(mask, arr, 0.0)
+                weight = mask.astype(float)
+                smoothed = gaussian_filter(
+                    filled, sigma=sigma_4d, mode='nearest')
+                weight_s = gaussian_filter(
+                    weight, sigma=sigma_4d, mode='nearest')
+                arr[:] = np.where(
+                    mask,
+                    smoothed / np.maximum(weight_s, 1e-10),
+                    np.nan)
             if verbose:
-                print(f"Running Hampel outlier filter on {label} "
-                      f"along rho axis ...")
-            n_out = 0
-            for isv in range(nS):
-                for iy in range(nY):
-                    for iz in range(nZ):
-                        col = arr[isv, :, iy, iz]
-                        cleaned, n_rep = hampel_filter_1d(
-                            col, window=5, n_sigma=3.0)
-                        if n_rep > 0:
-                            changed = (cleaned != col) & np.isfinite(col)
-                            col[changed] = cleaned[changed]
-                            n_out += n_rep
-            if n_out > 0 and verbose:
-                print(f"  Replaced {n_out} outlier cells in {label}")
+                print(f"Applied Gaussian smoothing with "
+                      f"sigma={sigma_4d}")
 
         logp_f32 = logp_tab.astype(np.float32)
         logt_f32 = logt_tab.astype(np.float32)
@@ -5503,76 +5529,123 @@ class hhe_z_mixtures():
     # in a single RGI evaluation — orders of magnitude faster than
     # the _vec per-element loop.
 
-    def _vec_fd_cp(self, lgp, lgt, yp, z, h=0.1, **kw):
-        return (self.get_s_pt_tab(lgp, lgt + h, yp, z)
-                - self.get_s_pt_tab(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
+    def _vec_fd_cp(self, lgp, lgt, yp, z, h=0.1,
+                   post_smooth_sigma=2.0, **kw):
+        result = (self.get_s_pt_tab(lgp, lgt + h, yp, z)
+                  - self.get_s_pt_tab(lgp, lgt - h, yp, z)) / (2*h*log10_to_loge)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_delta(self, lgp, lgt, yp, z, h=0.1, **kw):
-        return -(self.get_logrho_pt_tab(lgp, lgt + h, yp, z)
-                 - self.get_logrho_pt_tab(lgp, lgt - h, yp, z)) / (2*h)
+    def _vec_fd_delta(self, lgp, lgt, yp, z, h=0.1,
+                      post_smooth_sigma=2.0, **kw):
+        result = -(self.get_logrho_pt_tab(lgp, lgt + h, yp, z)
+                   - self.get_logrho_pt_tab(lgp, lgt - h, yp, z)) / (2*h)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=0.1, **kw):
+    @staticmethod
+    def _post_smooth(result, sigma):
+        """Apply 1-D Gaussian smoothing to a derivative array.
+
+        NaN-safe: NaN positions are filled with the median before
+        smoothing and restored afterwards.
+        """
+        if sigma <= 0:
+            return result
+        arr = np.asarray(result)
+        if arr.ndim < 1 or arr.size <= 3:
+            return result
+        good = np.isfinite(arr)
+        if good.sum() <= 3:
+            return result
+        fill_val = np.nanmedian(arr)
+        filled = np.where(good, arr, fill_val)
+        smoothed = gaussian_filter1d(filled, sigma=sigma)
+        return np.where(good, smoothed, arr)
+
+    def _vec_fd_nabla_ad(self, lgp, lgt, yp, z, h=0.1,
+                         post_smooth_sigma=2.0, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
-        return (t2 - t1) / (2*h)
+        return self._post_smooth((t2 - t1) / (2*h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_gamma1(self, lgp, lgt, yp, z, h=0.1,
+                       post_smooth_sigma=2.0, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = self.get_logt_sp(s_kb, lgp - h, yp, z)
         t2 = self.get_logt_sp(s_kb, lgp + h, yp, z)
         r1 = self._logrho_pt(lgp - h, t1, yp, z)
         r2 = self._logrho_pt(lgp + h, t2, yp, z)
         result = (2*h) / (r2 - r1)
-        return np.where(np.isfinite(result), result, np.nan)
+        result = np.where(np.isfinite(result), result, np.nan)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_chi_T(self, lgp, lgt, yp, z, h=0.1,
+                      post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
-        return (p2 - p1) / (2*h)
+        return self._post_smooth((p2 - p1) / (2*h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_chi_rho(self, lgp, lgt, yp, z, h=0.1,
+                        post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0 - h, lgt, yp, z)
         p2 = self.get_logp_rhot(rho0 + h, lgt, yp, z)
-        return (p2 - p1) / (2*h)
+        return self._post_smooth((p2 - p1) / (2*h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_cv(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_cv(self, lgp, lgt, yp, z, h=0.1,
+                   post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt - h, yp, z)
         p2 = self.get_logp_rhot(rho0, lgt + h, yp, z)
         s1 = self._s_pt(p1, lgt - h, yp, z)
         s2 = self._s_pt(p2, lgt + h, yp, z)
-        return (s2 - s1) / (2*h*log10_to_loge)
+        return self._post_smooth((s2 - s1) / (2*h*log10_to_loge),
+                                 post_smooth_sigma)
 
-    def _vec_fd_dsdy_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
-        return (self.get_s_pt_tab(lgp, lgt, yp + h, z)
-                - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2*h)
+    def _vec_fd_dsdy_pt(self, lgp, lgt, yp, z, h=0.01,
+                        post_smooth_sigma=2.0, **kw):
+        result = (self.get_s_pt_tab(lgp, lgt, yp + h, z)
+                  - self.get_s_pt_tab(lgp, lgt, yp - h, z)) / (2*h)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dsdz_pt(self, lgp, lgt, yp, z, h=0.01, **kw):
-        return (self.get_s_pt_tab(lgp, lgt, yp, z + h)
-                - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2*h)
+    def _vec_fd_dsdz_pt(self, lgp, lgt, yp, z, h=0.01,
+                        post_smooth_sigma=2.0, **kw):
+        result = (self.get_s_pt_tab(lgp, lgt, yp, z + h)
+                  - self.get_s_pt_tab(lgp, lgt, yp, z - h)) / (2*h)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dtds_sp(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_dtds_sp(self, lgp, lgt, yp, z, h=0.1,
+                        post_smooth_sigma=2.0, **kw):
         s_kb = self.get_s_pt_tab(lgp, lgt, yp, z) * erg_to_kbbar
         t1 = 10 ** self.get_logt_sp(s_kb - h, lgp, yp, z)
         t2 = 10 ** self.get_logt_sp(s_kb + h, lgp, yp, z)
-        return (t2 - t1) / (2*h / erg_to_kbbar)
+        return self._post_smooth((t2 - t1) / (2*h / erg_to_kbbar),
+                                 post_smooth_sigma)
 
-    def _vec_fd_chi_Y(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_chi_Y(self, lgp, lgt, yp, z, h=0.01,
+                      post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt, yp - h, z)
         p2 = self.get_logp_rhot(rho0, lgt, yp + h, z)
-        return (p2 - p1) * log10_to_loge / (2*h)
+        return self._post_smooth(
+            (p2 - p1) * log10_to_loge / (2*h),
+            post_smooth_sigma)
 
-    def _vec_fd_chi_Z(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_chi_Z(self, lgp, lgt, yp, z, h=0.01,
+                      post_smooth_sigma=2.0, **kw):
         rho0 = self.get_logrho_pt_tab(lgp, lgt, yp, z)
         p1 = self.get_logp_rhot(rho0, lgt, yp, z - h)
         p2 = self.get_logp_rhot(rho0, lgt, yp, z + h)
-        return (p2 - p1) * log10_to_loge / (2*h)
+        return self._post_smooth(
+            (p2 - p1) * log10_to_loge / (2*h),
+            post_smooth_sigma)
 
-    def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_dsdy_rhop(self, lgp, lgt, yp, z, h=0.1,
+                          post_smooth_sigma=2.0, **kw):
         """dS/dY|_{ρ,P} vectorized via constrained FD with ρ-P table.
 
         At each point, finds T at constant (ρ, P) for Y ± h using
@@ -5584,9 +5657,11 @@ class hhe_z_mixtures():
         lgt_m = self._logt_rhop_noconv(rho0, lgp, yp - h, z)
         s_p = self._s_pt(lgp, lgt_p, yp + h, z)
         s_m = self._s_pt(lgp, lgt_m, yp - h, z)
-        return (s_p - s_m) / (2 * h)
+        return self._post_smooth((s_p - s_m) / (2 * h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.1, **kw):
+    def _vec_fd_dsdz_rhop(self, lgp, lgt, yp, z, h=0.1,
+                          post_smooth_sigma=2.0, **kw):
         """dS/dZ|_{ρ,P} vectorized via constrained FD with ρ-P table.
 
         At each point, finds T at constant (ρ, P) for Z ± h using
@@ -5598,9 +5673,11 @@ class hhe_z_mixtures():
         lgt_m = self._logt_rhop_noconv(rho0, lgp, yp, z - h)
         s_p = self._s_pt(lgp, lgt_p, yp, z + h)
         s_m = self._s_pt(lgp, lgt_m, yp, z - h)
-        return (s_p - s_m) / (2 * h)
+        return self._post_smooth((s_p - s_m) / (2 * h),
+                                 post_smooth_sigma)
 
-    def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dtdy_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dT/dY|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5619,9 +5696,11 @@ class hhe_z_mixtures():
         T = 10.0 ** lgt
         det = b*c - a*d
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
-        return T * (d*S_Y - S0*b*log10_to_loge*rho_Y) / (S0 * det)
+        result = T * (d*S_Y - S0*b*log10_to_loge*rho_Y) / (S0 * det)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dtdz_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dT/dZ|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5640,9 +5719,11 @@ class hhe_z_mixtures():
         T = 10.0 ** lgt
         det = b*c - a*d
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
-        return T * (d*S_Z - S0*b*log10_to_loge*rho_Z) / (S0 * det)
+        result = T * (d*S_Z - S0*b*log10_to_loge*rho_Z) / (S0 * det)
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dudy_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dU/dY|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5669,9 +5750,11 @@ class hhe_z_mixtures():
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
         dTdY = T * (d*S_Y - S0*b*ln10*rho_Y) / (S0 * det)
         dPdY = P * (S0*a*ln10*rho_Y - c*S_Y) / (S0 * det)
-        return U_P * dPdY/(P*ln10) + U_T * dTdY/(T*ln10) + U_Y
+        result = U_P * dPdY/(P*ln10) + U_T * dTdY/(T*ln10) + U_Y
+        return self._post_smooth(result, post_smooth_sigma)
 
-    def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01, **kw):
+    def _vec_fd_dudz_srho(self, lgp, lgt, yp, z, h=0.01,
+                          post_smooth_sigma=2.0, **kw):
         """dU/dZ|_{S,ρ} vectorized via identity."""
         ht, hp = 0.1, 0.1
         S0 = self.get_s_pt_tab(lgp, lgt, yp, z)
@@ -5698,7 +5781,8 @@ class hhe_z_mixtures():
         det = np.where(np.abs(det) < 1e-20, 1e-20, det)
         dTdZ = T * (d*S_Z - S0*b*ln10*rho_Z) / (S0 * det)
         dPdZ = P * (S0*a*ln10*rho_Z - c*S_Z) / (S0 * det)
-        return U_P * dPdZ/(P*ln10) + U_T * dTdZ/(T*ln10) + U_Z
+        result = U_P * dPdZ/(P*ln10) + U_T * dTdZ/(T*ln10) + U_Z
+        return self._post_smooth(result, post_smooth_sigma)
 
     _VEC_FD_MAP = {
         'cp': '_vec_fd_cp', 'delta': '_vec_fd_delta',
