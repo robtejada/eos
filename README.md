@@ -1,10 +1,10 @@
 (!!!) IF YOU ENCOUNTER GIT LFS STORAGE ISSUES: Anyone can download a .zip file version stored here: https://drive.google.com/drive/u/1/folders/1V13BQLZ9_VKWoZQp6T5i7OXp8zreIrt7 and the following Zenodo: https://zenodo.org/records/19556111.
 
-If you download the Google Drive zipfile: This zip file contains the entire EOS data and code presented in Tejada Arevalo et al. (2024). I realized that some users have encountered problems with Git LFS in the GitHub repository (https://github.com/Rob685/eos/tree/main), so this is another option for obtaining the EOS data. 
+If you download the Google Drive zip file, it contains the entire EOS data and code presented in Tejada Arevalo et al. (2024). I realized that some users have encountered problems with Git LFS in the GitHub repository (https://github.com/Rob685/eos/tree/main), so this is another option for obtaining the EOS data. 
 
-Importantly, this is the [second release](https://zenodo.org/records/14194431) with an updated eos mixtures module called `eos_class.py`. This class handles all the available H-He-Z mixtures, with Z primarily being the water EOS of Haldemann et al (2020; AQUA). 
+Importantly, this is the [second release](https://zenodo.org/records/19556111) with an updated eos mixtures module called `eos_class.py`. This class handles all the available H-He-Z mixtures, with Z primarily being the water EOS of Haldemann et al (2020; AQUA). 
 
-# H-He EOS quantities for planetary evolution [![DOI](https://zenodo.org/badge/639560032.svg)](https://zenodo.org/doi/10.5281/zenodo.10659248) 
+# H-He EOS quantities for planetary evolution [![DOI](https://zenodo.org/badge/639560032.svg)](https://zenodo.org/doi/10.5281/zenodo.19556111) 
 ### EOS zip downloadable file (if GIT LFS Storage is limited): [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19556111.svg)](https://doi.org/10.5281/zenodo.19556111)
 
 
