@@ -29,6 +29,31 @@ from astropy import units as u
 ArrayLike = Union[float, int, np.ndarray]
 
 
+def _nan_guard_interp(a):
+    """Fill NaNs in `a` by linear interpolation along the last axis.
+
+    Interior NaNs are linearly interpolated from neighboring finite values.
+    Edge NaNs are held flat to the nearest finite value (np.interp default).
+    If a row is entirely non-finite, it is left unchanged.
+    """
+    a = np.asarray(a, dtype=float)
+    if a.ndim == 0 or not np.any(~np.isfinite(a)):
+        return a
+
+    def _fix_1d(row):
+        mask = np.isfinite(row)
+        if not mask.any() or mask.all():
+            return row
+        idx = np.arange(row.size)
+        row = row.copy()
+        row[~mask] = np.interp(idx[~mask], idx[mask], row[mask])
+        return row
+
+    if a.ndim == 1:
+        return _fix_1d(a)
+    return np.apply_along_axis(_fix_1d, -1, a)
+
+
 # ---------------------------------------------------------------------
 # P-T table smoothing
 # ---------------------------------------------------------------------
@@ -141,12 +166,14 @@ class MG2SIO4_ANEOS_EOS:
         # rhot_grids_path: str = "eos/aneos/forsterite_eos_grids.npy",
 
         rhot_table_path: str = "eos/rock_eos/mg2sio4_aneos_RHOT.npz",
-        # ------------------------------------------------------------------
-        # TODO (user): replace these placeholders with regenerated PT/SP grids
-        # after inverting/saving updated forsterite ANEOS tables.
-        # ------------------------------------------------------------------
-        pt_table_path: str = "eos/rock_eos/mg2sio4_aneos_PT.npz",
-        sp_table_path: str = "eos/rock_eos/mg2sio4_aneos_SP.npz",
+        # Legacy placeholder PT/SP grids cap at P=1000 GPa and their linear
+        # extrapolation loses PT<->SP consistency above that. Pass
+        # extended_tab=True (the default) to load the regenerated
+        # PT_extended / SP_extended files built by build_mg2sio4_extended_tables.py.
+        # Pass explicit paths (or "" to skip loading) to override.
+        pt_table_path: Optional[str] = None,
+        sp_table_path: Optional[str] = None,
+        extended_tab: bool = True,
         melt_transition_width_K: float = 50.0,
     ):
         self.L = 7.322e5 * (u.J/u.kg).to('erg/g')  # latent heat of fusion of the mantle
@@ -213,26 +240,40 @@ class MG2SIO4_ANEOS_EOS:
         self._u_rgi_rhot = RGI((self.tvals, self.rhovals), self.u_grid_MJkg, **rgi_kwargs)
         self._cv_rgi_rhot = RGI((self.tvals, self.rhovals), self.cv_grid_MJkgK, **rgi_kwargs)
 
-        # Optional P-T and S-P tables (placeholders by default).
-        self._has_pt_table = True
-        self._has_sp_table = True
+        # Optional P-T and S-P tables. Default paths are selected by `extended_tab`;
+        # passing explicit paths overrides the flag, and passing "" skips loading
+        # (used by the table-builder driver).
+        self.extended_tab = bool(extended_tab)
 
+        if pt_table_path is None:
+            pt_table_path = (
+                "eos/rock_eos/mg2sio4_aneos_PT_extended.npz" if self.extended_tab
+                else "eos/rock_eos/mg2sio4_aneos_PT.npz"
+            )
+        if sp_table_path is None:
+            sp_table_path = (
+                "eos/rock_eos/mg2sio4_aneos_SP_extended.npz" if self.extended_tab
+                else "eos/rock_eos/mg2sio4_aneos_SP.npz"
+            )
+
+        self._has_pt_table = False
+        self._has_sp_table = False
         self.pt_table_path = pt_table_path
         self.sp_table_path = sp_table_path
 
-        if os.path.exists(self.pt_table_path):
-            self._load_pt_table(self.pt_table_path)
-        else:
+        if pt_table_path and os.path.exists(pt_table_path):
+            self._load_pt_table(pt_table_path)
+        elif pt_table_path:
             warnings.warn(
-                f"PT table not found at '{self.pt_table_path}'. Falling back to inversion backend.",
+                f"PT table not found at '{pt_table_path}'. Falling back to inversion backend.",
                 RuntimeWarning,
             )
 
-        if os.path.exists(self.sp_table_path):
-            self._load_sp_table(self.sp_table_path)
-        else:
+        if sp_table_path and os.path.exists(sp_table_path):
+            self._load_sp_table(sp_table_path)
+        elif sp_table_path:
             warnings.warn(
-                f"SP table not found at '{self.sp_table_path}'. Falling back to inversion backend.",
+                f"SP table not found at '{sp_table_path}'. Falling back to inversion backend.",
                 RuntimeWarning,
             )
 
@@ -344,6 +385,8 @@ class MG2SIO4_ANEOS_EOS:
         self._cv_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.cv_vals_pt, **rgi_kwargs)
         self._cp_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.cp_vals_pt, **rgi_kwargs)
         self._alpha_rgi_pt = RGI((self.P_vals_pt, self.T_vals_pt), self.alpha_vals_pt, **rgi_kwargs)
+
+        self._has_pt_table = True
 
     def _load_sp_table(self, path: str):
         data = np.load(path)
@@ -702,7 +745,7 @@ class MG2SIO4_ANEOS_EOS:
                 r_brent = brentq(f, a, b, xtol=tol, maxiter=maxiter)
                 out[idx] = float(r_brent)
 
-        return out.reshape(P_arr.shape)
+        return _nan_guard_interp(out.reshape(P_arr.shape))
 
     def get_rho_pt(self, P, T, tab=True, **kwargs):
         P_arr, T_arr = self._as_arrays(P, T)
@@ -1277,6 +1320,9 @@ class MG2SIO4_ANEOS_EOS:
                 except Exception:
                     pass
 
+        rho_out = _nan_guard_interp(rho_out)
+        T_out = _nan_guard_interp(T_out)
+
         if return_diagnostics:
             return rho_out, T_out, info
         return rho_out, T_out
@@ -1367,3 +1413,65 @@ class MG2SIO4_ANEOS_EOS:
         _, T = self.get_rhot_sp_2d_inv(S_arr, P_arr, **inv_kwargs)
         vals = self.get_alpha_pt(P_arr, T, tab=False)
         return float(vals) if scalar else vals
+
+#### INVERSION TABLE CODE ####
+# The following code was used generate the extended tables and can be found in mg2sio4_aneos_checks.ipynb.
+#--------------- P, T inversion table extended ---------------
+# from eos import mg2sio4_aneos_eos as mg2sio4_eos
+# import numpy as np
+# from tqdm import tqdm
+
+# eos = mg2sio4_eos.MG2SIO4_ANEOS_EOS(extended_tab=False)
+
+# P_grid = np.logspace(-4, 4, 300)
+# T_grid = np.logspace(2, 5.0, 150)
+
+# S_res = []
+# rho_res = []
+# u_res = []
+# cp_res = []
+# cv_res = []
+# alpha_res = []
+
+# for i,T in enumerate(tqdm(T_grid)):
+#     rho = eos.get_rho_pt_inv(P_grid, T)
+#     S_res.append(eos.get_s_rhot(rho, T))
+#     rho_res.append(rho)
+#     u_res.append(eos.get_u_rhot(rho, T))
+#     cp_res.append(eos.get_cp_rhot(rho, T))
+#     cv_res.append(eos.get_cv_rhot(rho, T))
+#     alpha_res.append(eos.get_alpha_rhot(rho, T))
+
+# np.savez_compressed('mg2sio4_aneos_PT_extended.npz', svals_pt = S_res, pvals_pt = P_grid, t_grid_pt = T_grid, 
+#                     rho_grid_pt = rho_res, u_grid_pt = u_res, 
+#                     cp_grid_pt = cp_res, cv_grid_pt = cv_res, alpha_grid_pt = alpha_res) 
+
+# from eos import mg2sio4_aneos_eos as mg2sio4_eos
+# import numpy as np
+# from tqdm import tqdm
+
+#--------------- S, P inversion table extended ---------------
+# eos = mg2sio4_eos.MG2SIO4_ANEOS_EOS(extended_tab=False)
+
+# P_grid = np.logspace(-4, 4, 300)
+# S_grid = eos.S_vals_sp
+
+# T_res = []
+# rho_res = []
+# u_res = []
+# cp_res = []
+# cv_res = []
+# alpha_res = []
+
+# for i,s in enumerate(tqdm(S_grid)):
+#     rho, T = eos.get_rhot_sp_2d_inv(s, P_grid)
+#     T_res.append(T)
+#     rho_res.append(rho)
+#     u_res.append(eos.get_u_rhot(rho, T))
+#     cp_res.append(eos.get_cp_rhot(rho, T))
+#     cv_res.append(eos.get_cv_rhot(rho, T))
+#     alpha_res.append(eos.get_alpha_rhot(rho, T))
+
+# np.savez_compressed('mg2sio4_aneos_SP_extended.npz', svals_sp = S_grid, pvals_sp = P_grid, t_grid_sp = T_res, 
+#                     rho_grid_sp = rho_res, u_grid_sp = u_res, 
+#                     cp_grid_sp = cp_res, cv_grid_sp = cv_res, alpha_grid_sp = alpha_res) 
