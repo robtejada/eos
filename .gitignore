@@ -86,3 +86,10 @@ ch4_comb_eos.py
 nh3_comb_eos.py
 verify_derivatives.py
 test_smooth_derivatives.py
+coolTlust_tables_new.zip
+
+# Local-only (also present in Zenodo archive)
+h_aqua_eos.py
+test_hhe_z_mixtures.py
+test_thermodynamic_consistency.py
+interpolate.py
