@@ -27,11 +27,16 @@ class eos:
             logt_this_rho = self.data['logt'][self.data['logrho'] == logrhoval]
             for j, logtval in enumerate(self.logtvals):
                 # previously these were all scaled by 1e10 (MJ kg^-1 for s and u, GPa to cgs for p).
-                # actually not sure of any units; it seems pressure is already cgs. 
+                # actually not sure of any units; it seems pressure is already cgs.
                 # need to check s and u against another eos.
-                self.logp[i, j] = logp_this_rho[logt_this_rho == logtval]
-                self.logs[i, j] = logs_this_rho[logt_this_rho == logtval]
-                self.logu[i, j] = logu_this_rho[logt_this_rho == logtval]
+                mask = logt_this_rho == logtval
+                assert mask.sum() == 1, (
+                    f"aneos_rhot grid corrupted: expected exactly 1 row at "
+                    f"(logrho={logrhoval}, logt={logtval}), got {int(mask.sum())}"
+                )
+                self.logp[i, j] = logp_this_rho[mask][0]
+                self.logs[i, j] = logs_this_rho[mask][0]
+                self.logu[i, j] = logu_this_rho[mask][0]
 
         del(self.data)
 

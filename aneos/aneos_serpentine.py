@@ -43,9 +43,13 @@ class eos:
             data_this_logp = self.data[self.data['logp'] == logpval]
             for j, logtval in enumerate(self.logtvals):
                 data_this_logp_logt = data_this_logp[data_this_logp['logt'] == logtval]
-                self.logrho_on_nodes[i, j] = data_this_logp_logt['logrho']
-                self.logu_on_nodes[i, j] = data_this_logp_logt['logu']
-                self.logs_on_nodes[i, j] = data_this_logp_logt['logs']
+                assert len(data_this_logp_logt) == 1, (
+                    f"aneos grid corrupted: expected exactly 1 row at "
+                    f"(logp={logpval}, logt={logtval}), got {len(data_this_logp_logt)}"
+                )
+                self.logrho_on_nodes[i, j] = data_this_logp_logt['logrho'][0]
+                self.logu_on_nodes[i, j] = data_this_logp_logt['logu'][0]
+                self.logs_on_nodes[i, j] = data_this_logp_logt['logs'][0]
                 # self.chit_on_nodes[i, j] = data_this_logp_logt['chit']
                 # self.chirho_on_nodes[i, j] = data_this_logp_logt['chirho']
                 # self.gamma1_on_nodes[i, j] = data_this_logp_logt['gamma1']
