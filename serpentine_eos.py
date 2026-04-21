@@ -118,7 +118,7 @@ def get_t_sp(s, p, alg='brenth'):
             s, p = np.array([s]), np.array([p])
             guess = ideal_fe.get_t_sp(s, p, 0)
             sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, alg))
-            return float(sol.x)
+            return float(sol.x.item())
 
         guess = ideal_fe.get_t_sp(s, p, 0)
         sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, alg))
@@ -143,7 +143,7 @@ def get_p_rhot(rho, t, alg='brenth'):
             rho, t = np.array([rho]), np.array([t])
             guess = ideal_fe.get_p_rhot(rho, t, 0)
             sol = root(err_p_rhot, guess, tol=1e-8, method='hybr', args=(rho, t))
-            return float(sol.x)
+            return float(sol.x.item())
 
         guess = ideal_fe.get_p_rhot(rho, t, 0)
         sol = root(err_p_rhot, guess, tol=1e-8, method='hybr', args=(rho, t,))
@@ -165,7 +165,7 @@ def get_t_srho(s, rho, alg='brenth'):
             s, rho = np.array([s]), np.array([rho])
             guess = ideal_fe.get_t_srho(s, rho, 0)
             sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho, alg))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_fe.get_t_srho(s, rho, 0)
         sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho, alg))
         return sol.x

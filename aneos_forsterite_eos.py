@@ -41,17 +41,17 @@ def get_p_rhot_tab(logrho, logt):
     #print('WARNING-- PRESSURE IS IN GPA FOR INVERSION PURPOSES')
     if np.isscalar(logrho):
         # taking log10 here because original data has 0 GPa in the beginning
-        return float(rgi_p(np.array([logt, logrho]).T))
+        return float(rgi_p(np.array([logt, logrho]).T).item())
     return rgi_p(np.array([logt, logrho]).T) # returns in GPa
 
 def get_s_rhot_tab(logrho, logt):
     if np.isscalar(logrho):
-        return float(rgi_s(np.array([logt, logrho]).T))
+        return float(rgi_s(np.array([logt, logrho]).T).item())
     return rgi_s(np.array([logt, logrho]).T) # returns in MJ/kg/K units
 
 def get_u_rhot_tab(logrho, logt):
     if np.isscalar(logrho):
-        return float(rgi_u(np.array([logt, logrho]).T))
+        return float(rgi_u(np.array([logt, logrho]).T).item())
     return rgi_u(np.array([logt, logrho]).T) # returns in MJ/kg units
 
 def err_rho_pt(logrho, p_val, logtval):
@@ -67,7 +67,7 @@ def get_rho_pt(p_GPa, logt):
         guess = serpentine_eos.get_rho_pt_tab(np.log10(p_GPa*1e10), logt)
         #guess = 1
         sol = root(err_rho_pt, guess, tol=1e-8, method='hybr', args=(p_GPa, logt))
-        return float(sol.x)
+        return float(sol.x.item())
     
     sol = np.array([get_rho_pt(p, t) for p, t in zip(p_GPa, logt)])
     return sol
@@ -88,7 +88,7 @@ def get_rho_pt_tab(p_GPa, logt):
     #p_GPa = 10**(logp-10) 
     if np.isscalar(p_GPa):
         # needs to be in p_GPa... seems to work best for inversion
-        return float(rgi_rho(np.array([logt, p_GPa]).T))
+        return float(rgi_rho(np.array([logt, p_GPa]).T).item())
     return rgi_rho(np.array([logt, p_GPa]).T) # returns logrho
 
 def get_s_pt_tab(p_GPa, logt, tab=True):
@@ -120,7 +120,7 @@ def get_t_sp(s_MJ, p_GPa):
         # IT WORKS MUCH BETTER THAN THE GET_T_SP FUNC!
         guess = serpentine_eos.get_s_pt_tab(np.log10(p_GPa*1e10), logt_test)#/MJ_to_erg
         sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s_MJ, p_GPa))
-        return float(sol.x)
+        return float(sol.x.item())
 
     sol = np.array([get_t_sp(s_, p_) for s_, p_ in zip(s_MJ, p_GPa)])
     return sol
@@ -152,7 +152,7 @@ def get_t_sp_tab(s_MJ, p_GPa):
     #s_MJ = s/MJ_to_kbbar # converting MJ/kg/K to kb/baryon...
     if np.isscalar(p_GPa):
         # needs to be in p_GPa... seems to work best for inversion
-        return float(rgi_t(np.array([s_MJ, p_GPa]).T))
+        return float(rgi_t(np.array([s_MJ, p_GPa]).T).item())
     return rgi_t(np.array([s_MJ, p_GPa]).T) # returns logrho
 
 def get_rho_sp_tab(s_MJ, p_GPa, tab=True):

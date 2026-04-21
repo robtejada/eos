@@ -201,7 +201,7 @@ def get_t_sp(s, p, y,  alg='root'):
             s, p, y = np.array([s]), np.array([p]), np.array([y])
             guess = ideal_xy.get_t_sp(s, p, y)
             sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, y))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_xy.get_t_sp(s, p, y)
         sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, y))
         return sol.x
@@ -221,7 +221,7 @@ def get_t_srho(s, rho, y, alg='root'):
             s, rho, y = np.array([s]), np.array([rho]), np.array([y])
             guess = ideal_xy.get_t_srho(s, rho, y)
             sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho, y))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_xy.get_t_srho(s, rho, y)
         sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho, y))
         return sol.x
@@ -243,7 +243,7 @@ def get_t_rhop(_lgrho, _lgp, _y, alg='root'):
             _lgrho, _lgp, _y = np.array([_lgrho]), np.array([_lgp]), np.array([_y])
             guess = ideal_xy.get_t_rhop(_lgrho, _lgp, _y)
             sol = root(err_t_rhop, guess, tol=1e-8, method='hybr', args=(_lgrho, _lgp, _y))
-            return float(sol.x)
+            return float(sol.x.item())
 
         guess = ideal_xy.get_t_rhop(_lgrho, _lgp, _y)
         sol = root(err_t_rhop, guess, tol=1e-8, method='hybr', args=(_lgrho, _lgp, _y))
@@ -272,7 +272,7 @@ def get_p_rhot(rho, t, y, alg='root'):
             rho, t, y = np.array([rho]), np.array([t]), np.array([y])
             guess = ideal_x.get_p_rhot(rho, t, y)
             sol = root(err_p_rhot, guess, tol=1e-8, method='hybr', args=(rho, t, y))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_x.get_p_rhot(rho, t, y)
         sol = root(err_p_rhot, guess, tol=1e-8, method='hybr', args=(rho, t, y))
         return sol.x

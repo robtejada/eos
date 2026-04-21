@@ -31,17 +31,17 @@ rgi_test_u = RGI((logtvals, logrhovals), loguvals, method='linear', bounds_error
 
 def get_p_rhot_tab(rho, t):
     if np.isscalar(rho):
-        return float(rgi_test_p(np.array([t, rho]).T)) # in log GPa for now
+        return float(rgi_test_p(np.array([t, rho]).T).item()) # in log GPa for now
     return rgi_test_p(np.array([t, rho]).T)
 
 def get_s_rhot_tab(rho, t):
     if np.isscalar(rho):
-        return float(rgi_test_s(np.array([t, rho]).T))
+        return float(rgi_test_s(np.array([t, rho]).T).item())
     return rgi_test_s(np.array([t, rho]).T)
 
 def get_u_rhot_tab(rho, t):
     if np.isscalar(rho):
-        return float(rgi_test_u(np.array([t, rho]).T))
+        return float(rgi_test_u(np.array([t, rho]).T).item())
     return rgi_test_u(np.array([t, rho]).T)
 
 #### P, T ####
@@ -141,7 +141,7 @@ def get_rho_pt(p, t, alg='brenth'):
             p, t = np.array([p]), np.array([t])
             guess = ideal_fe.get_rho_pt(p, t, 0)
             sol = root(err_rho_pt, guess, tol=1e-8, method='hybr', args=(p, t))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_fe.get_rho_pt(p, t, 0)
         sol = root(err_rho_pt, guess, tol=1e-8, method='hybr', args=(p, t))
         return sol.x
@@ -168,7 +168,7 @@ def get_t_sp(s, p, alg='brenth'):
             s, p = np.array([s]), np.array([p])
             guess = ideal_fe.get_t_sp(s, p, 0)
             sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, alg))
-            return float(sol.x)
+            return float(sol.x.item())
 
         guess = ideal_fe.get_t_sp(s, p, 0)
         sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, alg))
@@ -189,7 +189,7 @@ def get_t_srho(s, rho, alg='brenth'):
             s, rho = np.array([s]), np.array([rho])
             guess = ideal_fe.get_t_srho(s, rho, 0)
             sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_fe.get_t_srho(s, rho, 0)
         sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho))
         return sol.x

@@ -208,7 +208,7 @@ def get_t_sp(s, p, y, alg='root'):
             s, p, y = np.array([s]), np.array([p]), np.array([y])
             guess = ideal_xy.get_t_sp(s, p, y)
             sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, y))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_xy.get_t_sp(s, p, y)
         sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(s, p, y))
         return sol.x
@@ -228,7 +228,7 @@ def get_t_srho(s, rho, y, alg='root'):
             s, rho, y = np.array([s]), np.array([rho]), np.array([y])
             guess = ideal_xy.get_t_srho(s, rho, y)
             sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho, y))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_xy.get_t_srho(s, rho, y)
         sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(s, rho, y))
         return sol.x
@@ -251,7 +251,7 @@ def get_rho_pt(p, t, y, z=0.0):
         p, t, y = np.array([p]), np.array([t]), np.array([y])
         guess = ideal_xy.get_rho_pt(p, t, y)
         sol = root(err_rho_pt, guess, tol=1e-8, method='hybr', args=(p, t, y))
-        return float(sol.x)
+        return float(sol.x.item())
 
     guess = ideal_xy.get_rho_pt(p, t, y)
     sol = root(err_rho_pt, guess, tol=1e-8, method='hybr', args=(p, t, y))

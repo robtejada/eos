@@ -106,7 +106,7 @@ def get_t_sp(_s, _lgp, _z2, _z3, alg='root'):
             _s, _lgp, _z2, _z3 = np.array([_s]), np.array([_lgp]), np.array([_z2]), np.array([_z3])
             guess = ideal_z.get_t_sp(_s, _lgp, 0)
             sol = root(err_t_sp, guess, tol=1e-8, method='hybr', args=(_s, _lgp, _z2, _z3))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_z.get_t_sp(_s, _lgp, np.zeros(len(_s)))#*(1 - _z) + _z*ideal_z.get_t_sp(_s, _lgp, 0) # just a guess...
         sol = root(err_t_sp, guess, tol=XTOL, method='hybr', args=(_s, _lgp, _z2, _z3))
         return sol.x
@@ -127,7 +127,7 @@ def get_p_rhot(_lgrho, _lgt, _z2, _z3, alg='root'):
             _lgrho, _lgt, _z2, _z3 = np.array([_lgrho]), np.array([_lgt]), np.array([_z2]), np.array([_z3])
             guess = ideal_z.get_p_rhot(_lgrho, _lgt, 0)
             sol = root(err_p_rhot, guess, tol=XTOL, method='hybr', args=(_lgrho, _lgt, _z2, _z3))
-            return float(sol.x)
+            return float(sol.x.item())
         guess = ideal_z.get_p_rhot(_lgrho, _lgt, np.zeros(len(_lgrho)))
         sol = root(err_p_rhot, guess, tol=XTOL, method='hybr', args=(_lgrho, _lgt, _z2, _z3))
         return sol.x
@@ -153,7 +153,7 @@ def get_t_srho(_s, _lgrho, _z2, _z3, alg='root'):
             _s, _lgrho, _fice = np.array([_s]), np.array([_lgrho]), np.array([_fice])
             guess = ideal_z.get_t_srho(_s, _lgrho, 0)
             sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(_s, _lgrho, _fice))
-            return float(sol.x)
+            return float(sol.x.item())
 
         guess = ideal_z.get_t_srho(_s, _lgrho, np.zeros(len(_s)))
         sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(_s, _lgrho, _fice))

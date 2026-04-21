@@ -380,7 +380,7 @@ def get_t_sp(_s, _lgp, _y, _z, hhe_eos, z_eos='aqua', hg=True, multivariable=Fal
             except:
                 guess = get_t_sp_tab(_s, _lgp, _y, _z, hhe_eos=hhe_eos, z_eos=z_eos, hg=hg)
             sol = root(err_t_sp, guess, tol=1e-8, method=method, args=(_s, _lgp, _y, _z, hhe_eos, z_eos, hg))
-            return float(sol.x)
+            return float(sol.x.item())
 
         # loops through arrays to find solulations, possibly an easier problem to solve than multivariable
         sol = np.array([get_t_sp(s, p, y, z, hhe_eos=hhe_eos, z_eos=z_eos, hg=hg) for s, p, y, z in zip(_s, _lgp, _y, _z)])
@@ -391,7 +391,7 @@ def get_t_sp(_s, _lgp, _y, _z, hhe_eos, z_eos='aqua', hg=True, multivariable=Fal
             _s, _lgp, _y, _z = np.array([_s]), np.array([_lgp]), np.array([_y]), np.array([_z])
             guess = ideal_xy.get_t_sp(_s, _lgp, _y)
             sol = root(err_t_sp, guess, tol=1e-8, method=method, args=(_s, _lgp, _y, _z, hhe_eos, z_eos, hg))
-            return float(sol.x)
+            return float(sol.x.item())
         else:
             guess = ideal_xy.get_t_sp(_s, _lgp, _y)
             sol = root(err_t_sp, guess, tol=1e-8, method=method, args=(_s, _lgp, _y, _z, hhe_eos, z_eos, hg))
@@ -409,7 +409,7 @@ def get_p_rhot(_lgrho, _lgt, _y, _z, hhe_eos, z_eos='aqua', hg=True):
         _lgrho, _lgt, _y, _z = np.array([_lgrho]), np.array([_lgt]), np.array([_y]), np.array([_z])
         guess = ideal_xy.get_p_rhot(_lgrho, _lgt, _y)
         sol = root(err_p_rhot, guess, tol=XTOL, method='hybr', args=(_lgrho, _lgt, _y, _z, hhe_eos, z_eos, hg))
-        return float(sol.x)
+        return float(sol.x.item())
 
     sol = np.array([get_p_rhot(rho, t, y, z, hhe_eos=hhe_eos, z_eos=z_eos, hg=hg) for rho, t, y, z in zip(_lgrho, _lgt, _y, _z)])
     return sol
@@ -427,7 +427,7 @@ def get_t_srho(_s, _lgrho, _y, _z, hhe_eos, z_eos='aqua', hg=True):
         _s, _lgrho, _y, _z = np.array([_s]), np.array([_lgrho]), np.array([_y]), np.array([_z])
         guess = ideal_xy.get_t_srho(_s, _lgrho, _y)
         sol = root(err_t_srho, guess, tol=1e-8, method='hybr', args=(_s, _lgrho, _y, _z, hhe_eos, z_eos, hg))
-        return float(sol.x)
+        return float(sol.x.item())
 
     sol = np.array([get_t_srho(s, rho, y, z, hhe_eos=hhe_eos, z_eos=z_eos, hg=hg) for s, rho, y, z in zip(_s, _lgrho, _y, _z)])
     return sol
@@ -438,7 +438,7 @@ def get_p_srho(_s, _lgrho, _y, _z, hhe_eos, z_eos='aqua', hg=True):
         _s, _lgrho, _y, _z = np.array([_s]), np.array([_lgrho]), np.array([_y]), np.array([_z])
         guess = ideal_xy.get_p_srho(_s, _lgrho, _y)[0]
         sol = root(err_p_srho, guess, tol=1e-8, method='hybr', args=(_s, _lgrho, _y, _z, hhe_eos, z_eos, hg))
-        return float(sol.x)
+        return float(sol.x.item())
 
     sol = np.array([get_p_srho(s, rho, y, z, hhe_eos=hhe_eos, z_eos=z_eos, hg=hg) for s, rho, y, z in zip(_s, _lgrho, _y, _z)])
     return sol
@@ -462,7 +462,7 @@ def get_t_rhop(_lgrho, _lgp, _y, _z, hhe_eos, z_eos='aqua', hg=True):
         _lgrho, _lgp, _y, _z = np.array([_lgrho]), np.array([_lgp]), np.array([_y]), np.array([_z])
         guess = ideal_xy.get_t_rhop(_lgrho, _lgp, _y)
         sol = root(err_t_rhop, guess, tol=1e-8, method='hybr', args=(_lgrho, _lgp, _y, _z, hhe_eos, z_eos, hg))
-        return float(sol.x)
+        return float(sol.x.item())
 
     sol = np.array([get_t_rhop(rho, p, y, z, hhe_eos=hhe_eos, z_eos=z_eos, hg=hg) for rho, p, y, z in zip(_lgrho, _lgp, _y, _z)])
     return sol
