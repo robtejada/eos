@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator as RGI
 # from scipy.optimize import root, root_scalar
-from eos import ideal_eos, aqua_eos, aqua_mlcp_eos, ppv_eos, ppv2_eos, serpentine_eos, aneos_forsterite_eos, fe_eos, iron2_eos, zmix_eos, mgsio3_liquid_eos_formix
+from eos import ideal_eos, aqua_eos, ppv_eos, ppv2_eos, fe_eos, iron2_eos, zmix_eos, mgsio3_liquid_eos_formix
 import os
 
 from astropy import units as u

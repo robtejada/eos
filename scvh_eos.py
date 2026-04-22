@@ -33,7 +33,7 @@ mhe = 4.0026
 
 CURR_DIR = os.path.dirname(os.path.realpath(__file__))
 
-eos_aneos = aneos.eos(path_to_data='%s/aneos' % CURR_DIR, material='serpentine')
+#eos_aneos = aneos.eos(path_to_data='%s/aneos' % CURR_DIR, material='serpentine')
 eos_scvh = scvh_man.eos(path_to_data='%s/scvh_mesa' % CURR_DIR)
 
 ideal_x = ideal_eos.IdealEOS(m=2)
