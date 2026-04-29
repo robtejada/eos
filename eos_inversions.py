@@ -1,22 +1,46 @@
 #!/usr/bin/env python
 """
-EOS Table Inversion Script
-==========================
+EOS Table Builder / Inversion Script
+====================================
 
-Inverts the P-T basis EOS tables to any target basis:
-    sp   : T(S, P, Y', Z)          — entropy-pressure
-    rhot : P(ρ, T, Y', Z)          — density-temperature
-    rhop : T(ρ, P, Y', Z)          — density-pressure  (ξ-mapped on ρ)
-    srho : P,T(S, ρ, Y', Z)        — entropy-density   (ξ-mapped on S, 2-D)
+Builds the P-T basis EOS table from the volume-addition-law forward
+model, or inverts an existing P-T basis table to any of four target
+bases:
+
+    pt   : S, log10 ρ, log10 U on (logP, logT, Y', Z)   — forward
+    sp   : T(S, P, Y', Z)                                — entropy-pressure
+    rhot : P(ρ, T, Y', Z)                                — density-temperature
+    rhop : T(ρ, P, Y', Z)                                — density-pressure
+    srho : P, T(S, ρ, Y', Z)                             — entropy-density (2 outputs)
+
+All inversion bases are stored on rectangular grids (the legacy
+ξ-mapped option has been retired).
+
+Build order
+-----------
+The P-T table must exist before any of the inversions can run, since
+the inversions all use ``pt_tab=True`` to read the smooth P-T forward
+model.  The S-ρ inversion additionally needs either the ρ-T or the
+S-P table (see ``--srho_basis``).
 
 Usage
 -----
-    python eos_inversions.py --basis sp --hhe_eos cd --z_eos water
-    python eos_inversions.py --basis rhot --hhe_eos cms
-    python eos_inversions.py --basis srho --hhe_eos cd --z_eos water --logp_lo 6 --logp_hi 14
+    # Build P-T forward table first:
+    python eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised
 
-All parameters have sensible defaults. Tables are saved to the auto-load
-paths used by ``hhe_z_mixtures(tab=True)``.
+    # Then build the inversions (any order, except srho is last):
+    python eos_inversions.py --basis sp   --hhe_eos cd --z_eos aqua_revised
+    python eos_inversions.py --basis rhot --hhe_eos cms
+    python eos_inversions.py --basis rhop --hhe_eos cd --z_eos aqua_revised
+    python eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised \\
+                             --srho_basis rhot
+
+    # Customise the P/T grid for any basis:
+    python eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised \\
+                             --logp_lo 6 --logp_hi 14
+
+All parameters have sensible defaults.  Tables are saved to the
+auto-load paths used by ``hhe_z_mixtures(pt_tab=True, inv_tab=True)``.
 """
 
 import argparse
@@ -54,13 +78,10 @@ DEFAULTS = {
     'logrho_hi':  1.76,
     'logrho_step': 0.1,
 
-    # S grid for square tables (SP, S-rho) — ADJUST THESE VALUES
+    # S grid for SP and S-ρ tables
     's_lo':       1.5,    # kb/baryon — lower entropy bound
     's_hi':       12.0,   # kb/baryon — upper entropy bound
     's_step':     0.1,    # kb/baryon — entropy step
-
-    # ξ resolution (for xi-mapped tables only, used with --xi_transform)
-    'n_xi':       150,
 
     # Y' and Z grids
     'y_lo':       0.05,
@@ -79,7 +100,7 @@ def build_parser():
 
     p.add_argument('--basis', required=True,
                    choices=['pt', 'sp', 'rhot', 'rhop', 'srho'],
-                   help='Target basis for inversion')
+                   help='Target basis (pt = forward; others = inversions)')
 
     # EOS selection
     p.add_argument('--hhe_eos', default=DEFAULTS['hhe_eos'],
@@ -119,23 +140,15 @@ def build_parser():
     p.add_argument('--logrho_step', type=float, default=DEFAULTS['logrho_step'],
                    help=f"logrho step (default: {DEFAULTS['logrho_step']})")
 
-    # ξ and table mode
-    p.add_argument('--xi_transform', action='store_true',
-                   help='Use xi-mapped adaptive tables instead of '
-                        'square (default: square)')
-    p.add_argument('--n_xi', type=int, default=DEFAULTS['n_xi'],
-                   help=f"Number of xi grid points for xi-mapped "
-                        f"tables (default: {DEFAULTS['n_xi']})")
-
-    # S grid (for square SP and S-rho tables)
+    # S grid (for SP and S-rho tables)
     p.add_argument('--s_lo', type=float, default=DEFAULTS['s_lo'],
-                   help=f"S min [kb/baryon] for square SP/S-rho "
+                   help=f"S min [kb/baryon] for SP/S-rho "
                         f"tables (default: {DEFAULTS['s_lo']})")
     p.add_argument('--s_hi', type=float, default=DEFAULTS['s_hi'],
-                   help=f"S max [kb/baryon] for square SP/S-rho "
+                   help=f"S max [kb/baryon] for SP/S-rho "
                         f"tables (default: {DEFAULTS['s_hi']})")
     p.add_argument('--s_step', type=float, default=DEFAULTS['s_step'],
-                   help=f"S step [kb/baryon] for square SP/S-rho "
+                   help=f"S step [kb/baryon] for SP/S-rho "
                         f"tables (default: {DEFAULTS['s_step']})")
 
     # Y' grid
@@ -193,7 +206,10 @@ def main():
 
     # --- Print summary ---
     print("=" * 65)
-    print(f"EOS Table Inversion: P,T → {args.basis.upper()}")
+    if args.basis == 'pt':
+        print(f"EOS Table Build: P-T forward (S, ρ, U)")
+    else:
+        print(f"EOS Table Inversion: P,T → {args.basis.upper()}")
     print("=" * 65)
     print(f"  H-He EOS:    {args.hhe_eos}")
     print(f"  Z EOS:       {args.z_eos}")
@@ -201,14 +217,11 @@ def main():
     print(f"  HG23:        {hg}")
     print(f"  Smoothing:   {smooth}")
     print(f"  mu_H(P,T):   {mu_h_vary}")
-    print(f"  Table mode:  {'xi-mapped' if args.xi_transform else 'square'}")
     print(f"  logP range:  [{args.logp_lo}, {args.logp_hi}] step {args.logp_step}")
     print(f"  logT range:  [{args.logt_lo}, {args.logt_hi}]")
     if args.basis in ('rhot', 'rhop', 'srho'):
         print(f"  logrho range:[{args.logrho_lo}, {args.logrho_hi}] step {args.logrho_step}")
-    if args.xi_transform and args.basis in ('sp', 'rhop', 'srho'):
-        print(f"  n_xi:        {args.n_xi}")
-    if not args.xi_transform and args.basis in ('sp', 'srho'):
+    if args.basis in ('sp', 'srho'):
         nS = len(np.arange(args.s_lo, args.s_hi + args.s_step * 0.1, args.s_step))
         print(f"  S range:     [{args.s_lo}, {args.s_hi}] step {args.s_step} ({nS} pts)")
     if args.basis == 'srho':
@@ -223,50 +236,27 @@ def main():
     # Estimate file size
     nP = len(np.arange(args.logp_lo, args.logp_hi + args.logp_step * 0.1, args.logp_step))
     nR = len(np.arange(args.logrho_lo, args.logrho_hi + args.logrho_step * 0.1, args.logrho_step))
-    nxi = args.n_xi
     nS = len(np.arange(args.s_lo, args.s_hi + args.s_step * 0.1, args.s_step))
-    bytes_per_f32 = 4
-
     nT = len(np.arange(args.logt_lo, args.logt_hi + 0.01, args.logp_step))
+    bytes_per_f32 = 4
 
     if args.basis == 'pt':
         n_cells = nP * nT * nY * nZ
         n_arrays = 3   # s_pt, logrho_pt, logu_pt
-        bounds_cells = 0
     elif args.basis == 'sp':
-        if args.xi_transform:
-            n_cells = nxi * nP * nY * nZ
-            bounds_cells = nP * nY * nZ * 2   # s_lo + s_hi
-        else:
-            n_cells = nS * nP * nY * nZ
-            bounds_cells = 0
+        n_cells = nS * nP * nY * nZ
         n_arrays = 1   # logt_sp only
     elif args.basis == 'rhot':
-        if args.xi_transform:
-            n_cells = nxi * nT * nY * nZ
-            bounds_cells = nT * nY * nZ * 2  # rho_lo + rho_hi
-        else:
-            n_cells = nR * nT * nY * nZ
-            bounds_cells = 0
+        n_cells = nR * nT * nY * nZ
         n_arrays = 1   # logp_rhot only
     elif args.basis == 'rhop':
-        if args.xi_transform:
-            n_cells = nxi * nP * nY * nZ
-            bounds_cells = nP * nY * nZ * 2   # rho_lo + rho_hi
-        else:
-            n_cells = nR * nP * nY * nZ
-            bounds_cells = 0
+        n_cells = nR * nP * nY * nZ
         n_arrays = 1   # logt_rhop only
     elif args.basis == 'srho':
-        if args.xi_transform:
-            n_cells = nxi * nR * nY * nZ
-            bounds_cells = nR * nY * nZ * 2   # s_lo + s_hi
-        else:
-            n_cells = nS * nR * nY * nZ
-            bounds_cells = 0
+        n_cells = nS * nR * nY * nZ
         n_arrays = 2   # logp_srho + logt_srho
 
-    est_bytes = (n_cells * n_arrays + bounds_cells) * bytes_per_f32
+    est_bytes = n_cells * n_arrays * bytes_per_f32
     est_mb = est_bytes / 1e6
     print(f"  Est. size:   {n_cells * n_arrays:,} cells → "
           f"~{est_mb:.0f} MB (float32, uncompressed)")
@@ -274,13 +264,13 @@ def main():
 
     # --- Create EOS ---
     # pt_tab=True uses the smooth P-T table for forward-model evaluation
-    # during inversions. inv_tab=False avoids loading inverted tables
-    # (which are what we're building). For --basis pt, both are off
+    # during inversions.  inv_tab=False avoids loading inverted tables
+    # (which are what we're building).  For --basis pt, both are off
     # since we build from raw VAL.
     #
-    # For --basis srho, we set inv_tab=True so the required dependency
-    # table (ρ-T or S-P) is auto-loaded, and srho_tab=False so the
-    # old S-ρ table is NOT loaded (we're building a fresh one).
+    # For --basis srho with srho_use_tab=True, we set inv_tab=True so
+    # the required dependency table (ρ-T or S-P) is auto-loaded.
+    # srho_tab=False because we're building a fresh S-ρ table.
     _pt_tab  = (args.basis != 'pt')  # PT basis builds from VAL
     _inv_tab = (args.basis == 'srho' and args.srho_use_tab)
     eos = hhe_z_mixtures(
@@ -294,13 +284,11 @@ def main():
         pt_tab=_pt_tab,
         inv_tab=_inv_tab,
         srho_tab=False,
-        xi_transform=args.xi_transform,
         logp_range=(args.logp_lo, args.logp_hi),
         logp_step=args.logp_step,
         logt_range=(args.logt_lo, args.logt_hi),
         logrho_range=(args.logrho_lo, args.logrho_hi),
         logrho_step=args.logrho_step,
-        n_xi=args.n_xi,
     )
 
     # --- Build table ---
@@ -311,22 +299,19 @@ def main():
         eos.save_pt_table(result, path=args.output)
 
     elif args.basis == 'sp':
-        result = eos.build_sp_table(yvals, zvals, n_xi=args.n_xi,
-                                    xi_transform=args.xi_transform,
+        result = eos.build_sp_table(yvals, zvals,
                                     s_lo=args.s_lo, s_hi=args.s_hi,
                                     s_step=args.s_step,
                                     smooth_sigma=args.smooth_sigma)
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
-        result = eos.build_rhot_table(yvals, zvals, n_xi=args.n_xi,
-                                      xi_transform=args.xi_transform,
+        result = eos.build_rhot_table(yvals, zvals,
                                       smooth_sigma=args.smooth_sigma)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':
-        result = eos.build_rhop_table(yvals, zvals, n_xi=args.n_xi,
-                                      xi_transform=args.xi_transform,
+        result = eos.build_rhop_table(yvals, zvals,
                                       smooth_sigma=args.smooth_sigma)
         eos.save_rhop_table(result, path=args.output)
 
@@ -336,10 +321,7 @@ def main():
         # was auto-loaded via inv_tab=True above.  Verify it's there.
         if args.srho_use_tab:
             if args.srho_basis == 'rhot' and eos._logp_rhot_rgi is None:
-                if args.xi_transform:
-                    rhot_path = eos._table_path('rhot')
-                else:
-                    rhot_path = eos._table_path_square('rhot')
+                rhot_path = eos._table_path('rhot')
                 print(f"ERROR: rho-T table not found at {rhot_path}")
                 print("Build it first:  python eos_inversions.py "
                       "--basis rhot ...")
@@ -347,10 +329,7 @@ def main():
                       "per-point Newton-Raphson.")
                 sys.exit(1)
             if args.srho_basis == 'sp' and eos._logt_sp_rgi is None:
-                if args.xi_transform:
-                    sp_path = eos._table_path('sp')
-                else:
-                    sp_path = eos._table_path_square('sp')
+                sp_path = eos._table_path('sp')
                 print(f"ERROR: S-P table not found at {sp_path}")
                 print("Build it first:  python eos_inversions.py "
                       "--basis sp ...")
@@ -358,8 +337,7 @@ def main():
                       "per-point Newton-Raphson.")
                 sys.exit(1)
 
-        result = eos.build_srho_table(yvals, zvals, n_xi=args.n_xi,
-                                      xi_transform=args.xi_transform,
+        result = eos.build_srho_table(yvals, zvals,
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
                                       basis=args.srho_basis,

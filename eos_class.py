@@ -1345,7 +1345,7 @@ class hhe_z_mixtures():
     # Table naming convention: {hhe_eos}/{hhe_eos}_{z_eos}_<basis>_*.npz
     # Auto-discovered relative to CURR_DIR (eos/ directory).
     _TABLE_BASES = {
-        'pt':   '{hhe}_{z}_pt_adaptive.npz',
+        'pt':   '{hhe}_{z}_pt_square.npz',
         'sp':   '{hhe}_{z}_sp_square.npz',
         'rhot': '{hhe}_{z}_rhot_square.npz',
         'rhop': '{hhe}_{z}_rhop_square.npz',
