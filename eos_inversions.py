@@ -38,24 +38,24 @@ DEFAULTS = {
     'hhe_eos':    'cd',
     'z_eos':      'aqua_revised',
     'hg':         True,
-    'smooth_hhe': True,
-    'smooth_z':   True,
+    'smooth_hhe': False,
+    'smooth_z':   False,
     'mu_h_vary':  False,
 
     # P-T grid
-    'logp_lo':    3.0, # 1 mbar
+    'logp_lo':    6.0, # 1 mbar
     'logp_hi':    15.0, # 1000 Mbar
     'logp_step':  0.05,
     'logt_lo':    1.3,
-    'logt_hi':    6.0,
+    'logt_hi':    5.8,
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -6.0,
-    'logrho_hi':  1.66,
+    'logrho_hi':  1.76,
     'logrho_step': 0.1,
 
     # S grid for square tables (SP, S-rho) — ADJUST THESE VALUES
-    's_lo':       2.0,    # kb/baryon — lower entropy bound
+    's_lo':       1.5,    # kb/baryon — lower entropy bound
     's_hi':       12.0,   # kb/baryon — upper entropy bound
     's_step':     0.1,    # kb/baryon — entropy step
 
