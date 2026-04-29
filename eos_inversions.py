@@ -25,7 +25,7 @@ S-P table (see ``--srho_basis``).
 
 Usage
 -----
-    # Build P-T forward table first:
+    # Build P-T forward table first (no per-component smoothing):
     python eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised
 
     # Then build the inversions (any order, except srho is last):
@@ -39,8 +39,21 @@ Usage
     python eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised \\
                              --logp_lo 6 --logp_hi 14
 
+    # Turn on per-component smoothing of the H-He and/or Z tables
+    # before VAL mixing (off by default; produces smoother PT
+    # surfaces but blurs real features like H2 dissociation steps):
+    python eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised \\
+                             --smooth_hhe --smooth_z
+
 All parameters have sensible defaults.  Tables are saved to the
 auto-load paths used by ``hhe_z_mixtures(pt_tab=True, inv_tab=True)``.
+
+Default toggles
+---------------
+    HG23 non-ideal mixing  : ON   (disable with --no_hg)
+    P-T-dependent mu_H     : OFF  (enable  with --mu_h_vary)
+    H-He smoothing         : OFF  (enable  with --smooth_hhe)
+    Z smoothing            : OFF  (enable  with --smooth_z)
 """
 
 import argparse
@@ -61,17 +74,17 @@ from eos.eos_class import hhe_z_mixtures
 DEFAULTS = {
     'hhe_eos':    'cd',
     'z_eos':      'aqua_revised',
-    'hg':         True,
-    'smooth_hhe': False,
-    'smooth_z':   False,
-    'mu_h_vary':  False,
+    'hg':         True,        # opt-out via --no_hg
+    'smooth_hhe': False,       # opt-in via --smooth_hhe
+    'smooth_z':   False,       # opt-in via --smooth_z
+    'mu_h_vary':  False,       # opt-in via --mu_h_vary
 
     # P-T grid
-    'logp_lo':    6.0, # 1 mbar
-    'logp_hi':    15.0, # 1000 Mbar
+    'logp_lo':    5.0, # 1 mbar
+    'logp_hi':    15.1, # 1000 Mbar
     'logp_step':  0.05,
     'logt_lo':    1.3,
-    'logt_hi':    5.8,
+    'logt_hi':    6.0,
 
     # ρ grid (for rhot, rhop, srho)
     'logrho_lo':  -6.0,
@@ -109,11 +122,19 @@ def build_parser():
     p.add_argument('--z_eos', default=DEFAULTS['z_eos'],
                    help=f"Z EOS label for filename (default: {DEFAULTS['z_eos']})")
     p.add_argument('--no_hg', action='store_true',
-                   help='Disable HG23 non-ideal mixing')
-    p.add_argument('--no_smooth', action='store_true',
-                   help='Disable H-He and Z smoothing')
-    p.add_argument('--no_mu_h_vary', action='store_true',
-                   help='Disable P-T dependent mu_H')
+                   help='Disable HG23 non-ideal mixing (default: enabled)')
+    p.add_argument('--smooth_hhe', action='store_true',
+                   help='Enable Gaussian smoothing of the H-He '
+                        'component table before VAL mixing '
+                        '(default: disabled)')
+    p.add_argument('--smooth_z', action='store_true',
+                   help='Enable Gaussian smoothing of the Z '
+                        'component tables before VAL mixing '
+                        '(default: disabled)')
+    p.add_argument('--mu_h_vary', action='store_true',
+                   help='Enable P-T dependent hydrogen molecular '
+                        'weight mu_H (default: disabled, i.e. '
+                        'constant atomic mu_H)')
     p.add_argument('--species', nargs='+',
                    default=['water_revised'],
                    help="Z species for val_mixtures (default: water_revised)")
@@ -201,8 +222,9 @@ def main():
     zvals = np.arange(args.z_lo, args.z_hi + args.z_step * 0.1, args.z_step)
 
     hg = not args.no_hg
-    smooth = not args.no_smooth
-    mu_h_vary = not args.no_mu_h_vary
+    smooth_hhe = args.smooth_hhe
+    smooth_z = args.smooth_z
+    mu_h_vary = args.mu_h_vary
 
     # --- Print summary ---
     print("=" * 65)
@@ -215,7 +237,8 @@ def main():
     print(f"  Z EOS:       {args.z_eos}")
     print(f"  Species:     {args.species}")
     print(f"  HG23:        {hg}")
-    print(f"  Smoothing:   {smooth}")
+    print(f"  Smooth H-He: {smooth_hhe}")
+    print(f"  Smooth Z:    {smooth_z}")
     print(f"  mu_H(P,T):   {mu_h_vary}")
     print(f"  logP range:  [{args.logp_lo}, {args.logp_hi}] step {args.logp_step}")
     print(f"  logT range:  [{args.logt_lo}, {args.logt_hi}]")
@@ -276,8 +299,8 @@ def main():
     eos = hhe_z_mixtures(
         hhe_eos_name=args.hhe_eos,
         hg=hg,
-        smooth_hhe=smooth,
-        smooth_z=smooth,
+        smooth_hhe=smooth_hhe,
+        smooth_z=smooth_z,
         mu_h_vary=mu_h_vary,
         species_list=args.species,
         z_eos=args.z_eos,
