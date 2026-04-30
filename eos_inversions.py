@@ -26,6 +26,7 @@ S-P table (see ``--srho_basis``).
 Usage
 -----
     # Build P-T forward table first (no per-component smoothing):
+    python eos/eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised
     python eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised
 
     # Then build the inversions (any order, except srho is last):
@@ -98,10 +99,10 @@ DEFAULTS = {
 
     # Y' and Z grids
     'y_lo':       0.05,
-    'y_hi':       1.0,
+    'y_hi':       1.05,
     'y_step':     0.05,
     'z_lo':       0.00,
-    'z_hi':       1.0,
+    'z_hi':       1.02,
     'z_step':     0.02,
 }
 
@@ -218,8 +219,8 @@ def main():
     args = parser.parse_args()
 
     # --- Build grids ---
-    yvals = np.arange(args.y_lo, args.y_hi + args.y_step * 0.1, args.y_step)
-    zvals = np.arange(args.z_lo, args.z_hi + args.z_step * 0.1, args.z_step)
+    yvals = np.arange(args.y_lo, args.y_hi, args.y_step)
+    zvals = np.arange(args.z_lo, args.z_hi, args.z_step)
 
     hg = not args.no_hg
     smooth_hhe = args.smooth_hhe
@@ -257,10 +258,10 @@ def main():
     print(f"  Z grid:      [{zvals[0]:.3f}, {zvals[-1]:.3f}] step {args.z_step} ({nZ} pts)")
 
     # Estimate file size
-    nP = len(np.arange(args.logp_lo, args.logp_hi + args.logp_step * 0.1, args.logp_step))
-    nR = len(np.arange(args.logrho_lo, args.logrho_hi + args.logrho_step * 0.1, args.logrho_step))
-    nS = len(np.arange(args.s_lo, args.s_hi + args.s_step * 0.1, args.s_step))
-    nT = len(np.arange(args.logt_lo, args.logt_hi + 0.01, args.logp_step))
+    nP = len(np.arange(args.logp_lo, args.logp_hi, args.logp_step))
+    nR = len(np.arange(args.logrho_lo, args.logrho_hi, args.logrho_step))
+    nS = len(np.arange(args.s_lo, args.s_hi, args.s_step))
+    nT = len(np.arange(args.logt_lo, args.logt_hi, args.logp_step))
     bytes_per_f32 = 4
 
     if args.basis == 'pt':
