@@ -1622,18 +1622,11 @@ class hhe_z_mixtures():
             print(f"Replaced {n_outliers} finite outlier cells "
                   f"in S (Hampel along P axis only)")
 
-        # --- Hampel pass 2: S, logrho, logU along the composition
-        # axes (Y', Z) only.  axes=[2, 3].  This catches isolated
-        # composition-direction outliers without touching the P or T
-        # axes, where the H2 pressure-dissociation step is a real
-        # physical feature that all-axes filtering would smear.
-        for arr, label in [(s_pt, 'S'), (logrho_pt, 'logrho'),
-                           (logu_pt, 'logU')]:
-            if verbose:
-                print(f"Running Hampel outlier filter on {label} "
-                      f"along Y' and Z axes ...")
-            self._hampel_nd(arr, axes=[2, 3],
-                            window=5, n_sigma=3.0, verbose=verbose)
+        # No Hampel along Y'/Z on the PT forward arrays.  The
+        # composition-axis boundary cells (Y'=0/1, Z=0/1) carry real
+        # logarithmic kinks in the mixing entropy that a window/MAD
+        # test misclassifies as outliers, smearing the boundary into
+        # the interior.  See diagnostic in eos_class history.
 
         s_f32 = s_pt.astype(np.float32)
         logrho_f32 = logrho_pt.astype(np.float32)
@@ -2045,6 +2038,139 @@ class hhe_z_mixtures():
             pass
 
         return np.array([np.nan, np.nan]), False
+
+    def _newton_1d_vec(self, residual_fn, guess, lo_abs, hi_abs,
+                       max_iter=40, tol=1e-6, h=1e-3, max_step=1.0):
+        """Vectorized Newton-Raphson with central-difference derivative.
+
+        Solves ``f(x) = 0`` element-wise where ``f`` and ``x`` are
+        arrays of any shape.  All operations broadcast — no Python
+        loop over elements.  Used to invert the forward model on a
+        whole (S, P) or (rho, T) etc. slab in one shot, replacing
+        the per-cell Newton loop in the build_*_table methods.
+
+        For batch inversion against the PT-RGI, this is typically
+        50-200x faster than calling scalar ``_newton_1d`` per cell
+        because each Newton iteration becomes one batched RGI
+        evaluation rather than O(grid_size) scalar evaluations.
+
+        Parameters
+        ----------
+        residual_fn : callable
+            ``f(x_array) -> residual_array`` of the same shape as
+            ``x_array``.  Must broadcast and return finite values
+            where the inversion is well-posed; NaN elsewhere.
+        guess : array_like
+            Initial guess.
+        lo_abs, hi_abs : float
+            Hard bounds.  ``x`` is clipped after each Newton step.
+        max_iter : int
+            Maximum Newton iterations.
+        tol : float
+            Convergence tolerance on |residual|.
+        h : float
+            Central-difference step for the derivative.
+        max_step : float
+            Cap on |Newton step| per iteration.
+
+        Returns
+        -------
+        x : ndarray, same shape as guess
+            Converged solution.  NaN where convergence failed.
+        converged : bool ndarray
+            True where ``|residual| < tol`` was reached.
+        """
+        x = np.clip(np.asarray(guess, dtype=float),
+                    lo_abs, hi_abs).copy()
+        # ``active`` = cells still being updated.  Once a cell hits
+        # |f|<tol it is frozen; we still evaluate the residual on it
+        # in subsequent iterations because the cost is dominated by
+        # the batched RGI call (whose cost barely grows with the
+        # subset size), but we don't update ``x`` on inactive cells.
+        active = np.ones(x.shape, dtype=bool)
+
+        for _ in range(max_iter):
+            if not active.any():
+                break
+
+            # Residual on the full slab (one batched RGI call)
+            f = np.asarray(residual_fn(x), dtype=float)
+            f_finite = np.isfinite(f)
+
+            # Mark newly-converged cells
+            ok = f_finite & (np.abs(f) < tol)
+            active &= ~ok
+            if not active.any():
+                break
+
+            # Central FD derivative — two more batched RGI calls
+            x_p = np.clip(x + h, lo_abs, hi_abs)
+            x_m = np.clip(x - h, lo_abs, hi_abs)
+            f_p = np.asarray(residual_fn(x_p), dtype=float)
+            f_m = np.asarray(residual_fn(x_m), dtype=float)
+            denom = (x_p - x_m)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                fp = (f_p - f_m) / denom
+                step = np.where(
+                    f_finite & np.isfinite(fp) & (np.abs(fp) > 1e-30),
+                    f / fp, 0.0)
+            step = np.clip(step, -max_step, max_step)
+
+            x_new = np.clip(x - step, lo_abs, hi_abs)
+            x = np.where(active, x_new, x)
+
+        # Final Newton-pass check
+        f = np.asarray(residual_fn(x), dtype=float)
+        ok_after_newton = np.isfinite(f) & (np.abs(f) < tol)
+
+        # --- Vectorized bisection fallback for cells where Newton
+        # didn't converge (typically because the cold-start was far
+        # from a steep-gradient root and Newton oscillated within the
+        # max_step cap).  Bisection is unconditionally convergent
+        # given a sign-changing bracket, fully batched (one RGI
+        # evaluation per iteration regardless of failed-cell count).
+        # Early-exit is in residual-space (|f(mid)| < tol everywhere
+        # bracketed) so the convergence test matches what the build
+        # actually cares about.  At steep gradients, an x-space exit
+        # at |b-a|<tol can leave residuals 10-100x larger than tol,
+        # which then fail the final tolerance check and get NaN'd.
+        bad = ~ok_after_newton
+        if bad.any():
+            f_lo = np.asarray(residual_fn(
+                np.where(bad, lo_abs, x)), dtype=float)
+            f_hi = np.asarray(residual_fn(
+                np.where(bad, hi_abs, x)), dtype=float)
+            # Cells where the bracket [lo, hi] genuinely contains a
+            # sign change are bisectable.
+            bracketed = bad & np.isfinite(f_lo) & np.isfinite(f_hi) \
+                        & (f_lo * f_hi < 0)
+            if bracketed.any():
+                a = np.where(bracketed, lo_abs, x)
+                b = np.where(bracketed, hi_abs, x)
+                fa = np.where(bracketed, f_lo, 0.0)
+                # Cap at 60 iterations (|b-a| -> 5e-18 in x-space, way
+                # past any meaningful gradient).  Early-exit when all
+                # bracketed cells satisfy |f(mid)| < tol.
+                for _ in range(60):
+                    mid = 0.5 * (a + b)
+                    f_mid = np.asarray(residual_fn(mid), dtype=float)
+                    valid = bracketed & np.isfinite(f_mid)
+                    same_sign_as_a = valid & (fa * f_mid > 0)
+                    a = np.where(same_sign_as_a, mid, a)
+                    fa = np.where(same_sign_as_a, f_mid, fa)
+                    b = np.where(valid & ~same_sign_as_a, mid, b)
+                    # Residual-based early exit
+                    if np.all(np.abs(f_mid[bracketed]) < tol):
+                        break
+                x = np.where(bracketed, 0.5 * (a + b), x)
+
+        # Final pass — accept cells that satisfy the tolerance now.
+        f = np.asarray(residual_fn(x), dtype=float)
+        ok_final = np.isfinite(f) & (np.abs(f) < tol)
+        # Cells that still don't converge become NaN (out-of-domain or
+        # no sign change in [lo, hi]).
+        x = np.where(ok_final, x, np.nan)
+        return x, ok_final
 
     def get_logt_sp(self, _s_kb, _lgp, _yp, _z=0.0,
                     _zm=0.0, _za=0.0, _zr=0.0,
@@ -2465,25 +2591,51 @@ class hhe_z_mixtures():
 
         logt_sp = np.full((nS, nP, nY, nZ), np.nan, dtype=float)
 
+        # 2-D mesh of (S, P) targets used by the vectorized Newton
+        S_2d, P_2d = np.meshgrid(svals, logp, indexing='ij')  # (nS, nP)
+
         total = nY * nZ
         pbar = tqdm(total=total,
-                     desc="Inverting P,T -> S,P (square)",
+                     desc="Inverting P,T -> S,P (vectorized)",
                      disable=not verbose,
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
+        # Solve the entire (nS, nP) slab at each (Y', Z) in one
+        # vectorized Newton-Raphson sweep.  Warm-start from the
+        # previous Z's solution; on the first Z of each Y', use the
+        # ideal-gas guess.  _newton_1d_vec applies a vectorized
+        # bisection fallback to any cell where Newton oscillates,
+        # so no per-cell scalar polish is needed.
         for iy, yp in enumerate(yvals):
+            prev_sol = None
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
 
-                for ip in range(nP):
-                    lgp_arr = np.full(nS, logp[ip])
-                    lgt_col = self.get_logt_sp(
-                        svals, lgp_arr, yp, zv,
-                        _zm=_zm, _za=_za, _zr=_zr,
-                        use_tab=False)
-                    logt_sp[:, ip, iy, iz] = np.atleast_1d(lgt_col)
+                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                    guess = prev_sol
+                else:
+                    # Cold start: mid-range logT.  Newton converges
+                    # in 20-30 iterations from here; subsequent Z
+                    # slabs warm-start and converge in 3-6.
+                    guess = np.full_like(S_2d, 0.5 * (1.5 + 7.0))
+
+                def residual(lgt_2d, _yp=yp, _zv=zv,
+                             _zm_=_zm, _za_=_za, _zr_=_zr):
+                    s_test = self._s_pt(P_2d, lgt_2d, _yp, _zv,
+                                        _zm_, _za_, _zr_) * erg_to_kbbar
+                    return s_test - S_2d
+
+                sol, _conv = self._newton_1d_vec(
+                    residual, guess, lo_abs=1.5, hi_abs=7.0)
+                # _newton_1d_vec already performs vectorized
+                # bisection on cells where Newton oscillated; cells
+                # that still didn't converge here are out-of-domain
+                # (no sign change in [lo, hi]) and remain NaN.
+
+                logt_sp[:, :, iy, iz] = sol
+                prev_sol = sol
 
         pbar.close()
 
@@ -2499,16 +2651,14 @@ class hhe_z_mixtures():
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # Hampel pass on logT(S,P,Y',Z) along the composition axes only.
-        # axes=[2, 3] = (Y', Z).  Filtering along S (axis 0) or P
-        # (axis 1) would smear the H2 pressure-dissociation contour;
-        # filtering along Y'/Z catches isolated bad inversions in
-        # composition without that risk.
-        if verbose:
-            print("Running Hampel outlier filter on logT "
-                  "along Y' and Z axes ...")
-        self._hampel_nd(logt_sp, axes=[2, 3],
-                        window=5, n_sigma=3.0, verbose=verbose)
+        # No Hampel pass on the inverted logT(S,P,Y',Z).  The
+        # composition-axis boundary cells (Y'=0/1, Z=0/1) carry
+        # qualitatively different physics from interior cells, and a
+        # window/MAD test along Y'/Z misclassifies the boundary as an
+        # outlier and smears it inward, producing visible inversion
+        # gaps near pure He / pure metal limits.  Newton convergence
+        # failures show up as NaNs and have already been handled by
+        # _fill_table_nans above.
 
         # --- Optional Gaussian smoothing along S and P axes ---
         if smooth_sigma > 0:
@@ -2685,19 +2835,37 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
+        # 2-D mesh of (rho, T) targets used by the vectorized Newton
+        R_2d, T_2d = np.meshgrid(logrho, logt, indexing='ij')  # (nR, nT)
+
+        # Newton bounds in logP — span the build's logP grid
+        lgp_lo = float(self.logp_vals[0])
+        lgp_hi = float(self.logp_vals[-1])
+
+        # Vectorized Newton on the entire (nR, nT) slab per (Y', Z).
+        # _newton_1d_vec applies a vectorized bisection fallback to
+        # any cell where Newton oscillates.
         for iy, yp in enumerate(yvals):
+            prev_sol = None
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
 
-                for it in range(nT):
-                    lgt_arr = np.full(nR, logt[it])
-                    lgp_col = self.get_logp_rhot(
-                        logrho, lgt_arr, yp, zv,
-                        _zm=_zm, _za=_za, _zr=_zr,
-                        use_tab=False)
-                    logp_tab[:, it, iy, iz] = np.atleast_1d(
-                        lgp_col)
+                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                    guess = prev_sol
+                else:
+                    guess = np.full_like(R_2d, 0.5 * (lgp_lo + lgp_hi))
+
+                def residual(lgp_2d, _yp=yp, _zv=zv,
+                             _zm_=_zm, _za_=_za, _zr_=_zr):
+                    rho_test = self._logrho_pt(lgp_2d, T_2d, _yp, _zv,
+                                                _zm_, _za_, _zr_)
+                    return rho_test - R_2d
+
+                sol, _conv = self._newton_1d_vec(
+                    residual, guess, lo_abs=lgp_lo, hi_abs=lgp_hi)
+                logp_tab[:, :, iy, iz] = sol
+                prev_sol = sol
 
         pbar.close()
 
@@ -2708,13 +2876,11 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
 
-        # Hampel pass on logP(rho,T,Y',Z) along the composition axes
-        # only.  axes=[2, 3] = (Y', Z).
-        if verbose:
-            print("Running Hampel outlier filter on logP "
-                  "along Y' and Z axes ...")
-        self._hampel_nd(logp_tab, axes=[2, 3],
-                        window=5, n_sigma=3.0, verbose=verbose)
+        # No Hampel pass on the inverted logP(rho,T,Y',Z) — see
+        # comment in build_sp_table.  Composition boundaries (Y'=0/1,
+        # Z=0/1) carry physics that's qualitatively different from
+        # interior cells, and Hampel along those axes smears the
+        # boundary into the interior.
 
         # --- Optional Gaussian smoothing along rho and T axes ---
         if smooth_sigma > 0:
@@ -2958,24 +3124,33 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        # Temporarily disable rhoP table to force Newton path
-        saved_rgi = self._logt_rhop_rgi
-        self._logt_rhop_rgi = None
-        try:
-            for iy, yp in enumerate(yvals):
-                for iz, zv in enumerate(zvals):
-                    pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
-                    pbar.update(1)
+        # 2-D mesh of (rho, P) targets used by the vectorized Newton
+        R_2d, P_2d = np.meshgrid(logrho, logp, indexing='ij')  # (nR, nP)
 
-                    for ip in range(nP):
-                        lgp_arr = np.full(nR, logp[ip])
-                        lgt_col = self._logt_rhop_noconv(
-                            logrho, lgp_arr, yp, zv,
-                            _zm=_zm, _za=_za, _zr=_zr)
-                        logt_tab[:, ip, iy, iz] = np.atleast_1d(
-                            lgt_col)
-        finally:
-            self._logt_rhop_rgi = saved_rgi
+        # Vectorized Newton on the entire (nR, nP) slab per (Y', Z).
+        # _newton_1d_vec applies a vectorized bisection fallback to
+        # any cell where Newton oscillates.
+        for iy, yp in enumerate(yvals):
+            prev_sol = None
+            for iz, zv in enumerate(zvals):
+                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+                pbar.update(1)
+
+                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                    guess = prev_sol
+                else:
+                    guess = np.full_like(R_2d, 0.5 * (1.5 + 7.0))
+
+                def residual(lgt_2d, _yp=yp, _zv=zv,
+                             _zm_=_zm, _za_=_za, _zr_=_zr):
+                    rho_test = self._logrho_pt(P_2d, lgt_2d, _yp, _zv,
+                                                _zm_, _za_, _zr_)
+                    return rho_test - R_2d
+
+                sol, _conv = self._newton_1d_vec(
+                    residual, guess, lo_abs=1.5, hi_abs=7.0)
+                logt_tab[:, :, iy, iz] = sol
+                prev_sol = sol
 
         pbar.close()
 
@@ -2986,14 +3161,9 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # Hampel pass on logT(rho,P,Y',Z) along the composition axes
-        # only.  axes=[2, 3] = (Y', Z).  (The stored quantity is logT;
-        # the rho-P table doesn't store an S column.)
-        if verbose:
-            print("Running Hampel outlier filter on logT "
-                  "along Y' and Z axes ...")
-        self._hampel_nd(logt_tab, axes=[2, 3],
-                        window=5, n_sigma=3.0, verbose=verbose)
+        # No Hampel pass on the inverted logT(rho,P,Y',Z) — see
+        # comment in build_sp_table.  Composition boundaries (Y'=0/1,
+        # Z=0/1) get smeared into the interior by Y'/Z Hampel.
 
         # --- Optional Gaussian smoothing along rho and P axes ---
         if smooth_sigma > 0:
@@ -3313,49 +3483,80 @@ class hhe_z_mixtures():
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
 
-        prev_z = np.full((nS, nR), np.nan)
+        # 2-D mesh of (S, rho) targets used by the vectorized Newton
+        S_2d, R_2d = np.meshgrid(svals, logrho, indexing='ij')  # (nS, nR)
 
+        # Newton bounds in the primary unknown
+        if use_rhot:
+            lo_abs, hi_abs = 1.5, 7.0           # logT bounds
+        else:
+            lo_abs = float(self.logp_vals[0])    # logP bounds
+            hi_abs = float(self.logp_vals[-1])
+
+        # Vectorized 1-D Newton on the entire (nS, nR) slab per (Y', Z).
+        # The "inner" step (rho-T or S-P inversion to recover the
+        # dependency variable) is array-aware via the loaded RGI tables
+        # when use_tab=True, so each vectorized Newton iteration is a
+        # few batched RGI calls.  _newton_1d_vec applies a vectorized
+        # bisection fallback to any cell where Newton oscillates.
         for iy, yp in enumerate(yvals):
-            prev_z[:] = np.nan
-
+            prev_sol = None  # primary-unknown solution from previous Z
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
 
-                for ir in range(nR):
-                    rho_target = logrho[ir]
-                    prev_s = np.nan
+                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                    guess = prev_sol
+                else:
+                    guess = np.full_like(S_2d, 0.5 * (lo_abs + hi_abs))
 
-                    for isv in range(nS):
-                        s_phys = svals[isv]
+                if use_rhot:
+                    # Solve for logT at fixed (S, rho).  Inner step:
+                    # P = logp_rhot(rho, T, Y', Z); residual is in S.
+                    def residual(lgt_2d, _yp=yp, _zv=zv,
+                                 _zm_=_zm, _za_=_za, _zr_=_zr):
+                        lgp = self.get_logp_rhot(
+                            R_2d, lgt_2d, _yp, _zv, _zm_, _za_, _zr_,
+                            use_tab=use_tab)
+                        s_test = self._s_pt(
+                            lgp, lgt_2d, _yp, _zv,
+                            _zm_, _za_, _zr_) * erg_to_kbbar
+                        return s_test - S_2d
+                else:
+                    # Solve for logP at fixed (S, rho).  Inner step:
+                    # T = logt_sp(S, P, Y', Z); residual is in rho.
+                    def residual(lgp_2d, _yp=yp, _zv=zv,
+                                 _zm_=_zm, _za_=_za, _zr_=_zr):
+                        lgt = self.get_logt_sp(
+                            S_2d, lgp_2d, _yp, _zv, _zm_, _za_, _zr_,
+                            use_tab=use_tab)
+                        rho_test = self._logrho_pt(
+                            lgp_2d, lgt, _yp, _zv, _zm_, _za_, _zr_)
+                        return rho_test - R_2d
 
-                        prev_guess = (prev_s
-                                      if np.isfinite(prev_s)
-                                      else prev_z[isv, ir])
+                sol, _conv = self._newton_1d_vec(
+                    residual, guess, lo_abs=lo_abs, hi_abs=hi_abs)
 
-                        if use_rhot:
-                            lgp, lgt = self._srho_via_rhot(
-                                s_phys, rho_target, yp, zv,
-                                _zm, _za, _zr,
-                                prev_lgt=(prev_guess
-                                          if np.isfinite(prev_guess)
-                                          else None),
-                                use_tab=use_tab)
-                        else:
-                            lgp, lgt = self._srho_via_sp(
-                                s_phys, rho_target, yp, zv,
-                                _zm, _za, _zr,
-                                prev_lgp=(prev_guess
-                                          if np.isfinite(prev_guess)
-                                          else None),
-                                use_tab=use_tab)
+                # Recover the dependency variable on the converged grid
+                if use_rhot:
+                    lgt_slab = sol
+                    lgp_slab = self.get_logp_rhot(
+                        R_2d, lgt_slab, yp, zv, _zm, _za, _zr,
+                        use_tab=use_tab)
+                else:
+                    lgp_slab = sol
+                    lgt_slab = self.get_logt_sp(
+                        S_2d, lgp_slab, yp, zv, _zm, _za, _zr,
+                        use_tab=use_tab)
 
-                        if np.isfinite(lgp) and np.isfinite(lgt):
-                            logp_tab[isv, ir, iy, iz] = lgp
-                            logt_tab[isv, ir, iy, iz] = lgt
-                            warm = lgt if use_rhot else lgp
-                            prev_z[isv, ir] = warm
-                            prev_s = warm
+                # Mark cells as NaN if either piece failed
+                bad_final = ~(np.isfinite(lgp_slab) & np.isfinite(lgt_slab))
+                lgp_slab = np.where(bad_final, np.nan, lgp_slab)
+                lgt_slab = np.where(bad_final, np.nan, lgt_slab)
+
+                logp_tab[:, :, iy, iz] = lgp_slab
+                logt_tab[:, :, iy, iz] = lgt_slab
+                prev_sol = sol
 
         pbar.close()
 
@@ -3367,14 +3568,9 @@ class hhe_z_mixtures():
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # Hampel pass on logP and logT along the composition axes only.
-        # axes=[2, 3] = (Y', Z).
-        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
-            if verbose:
-                print(f"Running Hampel outlier filter on {label} "
-                      f"along Y' and Z axes ...")
-            self._hampel_nd(arr, axes=[2, 3],
-                            window=5, n_sigma=3.0, verbose=verbose)
+        # No Hampel pass on the inverted logP, logT(S,rho,Y',Z) —
+        # see comment in build_sp_table.  Composition boundaries
+        # (Y'=0/1, Z=0/1) get smeared into the interior by Y'/Z Hampel.
 
         # --- Optional Gaussian smoothing along S and rho axes ---
         if smooth_sigma > 0:
