@@ -93,7 +93,7 @@ DEFAULTS = {
 
     # S grid for SP and S-ρ tables
     's_lo':       1.5,    # kb/baryon — lower entropy bound
-    's_hi':       12.0,   # kb/baryon — upper entropy bound
+    's_hi':       12.1,   # kb/baryon — upper entropy bound
     's_step':     0.1,    # kb/baryon — entropy step
 
     # Y' and Z grids

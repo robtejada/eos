@@ -1601,21 +1601,12 @@ class hhe_z_mixtures():
                     print(f"Filling {n_nan} NaN cells in {label} ...")
                 self._fill_nans_2axis(arr, axis0=0, axis1=1)
 
-        # Detect and replace finite outlier spikes along the P axis
-        # only.  The CD21 H-He forward model produces isolated entropy
-        # spikes (e.g. 260x at logP=12.75, low T) from numerical
-        # artifacts in the underlying tables that are 1-D in P.
-        #
-        # Cross-axis Hampel on the PT forward model is intentionally
-        # NOT applied: composition-axis (Y', Z) boundary cells (e.g.
-        # the Y'=1 pure-He limit) carry real logarithmic kinks in the
-        # mixing entropy that a window/MAD test misclassifies as
-        # outliers, and the CD21 H2 pressure-dissociation surface
-        # at high (P,T) is a real physical step that looks 1-cell-wide
-        # along the T axis.  All-axes filtering smears those features
-        # and produces visible isentrope artifacts.  Only S is
-        # filtered; rho and U at the same grid points are typically
-        # smooth.
+        # --- Hampel pass 1: S along the P axis only ---
+        # Targets the known CD21 H-He single-cell entropy spike (e.g.
+        # 260x at logP=12.75, low T) from numerical artifacts in the
+        # underlying tables that are 1-D in P.  This artifact is
+        # persistent across (Y', Z), so it would not show up as an
+        # outlier from the composition-axis perspective.
         if verbose:
             print("Running Hampel outlier filter on S along P axis ...")
         flat = s_pt.reshape(nP, -1)  # (nP, nT*nY*nZ)
@@ -1630,6 +1621,19 @@ class hhe_z_mixtures():
         if n_outliers > 0 and verbose:
             print(f"Replaced {n_outliers} finite outlier cells "
                   f"in S (Hampel along P axis only)")
+
+        # --- Hampel pass 2: S, logrho, logU along the composition
+        # axes (Y', Z) only.  axes=[2, 3].  This catches isolated
+        # composition-direction outliers without touching the P or T
+        # axes, where the H2 pressure-dissociation step is a real
+        # physical feature that all-axes filtering would smear.
+        for arr, label in [(s_pt, 'S'), (logrho_pt, 'logrho'),
+                           (logu_pt, 'logU')]:
+            if verbose:
+                print(f"Running Hampel outlier filter on {label} "
+                      f"along Y' and Z axes ...")
+            self._hampel_nd(arr, axes=[2, 3],
+                            window=5, n_sigma=3.0, verbose=verbose)
 
         s_f32 = s_pt.astype(np.float32)
         logrho_f32 = logrho_pt.astype(np.float32)
@@ -2495,12 +2499,16 @@ class hhe_z_mixtures():
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # No Hampel pass on the inverted logT(S,P,Y',Z): cross-axis
-        # filtering treats real composition-boundary kinks at Y'=1 / Z=1
-        # and the H2 pressure-dissociation contour across the P axis as
-        # outliers and smears them, producing visible isentrope artifacts.
-        # Newton convergence failures show up as NaNs and have already
-        # been handled by _fill_table_nans above.
+        # Hampel pass on logT(S,P,Y',Z) along the composition axes only.
+        # axes=[2, 3] = (Y', Z).  Filtering along S (axis 0) or P
+        # (axis 1) would smear the H2 pressure-dissociation contour;
+        # filtering along Y'/Z catches isolated bad inversions in
+        # composition without that risk.
+        if verbose:
+            print("Running Hampel outlier filter on logT "
+                  "along Y' and Z axes ...")
+        self._hampel_nd(logt_sp, axes=[2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
 
         # --- Optional Gaussian smoothing along S and P axes ---
         if smooth_sigma > 0:
@@ -2700,9 +2708,13 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
 
-        # No Hampel pass on the inverted logP(rho,T,Y',Z): see comment
-        # in build_sp_table.  NaN-fill above already handled Newton
-        # convergence failures.
+        # Hampel pass on logP(rho,T,Y',Z) along the composition axes
+        # only.  axes=[2, 3] = (Y', Z).
+        if verbose:
+            print("Running Hampel outlier filter on logP "
+                  "along Y' and Z axes ...")
+        self._hampel_nd(logp_tab, axes=[2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
 
         # --- Optional Gaussian smoothing along rho and T axes ---
         if smooth_sigma > 0:
@@ -2974,9 +2986,14 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # No Hampel pass on the inverted logT(rho,P,Y',Z): see comment
-        # in build_sp_table.  NaN-fill above already handled Newton
-        # convergence failures.
+        # Hampel pass on logT(rho,P,Y',Z) along the composition axes
+        # only.  axes=[2, 3] = (Y', Z).  (The stored quantity is logT;
+        # the rho-P table doesn't store an S column.)
+        if verbose:
+            print("Running Hampel outlier filter on logT "
+                  "along Y' and Z axes ...")
+        self._hampel_nd(logt_tab, axes=[2, 3],
+                        window=5, n_sigma=3.0, verbose=verbose)
 
         # --- Optional Gaussian smoothing along rho and P axes ---
         if smooth_sigma > 0:
@@ -3350,9 +3367,14 @@ class hhe_z_mixtures():
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # No Hampel pass on the inverted logP(S,rho,Y',Z), logT(S,rho,Y',Z):
-        # see comment in build_sp_table.  NaN-fill above already handled
-        # Newton convergence failures.
+        # Hampel pass on logP and logT along the composition axes only.
+        # axes=[2, 3] = (Y', Z).
+        for arr, label in [(logp_tab, 'logP'), (logt_tab, 'logT')]:
+            if verbose:
+                print(f"Running Hampel outlier filter on {label} "
+                      f"along Y' and Z axes ...")
+            self._hampel_nd(arr, axes=[2, 3],
+                            window=5, n_sigma=3.0, verbose=verbose)
 
         # --- Optional Gaussian smoothing along S and rho axes ---
         if smooth_sigma > 0:
