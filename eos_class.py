@@ -3424,10 +3424,23 @@ class hhe_z_mixtures():
     def build_srho_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          s_lo=4.0, s_hi=12.0, s_step=0.1,
-                         basis='rhot', use_tab=True,
                          smooth_sigma=0.0,
                          verbose=True):
         """Build logP, logT on a uniform (S, logrho, Y', Z) grid.
+
+        Decomposes the 2-D (S, ρ) → (P, T) inversion into a 1-D
+        outer Newton solve in logT, with the inner step using the
+        pre-computed ρ-T inversion table to recover P at fixed
+        (ρ, T):
+
+            residual(T) = S_PT(P=P_rhoT(ρ, T, Y', Z), T, Y', Z) - S_target
+
+        The outer Newton iterates only over T; P is read from the
+        ρ-T table at each iteration.  After convergence in T, the
+        final P is read once more from the ρ-T table.
+
+        Requires the pre-computed ρ-T inversion table (built first
+        with ``build_rhot_table``) and the PT forward table.
 
         Parameters
         ----------
@@ -3437,27 +3450,24 @@ class hhe_z_mixtures():
             Fixed nested metal sub-fractions.
         s_lo, s_hi, s_step : float
             Entropy range and step in kb/baryon.
-        basis : str, optional
-            ``'rhot'`` (default) or ``'sp'``: 1-D decomposition basis.
-        use_tab : bool, optional
-            Use pre-computed tables for the inner inversion.
         smooth_sigma : float
             If > 0, apply a light Gaussian smoothing (in grid-cell
-            units) along the S and rho axes after Hampel filtering.
+            units) along the S and rho axes after the build.
         verbose : bool
             Print progress.
         """
-        use_rhot = (basis == 'rhot')
-
-        if use_tab:
-            if use_rhot and self._logp_rhot_rgi is None:
-                raise RuntimeError(
-                    "build_srho_table (square) with basis='rhot' and "
-                    "use_tab=True requires a pre-computed rho-T table.")
-            if not use_rhot and self._logt_sp_rgi is None:
-                raise RuntimeError(
-                    "build_srho_table (square) with basis='sp' and "
-                    "use_tab=True requires a pre-computed S-P table.")
+        if self._logp_rhot_rgi is None:
+            raise RuntimeError(
+                "build_srho_table requires a pre-computed rho-T table "
+                "(load via inv_tab=True or call load_rhot_table).  "
+                "Build it first:\n"
+                "  python eos_inversions.py --basis rhot ...")
+        if self._s_pt_rgi is None:
+            raise RuntimeError(
+                "build_srho_table requires a pre-computed P-T table "
+                "(load via pt_tab=True or call load_pt_table).  "
+                "Build it first:\n"
+                "  python eos_inversions.py --basis pt ...")
 
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
@@ -3472,13 +3482,15 @@ class hhe_z_mixtures():
             print(f"  Y' grid: {nY} pts, Z grid: {nZ} pts")
             print(f"  Total cells: {nS}x{nR}x{nY}x{nZ} = "
                   f"{nS*nR*nY*nZ:,}")
+            print(f"  Decomposition: 1-D outer Newton in T using "
+                  f"the rho-T table for the inner P(rho,T) step.")
 
         logp_tab = np.full((nS, nR, nY, nZ), np.nan, dtype=float)
         logt_tab = np.full((nS, nR, nY, nZ), np.nan, dtype=float)
 
         total = nY * nZ
         pbar = tqdm(total=total,
-                     desc=f"Inverting S,rho -> P,T (square, {basis})",
+                     desc="Inverting P,T -> S,rho (1-D via rho-T)",
                      disable=not verbose,
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
                                 '[{elapsed}<{remaining}]')
@@ -3486,21 +3498,16 @@ class hhe_z_mixtures():
         # 2-D mesh of (S, rho) targets used by the vectorized Newton
         S_2d, R_2d = np.meshgrid(svals, logrho, indexing='ij')  # (nS, nR)
 
-        # Newton bounds in the primary unknown
-        if use_rhot:
-            lo_abs, hi_abs = 1.5, 7.0           # logT bounds
-        else:
-            lo_abs = float(self.logp_vals[0])    # logP bounds
-            hi_abs = float(self.logp_vals[-1])
+        # Outer Newton bounds in logT
+        lo_abs, hi_abs = 1.5, 7.0
 
-        # Vectorized 1-D Newton on the entire (nS, nR) slab per (Y', Z).
-        # The "inner" step (rho-T or S-P inversion to recover the
-        # dependency variable) is array-aware via the loaded RGI tables
-        # when use_tab=True, so each vectorized Newton iteration is a
-        # few batched RGI calls.  _newton_1d_vec applies a vectorized
+        # Vectorized 1-D outer Newton in logT on the entire (nS, nR)
+        # slab per (Y', Z).  Inner P(rho, T) lookup is array-aware via
+        # the loaded rho-T RGI, so each vectorized Newton iteration is
+        # a few batched RGI calls.  _newton_1d_vec applies a vectorized
         # bisection fallback to any cell where Newton oscillates.
         for iy, yp in enumerate(yvals):
-            prev_sol = None  # primary-unknown solution from previous Z
+            prev_sol = None
             for iz, zv in enumerate(zvals):
                 pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
                 pbar.update(1)
@@ -3510,44 +3517,27 @@ class hhe_z_mixtures():
                 else:
                     guess = np.full_like(S_2d, 0.5 * (lo_abs + hi_abs))
 
-                if use_rhot:
-                    # Solve for logT at fixed (S, rho).  Inner step:
-                    # P = logp_rhot(rho, T, Y', Z); residual is in S.
-                    def residual(lgt_2d, _yp=yp, _zv=zv,
-                                 _zm_=_zm, _za_=_za, _zr_=_zr):
-                        lgp = self.get_logp_rhot(
-                            R_2d, lgt_2d, _yp, _zv, _zm_, _za_, _zr_,
-                            use_tab=use_tab)
-                        s_test = self._s_pt(
-                            lgp, lgt_2d, _yp, _zv,
-                            _zm_, _za_, _zr_) * erg_to_kbbar
-                        return s_test - S_2d
-                else:
-                    # Solve for logP at fixed (S, rho).  Inner step:
-                    # T = logt_sp(S, P, Y', Z); residual is in rho.
-                    def residual(lgp_2d, _yp=yp, _zv=zv,
-                                 _zm_=_zm, _za_=_za, _zr_=_zr):
-                        lgt = self.get_logt_sp(
-                            S_2d, lgp_2d, _yp, _zv, _zm_, _za_, _zr_,
-                            use_tab=use_tab)
-                        rho_test = self._logrho_pt(
-                            lgp_2d, lgt, _yp, _zv, _zm_, _za_, _zr_)
-                        return rho_test - R_2d
+                # Residual in S, with P read from the rho-T table at
+                # each iteration via use_tab=True (one batched RGI
+                # lookup per Newton step).
+                def residual(lgt_2d, _yp=yp, _zv=zv,
+                             _zm_=_zm, _za_=_za, _zr_=_zr):
+                    lgp = self.get_logp_rhot(
+                        R_2d, lgt_2d, _yp, _zv, _zm_, _za_, _zr_,
+                        use_tab=True)
+                    s_test = self._s_pt(
+                        lgp, lgt_2d, _yp, _zv,
+                        _zm_, _za_, _zr_) * erg_to_kbbar
+                    return s_test - S_2d
 
                 sol, _conv = self._newton_1d_vec(
                     residual, guess, lo_abs=lo_abs, hi_abs=hi_abs)
 
-                # Recover the dependency variable on the converged grid
-                if use_rhot:
-                    lgt_slab = sol
-                    lgp_slab = self.get_logp_rhot(
-                        R_2d, lgt_slab, yp, zv, _zm, _za, _zr,
-                        use_tab=use_tab)
-                else:
-                    lgp_slab = sol
-                    lgt_slab = self.get_logt_sp(
-                        S_2d, lgp_slab, yp, zv, _zm, _za, _zr,
-                        use_tab=use_tab)
+                # Recover P from the rho-T table at the converged T
+                lgt_slab = sol
+                lgp_slab = self.get_logp_rhot(
+                    R_2d, lgt_slab, yp, zv, _zm, _za, _zr,
+                    use_tab=True)
 
                 # Mark cells as NaN if either piece failed
                 bad_final = ~(np.isfinite(lgp_slab) & np.isfinite(lgt_slab))

@@ -20,8 +20,9 @@ Build order
 -----------
 The P-T table must exist before any of the inversions can run, since
 the inversions all use ``pt_tab=True`` to read the smooth P-T forward
-model.  The S-ρ inversion additionally needs either the ρ-T or the
-S-P table (see ``--srho_basis``).
+model.  The S-ρ inversion additionally needs the ρ-T inversion
+table — it does a 1-D outer Newton in T with the inner P(ρ, T) step
+served by the ρ-T table — so build ρ-T before S-ρ.
 
 Usage
 -----
@@ -33,8 +34,7 @@ Usage
     python eos_inversions.py --basis sp   --hhe_eos cd --z_eos aqua_revised
     python eos_inversions.py --basis rhot --hhe_eos cms
     python eos_inversions.py --basis rhop --hhe_eos cd --z_eos aqua_revised
-    python eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised \\
-                             --srho_basis rhot
+    python eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised
 
     # Customise the P/T grid for any basis:
     python eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised \\
@@ -189,17 +189,6 @@ def build_parser():
     p.add_argument('--z_step', type=float, default=DEFAULTS['z_step'],
                    help=f"Z step (default: {DEFAULTS['z_step']})")
 
-    # S-ρ specific
-    p.add_argument('--srho_basis', default='rhot',
-                   choices=['rhot', 'sp'],
-                   help="1-D decomposition for srho inversion "
-                        "(default: rhot)")
-    p.add_argument('--srho_use_tab', default=True,
-                   type=lambda x: x.lower() not in ('false', '0', 'no'),
-                   help="Use pre-computed rhot/sp table for srho "
-                        "inversion (default: True). Set to False "
-                        "to use per-point Newton-Raphson.")
-
     # Post-inversion smoothing
     p.add_argument('--smooth_sigma', type=float, default=0.0,
                    help="Gaussian smoothing sigma (grid cells) "
@@ -249,8 +238,7 @@ def main():
         nS = len(np.arange(args.s_lo, args.s_hi + args.s_step * 0.1, args.s_step))
         print(f"  S range:     [{args.s_lo}, {args.s_hi}] step {args.s_step} ({nS} pts)")
     if args.basis == 'srho':
-        print(f"  srho basis:  {args.srho_basis}")
-        print(f"  srho use_tab:{args.srho_use_tab}")
+        print(f"  srho basis:  rho-T (1-D outer Newton in T)")
     if args.smooth_sigma > 0:
         print(f"  smooth_sigma:{args.smooth_sigma}")
     nY, nZ = len(yvals), len(zvals)
@@ -292,11 +280,12 @@ def main():
     # (which are what we're building).  For --basis pt, both are off
     # since we build from raw VAL.
     #
-    # For --basis srho with srho_use_tab=True, we set inv_tab=True so
-    # the required dependency table (ρ-T or S-P) is auto-loaded.
+    # For --basis srho we set inv_tab=True so the rho-T dependency
+    # table auto-loads (build_srho_table does a 1-D outer Newton in
+    # T using rho-T table lookups for the inner P(rho,T) step).
     # srho_tab=False because we're building a fresh S-ρ table.
     _pt_tab  = (args.basis != 'pt')  # PT basis builds from VAL
-    _inv_tab = (args.basis == 'srho' and args.srho_use_tab)
+    _inv_tab = (args.basis == 'srho')
     eos = hhe_z_mixtures(
         hhe_eos_name=args.hhe_eos,
         hg=hg,
@@ -340,32 +329,20 @@ def main():
         eos.save_rhop_table(result, path=args.output)
 
     elif args.basis == 'srho':
-        # The S-ρ inversion uses a 1-D decomposition.  When
-        # use_tab=True, the required dependency table (ρ-T or S-P)
-        # was auto-loaded via inv_tab=True above.  Verify it's there.
-        if args.srho_use_tab:
-            if args.srho_basis == 'rhot' and eos._logp_rhot_rgi is None:
-                rhot_path = eos._table_path('rhot')
-                print(f"ERROR: rho-T table not found at {rhot_path}")
-                print("Build it first:  python eos_inversions.py "
-                      "--basis rhot ...")
-                print("Or set --srho_use_tab False to use "
-                      "per-point Newton-Raphson.")
-                sys.exit(1)
-            if args.srho_basis == 'sp' and eos._logt_sp_rgi is None:
-                sp_path = eos._table_path('sp')
-                print(f"ERROR: S-P table not found at {sp_path}")
-                print("Build it first:  python eos_inversions.py "
-                      "--basis sp ...")
-                print("Or set --srho_use_tab False to use "
-                      "per-point Newton-Raphson.")
-                sys.exit(1)
+        # 1-D outer Newton in T using the pre-computed rho-T table.
+        # build_srho_table itself raises a clear RuntimeError if the
+        # rho-T table is missing, but verify here for a friendlier CLI
+        # message.
+        if eos._logp_rhot_rgi is None:
+            rhot_path = eos._table_path('rhot')
+            print(f"ERROR: rho-T table not found at {rhot_path}")
+            print("Build it first:  python eos_inversions.py "
+                  "--basis rhot ...")
+            sys.exit(1)
 
         result = eos.build_srho_table(yvals, zvals,
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
-                                      basis=args.srho_basis,
-                                      use_tab=args.srho_use_tab,
                                       smooth_sigma=args.smooth_sigma)
         eos.save_srho_table(result, path=args.output)
 
