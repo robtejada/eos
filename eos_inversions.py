@@ -28,7 +28,6 @@ Usage
 -----
     # Build P-T forward table first (no per-component smoothing):
     python eos/eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised
-    python eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised
 
     # Then build the inversions (any order, except srho is last):
     python eos_inversions.py --basis sp   --hhe_eos cd --z_eos aqua_revised
@@ -46,15 +45,57 @@ Usage
     python eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised \\
                              --smooth_hhe --smooth_z
 
-All parameters have sensible defaults.  Tables are saved to the
-auto-load paths used by ``hhe_z_mixtures(pt_tab=True, inv_tab=True)``.
+    # Turn on post-inversion smoothing (Hampel + Gaussian sigma=1) on
+    # the inverted table itself:
+    python eos_inversions.py --basis sp --hhe_eos cd --z_eos aqua_revised \\
+                             --smooth_inverted
+
+All parameters have sensible defaults.  Tables are always written to
+(and auto-loaded from) the canonical ``*_<basis>_square.npz`` paths
+used by ``hhe_z_mixtures(pt_tab=True, inv_tab=True)``.
+
+Reference recipe (full smoothed pipeline used to generate the committed tables)
+-------------------------------------------------------------------------------
+The five commands below reproduce the production smooth tables for the
+``cd + aqua_revised`` configuration.  Run in order — PT first (so its
+output is on disk for the inversions to read), then ρ-T (so srho can
+read it), then any of {sp, rhop, srho}.
+
+    # 1) PT forward, with per-component smoothing of H-He and Z
+    #    component tables before VAL mixing:
+    python eos/eos_inversions.py --basis pt --hhe_eos cd --z_eos aqua_revised \\
+                                 --smooth_hhe --smooth_z
+
+    # 2) rho-T inversion on an extended (logP, logrho) grid, with
+    #    post-inversion Hampel + Gaussian smoothing:
+    python eos/eos_inversions.py --basis rhot --hhe_eos cd --z_eos aqua_revised \\
+                                 --logp_lo 0.0 --logp_hi 16 --logrho_lo -8.0 \\
+                                 --n_workers 10 --smooth_inverted
+
+    # 3) S-P inversion:
+    python eos/eos_inversions.py --basis sp --hhe_eos cd --z_eos aqua_revised \\
+                                 --n_workers 10 --smooth_inverted
+
+    # 4) rho-P inversion:
+    python eos/eos_inversions.py --basis rhop --hhe_eos cd --z_eos aqua_revised \\
+                                 --n_workers 10 --smooth_inverted
+
+    # 5) S-rho inversion (extended S range to S=40 to cover low-P /
+    #    high-T queries in the Sackur-Tetrode regime; finer S step,
+    #    coarser Z step to keep the file size manageable):
+    python eos/eos_inversions.py --basis srho --hhe_eos cd --z_eos aqua_revised \\
+                                 --logrho_lo -8.0 --logp_lo 1.0 --logp_hi 16.0 \\
+                                 --s_lo 2.0 --s_hi 40.0 --s_step 0.05 \\
+                                 --z_step 0.05 \\
+                                 --n_workers 10 --smooth_inverted
 
 Default toggles
 ---------------
-    HG23 non-ideal mixing  : ON   (disable with --no_hg)
-    P-T-dependent mu_H     : OFF  (enable  with --mu_h_vary)
-    H-He smoothing         : OFF  (enable  with --smooth_hhe)
-    Z smoothing            : OFF  (enable  with --smooth_z)
+    HG23 non-ideal mixing      : ON   (disable with --no_hg)
+    P-T-dependent mu_H         : OFF  (enable  with --mu_h_vary)
+    H-He smoothing             : OFF  (enable  with --smooth_hhe)
+    Z smoothing                : OFF  (enable  with --smooth_z)
+    Post-inversion smoothing   : OFF  (enable  with --smooth_inverted)
 """
 
 import argparse
@@ -81,7 +122,7 @@ DEFAULTS = {
     'mu_h_vary':  False,       # opt-in via --mu_h_vary
 
     # P-T grid
-    'logp_lo':    5.0, # 1 mbar
+    'logp_lo':    5.0, # 0.1 bar
     'logp_hi':    15.1, # 1000 Mbar
     'logp_step':  0.05,
     'logt_lo':    1.3,
@@ -190,11 +231,16 @@ def build_parser():
                    help=f"Z step (default: {DEFAULTS['z_step']})")
 
     # Post-inversion smoothing
-    p.add_argument('--smooth_sigma', type=float, default=0.0,
-                   help="Gaussian smoothing sigma (grid cells) "
-                        "applied to inversion tables after Hampel "
-                        "filtering along the two physical axes. "
-                        "Recommended: 0.5. (default: 0.0 = off)")
+    p.add_argument('--smooth_inverted', action='store_true',
+                   help="Apply Hampel + light Gaussian (sigma=1 grid "
+                        "cell) smoothing along the two physical axes "
+                        "of the inverted table after NaN-fill.  "
+                        "Composition axes (Y' and Z) are deliberately "
+                        "not smoothed.  Default off -- builds a raw "
+                        "inversion with no post-processing.  Disjoint "
+                        "from --smooth_hhe / --smooth_z (those smooth "
+                        "the underlying H-He / Z component tables).  "
+                        "Has no effect for --basis pt.")
 
     # Parallelism
     p.add_argument('--n_workers', type=int, default=1,
@@ -249,8 +295,8 @@ def main():
         print(f"  S range:     [{args.s_lo}, {args.s_hi}] step {args.s_step} ({nS} pts)")
     if args.basis == 'srho':
         print(f"  srho basis:  rho-T (1-D outer Newton in T)")
-    if args.smooth_sigma > 0:
-        print(f"  smooth_sigma:{args.smooth_sigma}")
+    if args.smooth_inverted and args.basis != 'pt':
+        print(f"  smooth_inverted: True (Hampel + Gaussian sigma=1)")
     if args.n_workers > 1 and args.basis != 'pt':
         print(f"  n_workers:   {args.n_workers}")
     nY, nZ = len(yvals), len(zvals)
@@ -287,7 +333,7 @@ def main():
     print("-" * 65)
 
     # --- Create EOS ---
-    # pt_tab=True uses the smooth P-T table for forward-model evaluation
+    # pt_tab=True uses the P-T table for forward-model evaluation
     # during inversions.  inv_tab=False avoids loading inverted tables
     # (which are what we're building).  For --basis pt, both are off
     # since we build from raw VAL.
@@ -327,19 +373,19 @@ def main():
         result = eos.build_sp_table(yvals, zvals,
                                     s_lo=args.s_lo, s_hi=args.s_hi,
                                     s_step=args.s_step,
-                                    smooth_sigma=args.smooth_sigma,
+                                    smooth_inverted=args.smooth_inverted,
                                     n_workers=args.n_workers)
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
         result = eos.build_rhot_table(yvals, zvals,
-                                      smooth_sigma=args.smooth_sigma,
+                                      smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':
         result = eos.build_rhop_table(yvals, zvals,
-                                      smooth_sigma=args.smooth_sigma,
+                                      smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_rhop_table(result, path=args.output)
 
@@ -358,7 +404,7 @@ def main():
         result = eos.build_srho_table(yvals, zvals,
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
-                                      smooth_sigma=args.smooth_sigma,
+                                      smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_srho_table(result, path=args.output)
 

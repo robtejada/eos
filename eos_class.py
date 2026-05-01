@@ -552,7 +552,7 @@ class z_eos:
                     filled[i] = np.interp(np.arange(len(row)),
                                           np.where(valid)[0], row[valid])
 
-            smoothed_full = gaussian_filter(filled, sigma=[3.0, 3.0],
+            smoothed_full = gaussian_filter(filled, sigma=[1.0, 1.0],
                                             mode='nearest')
 
             logp_2d = logp[:, np.newaxis]
@@ -1446,7 +1446,6 @@ class hhe_z_mixtures():
                  pt_tab=True,
                  inv_tab=True,
                  srho_tab=False,
-                 sp_rhop_smooth=False,
                  y_prime=True,
                  logp_range=(6.0, 14.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
@@ -1482,10 +1481,6 @@ class hhe_z_mixtures():
             ``inv_tab=True``.  Default False — the S-ρ inversion
             uses the 1-D decomposition via the ρ-T or S-P tables
             instead of the pre-computed 2-D S-ρ table.
-        sp_rhop_smooth : bool
-            If True, load the Gaussian-smoothed S-P and ρ-P tables
-            (``*_smooth.npz``) instead of the default ``*_square.npz``
-            ones.  Only affects auto-loading when ``inv_tab=True``.
         logp_range, logp_step, logt_range, logrho_range, logrho_step :
             Grid bounds and steps for table-build mode.
         interp_method : str
@@ -1499,7 +1494,6 @@ class hhe_z_mixtures():
         self.pt_tab = pt_tab
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
-        self.sp_rhop_smooth = sp_rhop_smooth
         self.y_prime = y_prime
         self._interp_method = interp_method
 
@@ -1512,7 +1506,6 @@ class hhe_z_mixtures():
             species_list=species_list,
             z_eos=z_eos,
             pt_tab=pt_tab, inv_tab=inv_tab, srho_tab=srho_tab,
-            sp_rhop_smooth=sp_rhop_smooth,
             y_prime=y_prime,
             logp_range=logp_range, logp_step=logp_step,
             logt_range=logt_range,
@@ -1571,22 +1564,18 @@ class hhe_z_mixtures():
 
         Controlled by ``self.pt_tab`` (P-T basis table),
         ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P tables), and
-        ``self.srho_tab`` (S-ρ table, loaded only when True).
-        ``self.sp_rhop_smooth=True`` swaps in the Gaussian-smoothed
-        S-P / ρ-P variants (``*_smooth.npz``) when available.
+        ``self.srho_tab`` (S-ρ table, loaded only when True).  Each
+        table is loaded from its canonical ``_square.npz`` path when
+        the file is present.
         """
-        # P-T basis table (controlled by pt_tab)
         if self.pt_tab:
             pt_path = self._table_path('pt')
             if os.path.isfile(pt_path):
                 self.load_pt_table(pt_path)
 
-        # Inverted tables (controlled by inv_tab)
         if self.inv_tab:
             for basis in ('sp', 'rhot', 'rhop'):
                 path = self._table_path(basis)
-                if self.sp_rhop_smooth and basis in ('sp', 'rhop'):
-                    path = path.replace('.npz', '_smooth.npz')
                 if os.path.isfile(path):
                     getattr(self, f'load_{basis}_table')(path)
             # S-ρ table only loaded when explicitly requested
@@ -1779,7 +1768,7 @@ class hhe_z_mixtures():
             data['s_pt'], data['logrho_pt'], data['logu_pt'])
 
     def save_pt_table(self, result, path=None):
-        """Save a P-T table to NPZ."""
+        """Save a P-T table to NPZ at the canonical auto-load path."""
         if path is None:
             path = self._table_path('pt')
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2641,6 +2630,69 @@ class hhe_z_mixtures():
                 print(f"  Axis {ax}: replaced {n_out} outlier cells")
         return n_total
 
+    def _smooth_inverted_table(self, table, sigma=1.0,
+                                hampel_window=5, hampel_n_sigma=3.0,
+                                verbose=True):
+        """Apply Hampel + light Gaussian smoothing to an inverted 4-D
+        table (e.g. ``logt_sp``, ``logp_rhot``, ``logt_rhop``).
+
+        Smoothing is applied **only** along the two physical axes
+        (axes 0 and 1 — e.g. S and P for SP, ρ and T for ρT, etc.).
+        The composition axes (Y' = axis 2, Z = axis 3) are deliberately
+        left untouched: at the boundaries Y'=0/1 and Z=0/1 the physics
+        is qualitatively different from the interior, and a Hampel /
+        Gaussian pass along those axes smears the boundary inward and
+        produces visible artifacts in plots near pure He / pure metal
+        limits.
+
+        Run this **after** ``_fill_table_nans``: Hampel handles
+        isolated outliers from Newton convergence flicker, then a
+        light σ=1-grid-cell Gaussian provides clean FD-derivative
+        behavior for downstream code without distorting the table by
+        more than ~1 grid cell of resolution.
+
+        Parameters
+        ----------
+        table : ndarray, shape (n0, n1, nY, nZ)
+            The 4-D inverted table.  Modified in-place by Hampel.
+        sigma : float
+            Gaussian sigma in grid cells along axes 0 and 1.
+        hampel_window : int
+            Half-window for the Hampel pass.
+        hampel_n_sigma : float
+            Outlier threshold (in MAD-sigmas) for the Hampel pass.
+        verbose : bool
+            Print Hampel replacement counts.
+
+        Returns
+        -------
+        smoothed : ndarray
+            New 4-D array with the same shape as ``table``.  NaN
+            cells are preserved (the Gaussian is mask-aware).
+        """
+        # 1) Hampel along physical axes (in-place) — catches isolated
+        #    Newton-flicker outliers before they get smeared by the
+        #    Gaussian into broader bumps.
+        n_replaced = self._hampel_nd(
+            table, axes=(0, 1),
+            window=hampel_window, n_sigma=hampel_n_sigma,
+            verbose=verbose)
+        if verbose and n_replaced > 0:
+            print(f"  Hampel total: {n_replaced} outlier cells replaced")
+
+        # 2) NaN-aware Gaussian along physical axes only.
+        sigma_4d = [sigma, sigma, 0.0, 0.0]
+        mask = np.isfinite(table)
+        filled = np.where(mask, table, 0.0)
+        weight = mask.astype(float)
+        smoothed = gaussian_filter(filled, sigma=sigma_4d, mode='nearest')
+        weight_s = gaussian_filter(weight, sigma=sigma_4d, mode='nearest')
+        out = np.where(mask, smoothed / np.maximum(weight_s, 1e-10),
+                       np.nan)
+        if verbose:
+            print(f"  Gaussian smoothing applied with sigma={sigma_4d}")
+        return out
+
     # =================================================================
     # Table generation
     # =================================================================
@@ -2734,7 +2786,7 @@ class hhe_z_mixtures():
     def build_sp_table(self, yvals, zvals,
                        _zm=0.0, _za=0.0, _zr=0.0,
                        s_lo=4.0, s_hi=12.0, s_step=0.1,
-                       smooth_sigma=0.0,
+                       smooth_inverted=False,
                        n_workers=1,
                        verbose=True):
         """Build logT on a uniform (S, logP, Y', Z) grid.
@@ -2747,10 +2799,14 @@ class hhe_z_mixtures():
             Fixed nested metal sub-fractions.
         s_lo, s_hi, s_step : float
             Entropy range and step in kb/baryon.
-        smooth_sigma : float
-            If > 0, apply a light Gaussian smoothing (in grid-cell
-            units) along the S and logP axes after Hampel filtering.
-            Recommended starting value: 0.5.
+        smooth_inverted : bool
+            If True, apply a Hampel + light Gaussian (σ=1 grid cell)
+            pass along the S and logP axes after NaN-fill, and save
+            to the ``*_smooth.npz`` variant of the auto-load path.
+            Default False — saves to ``*_square.npz`` with no
+            post-inversion smoothing.  Disjoint from ``smooth_hhe`` /
+            ``smooth_z`` (those smooth the underlying H-He / Z
+            component tables before VAL mixing).
         n_workers : int
             If > 1, dispatch Y' rows across this many worker
             processes via multiprocessing.  Capped at len(yvals).
@@ -2821,31 +2877,20 @@ class hhe_z_mixtures():
                 print(f"  WARNING: {n_nan_after} NaNs remain after "
                       f"interpolation")
 
-        # No Hampel pass on the inverted logT(S,P,Y',Z).  The
-        # composition-axis boundary cells (Y'=0/1, Z=0/1) carry
-        # qualitatively different physics from interior cells, and a
-        # window/MAD test along Y'/Z misclassifies the boundary as an
-        # outlier and smears it inward, producing visible inversion
-        # gaps near pure He / pure metal limits.  Newton convergence
-        # failures show up as NaNs and have already been handled by
-        # _fill_table_nans above.
-
-        # --- Optional Gaussian smoothing along S and P axes ---
-        if smooth_sigma > 0:
-            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
-            mask = np.isfinite(logt_sp)
-            filled = np.where(mask, logt_sp, 0.0)
-            weight = mask.astype(float)
-            smoothed = gaussian_filter(filled, sigma=sigma_4d,
-                                       mode='nearest')
-            weight_s = gaussian_filter(weight, sigma=sigma_4d,
-                                       mode='nearest')
-            logt_sp = np.where(
-                mask, smoothed / np.maximum(weight_s, 1e-10),
-                np.nan)
+        # Hampel + Gaussian along (S, P) only when explicitly opted-in
+        # via smooth_inverted=True.  Y' and Z axes are deliberately
+        # left untouched: composition-axis boundary cells (Y'=0/1,
+        # Z=0/1) carry qualitatively different physics from interior
+        # cells and a window/MAD test along those axes smears the
+        # boundary inward, producing visible artifacts near pure-He
+        # and pure-metal limits.  Newton convergence failures already
+        # show up as NaNs and were handled by _fill_table_nans above.
+        if smooth_inverted:
             if verbose:
-                print(f"Applied Gaussian smoothing with "
-                      f"sigma={sigma_4d}")
+                print("Smoothing inverted table (Hampel + Gaussian "
+                      "along S, P) ...")
+            logt_sp = self._smooth_inverted_table(
+                logt_sp, sigma=1.0, verbose=verbose)
 
         # --- Cast to float32 ---
         logt_sp_f32 = logt_sp.astype(np.float32)
@@ -2877,7 +2922,8 @@ class hhe_z_mixtures():
         return result
 
     def save_sp_table(self, result, path=None):
-        """Save a table dict (from ``build_sp_table``) to NPZ."""
+        """Save a table dict (from ``build_sp_table``) to NPZ at the
+        canonical auto-load path."""
         if path is None:
             path = self._table_path('sp')
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2995,7 +3041,7 @@ class hhe_z_mixtures():
 
     def build_rhot_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         smooth_sigma=0.0,
+                         smooth_inverted=False,
                          n_workers=1,
                          verbose=True):
         """Build logP on a uniform (logrho, logT, Y', Z) grid.
@@ -3006,9 +3052,11 @@ class hhe_z_mixtures():
             1-D Y' and Z grids.
         _zm, _za, _zr : float
             Fixed nested metal sub-fractions.
-        smooth_sigma : float
-            If > 0, apply a light Gaussian smoothing (in grid-cell
-            units) along the rho and logT axes after Hampel filtering.
+        smooth_inverted : bool
+            If True, apply a Hampel + light Gaussian (σ=1 grid cell)
+            pass along the logρ and logT axes after NaN-fill, and save
+            to the ``*_smooth.npz`` variant.  Default False — saves to
+            ``*_square.npz`` with no post-inversion smoothing.
         n_workers : int
             If > 1, dispatch Y' rows across this many worker processes.
             Default 1 (serial).
@@ -3065,28 +3113,15 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logp_tab = self._fill_table_nans(logp_tab)
 
-        # No Hampel pass on the inverted logP(rho,T,Y',Z) — see
-        # comment in build_sp_table.  Composition boundaries (Y'=0/1,
-        # Z=0/1) carry physics that's qualitatively different from
-        # interior cells, and Hampel along those axes smears the
-        # boundary into the interior.
-
-        # --- Optional Gaussian smoothing along rho and T axes ---
-        if smooth_sigma > 0:
-            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
-            mask = np.isfinite(logp_tab)
-            filled = np.where(mask, logp_tab, 0.0)
-            weight = mask.astype(float)
-            smoothed = gaussian_filter(filled, sigma=sigma_4d,
-                                       mode='nearest')
-            weight_s = gaussian_filter(weight, sigma=sigma_4d,
-                                       mode='nearest')
-            logp_tab = np.where(
-                mask, smoothed / np.maximum(weight_s, 1e-10),
-                np.nan)
+        # Hampel + Gaussian along (logρ, logT) only when
+        # smooth_inverted=True.  See build_sp_table for the
+        # composition-axis rationale.
+        if smooth_inverted:
             if verbose:
-                print(f"Applied Gaussian smoothing with "
-                      f"sigma={sigma_4d}")
+                print("Smoothing inverted table (Hampel + Gaussian "
+                      "along rho, T) ...")
+            logp_tab = self._smooth_inverted_table(
+                logp_tab, sigma=1.0, verbose=verbose)
 
         logp_f32 = logp_tab.astype(np.float32)
 
@@ -3120,7 +3155,7 @@ class hhe_z_mixtures():
         return result
 
     def save_rhot_table(self, result, path=None):
-        """Save a ρ-T table dict to NPZ."""
+        """Save a ρ-T table dict to NPZ at the canonical auto-load path."""
         if path is None:
             path = self._table_path('rhot')
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -3303,7 +3338,7 @@ class hhe_z_mixtures():
 
     def build_rhop_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
-                         smooth_sigma=0.0,
+                         smooth_inverted=False,
                          n_workers=1,
                          verbose=True):
         """Build logT on a uniform (logrho, logP, Y', Z) grid.
@@ -3314,9 +3349,11 @@ class hhe_z_mixtures():
             1-D Y' and Z grids.
         _zm, _za, _zr : float
             Fixed nested metal sub-fractions.
-        smooth_sigma : float
-            If > 0, apply a light Gaussian smoothing (in grid-cell
-            units) along the rho and logP axes after Hampel filtering.
+        smooth_inverted : bool
+            If True, apply a Hampel + light Gaussian (σ=1 grid cell)
+            pass along the logρ and logP axes after NaN-fill, and save
+            to the ``*_smooth.npz`` variant.  Default False — saves to
+            ``*_square.npz`` with no post-inversion smoothing.
         n_workers : int
             If > 1, dispatch Y' rows across this many worker processes.
             Default 1 (serial).
@@ -3369,26 +3406,15 @@ class hhe_z_mixtures():
                 print(f"Filling {n_nan} NaN cells by interpolation ...")
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # No Hampel pass on the inverted logT(rho,P,Y',Z) — see
-        # comment in build_sp_table.  Composition boundaries (Y'=0/1,
-        # Z=0/1) get smeared into the interior by Y'/Z Hampel.
-
-        # --- Optional Gaussian smoothing along rho and P axes ---
-        if smooth_sigma > 0:
-            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
-            mask = np.isfinite(logt_tab)
-            filled = np.where(mask, logt_tab, 0.0)
-            weight = mask.astype(float)
-            smoothed = gaussian_filter(filled, sigma=sigma_4d,
-                                       mode='nearest')
-            weight_s = gaussian_filter(weight, sigma=sigma_4d,
-                                       mode='nearest')
-            logt_tab = np.where(
-                mask, smoothed / np.maximum(weight_s, 1e-10),
-                np.nan)
+        # Hampel + Gaussian along (logρ, logP) only when
+        # smooth_inverted=True.  See build_sp_table for the
+        # composition-axis rationale.
+        if smooth_inverted:
             if verbose:
-                print(f"Applied Gaussian smoothing with "
-                      f"sigma={sigma_4d}")
+                print("Smoothing inverted table (Hampel + Gaussian "
+                      "along rho, P) ...")
+            logt_tab = self._smooth_inverted_table(
+                logt_tab, sigma=1.0, verbose=verbose)
 
         logt_f32 = logt_tab.astype(np.float32)
 
@@ -3422,7 +3448,7 @@ class hhe_z_mixtures():
         return result
 
     def save_rhop_table(self, result, path=None):
-        """Save a ρ-P table to NPZ."""
+        """Save a ρ-P table to NPZ at the canonical auto-load path."""
         if path is None:
             path = self._table_path('rhop')
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -3678,7 +3704,7 @@ class hhe_z_mixtures():
     def build_srho_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          s_lo=4.0, s_hi=12.0, s_step=0.1,
-                         smooth_sigma=0.0,
+                         smooth_inverted=False,
                          n_workers=1,
                          verbose=True):
         """Build logP, logT on a uniform (S, logrho, Y', Z) grid.
@@ -3705,9 +3731,12 @@ class hhe_z_mixtures():
             Fixed nested metal sub-fractions.
         s_lo, s_hi, s_step : float
             Entropy range and step in kb/baryon.
-        smooth_sigma : float
-            If > 0, apply a light Gaussian smoothing (in grid-cell
-            units) along the S and rho axes after the build.
+        smooth_inverted : bool
+            If True, apply a Hampel + light Gaussian (σ=1 grid cell)
+            pass along the S and logρ axes after NaN-fill, and save
+            to the ``*_smooth.npz`` variant.  Default False — saves to
+            ``*_square.npz`` with no post-inversion smoothing.  Both
+            ``logp_srho`` and ``logt_srho`` are smoothed.
         verbose : bool
             Print progress.
         """
@@ -3782,29 +3811,17 @@ class hhe_z_mixtures():
             logp_tab = self._fill_table_nans(logp_tab)
             logt_tab = self._fill_table_nans(logt_tab)
 
-        # No Hampel pass on the inverted logP, logT(S,rho,Y',Z) —
-        # see comment in build_sp_table.  Composition boundaries
-        # (Y'=0/1, Z=0/1) get smeared into the interior by Y'/Z Hampel.
-
-        # --- Optional Gaussian smoothing along S and rho axes ---
-        if smooth_sigma > 0:
-            sigma_4d = [smooth_sigma, smooth_sigma, 0.0, 0.0]
-            for arr, label in [(logp_tab, 'logP'),
-                               (logt_tab, 'logT')]:
-                mask = np.isfinite(arr)
-                filled = np.where(mask, arr, 0.0)
-                weight = mask.astype(float)
-                smoothed = gaussian_filter(
-                    filled, sigma=sigma_4d, mode='nearest')
-                weight_s = gaussian_filter(
-                    weight, sigma=sigma_4d, mode='nearest')
-                arr[:] = np.where(
-                    mask,
-                    smoothed / np.maximum(weight_s, 1e-10),
-                    np.nan)
+        # Hampel + Gaussian along (S, logρ) for both arrays only when
+        # smooth_inverted=True.  See build_sp_table for the
+        # composition-axis rationale.
+        if smooth_inverted:
             if verbose:
-                print(f"Applied Gaussian smoothing with "
-                      f"sigma={sigma_4d}")
+                print("Smoothing inverted table (Hampel + Gaussian "
+                      "along S, rho) ...")
+            logp_tab = self._smooth_inverted_table(
+                logp_tab, sigma=1.0, verbose=verbose)
+            logt_tab = self._smooth_inverted_table(
+                logt_tab, sigma=1.0, verbose=verbose)
 
         logp_f32 = logp_tab.astype(np.float32)
         logt_f32 = logt_tab.astype(np.float32)
@@ -3843,7 +3860,7 @@ class hhe_z_mixtures():
         return result
 
     def save_srho_table(self, result, path=None):
-        """Save an S-ρ table to NPZ."""
+        """Save an S-ρ table to NPZ at the canonical auto-load path."""
         if path is None:
             path = self._table_path('srho')
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -4005,7 +4022,7 @@ class hhe_z_mixtures():
     # ρ-P-basis derivatives (Ledoux dS at fixed ρ, P)
     # =================================================================
 
-    def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0,
+    def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1,
                             dy=0.01, **kw):
         """dS/dY|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
 
@@ -4013,15 +4030,31 @@ class hhe_z_mixtures():
         and using the ρ-P inversion to find T(ρ, P, Y±dY, Z).
         """
         _y = self._to_yprime(_y, _z)
-        lgp, _ = self.get_logp_logt_srho(_s, _lgrho, _y, _z, _zr=_frock)
-        if np.isscalar(lgp) and not np.isfinite(lgp):
-            return np.nan
-        lgt_m = self.get_logt_rhop(_lgrho, lgp, _y - dy, _z, _zr=_frock)
-        lgt_p = self.get_logt_rhop(_lgrho, lgp, _y + dy, _z, _zr=_frock)
-        s_m = self._s_pt(lgp, lgt_m, _y - dy, _z, _zr=_frock)
-        s_p = self._s_pt(lgp, lgt_p, _y + dy, _z, _zr=_frock)
-        return (s_p - s_m) / (2 * dy)
 
+        # dPdS|{rho, Y, Z}:
+        dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=ds, **kw)
+        #dPdY|{S, rho, Y}:
+        dpdy_srho = self.get_dpdy_srho(_s, _lgrho, _y, _z, _frock, dy=dy, **kw)
+
+        #dSdY|{rho, P, Z} = -dPdY|{S, rho, Y} / dPdS|{rho, Y, Z}
+        dsdy_rhopy = -dpdy_srho/dpds_rhoy_srho # triple product rule
+
+        return dsdy_rhopy
+    
+    def get_dsdy_rhop(self, _lgrho, _lgp, _y, _z, _frock=0.0,
+                            dy=0.01, **kw):
+        """dS/dY|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
+
+        Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Y
+        and using the ρ-P inversion to find T(ρ, P, Y±dY, Z).
+        """
+        _y = self._to_yprime(_y, _z)
+        lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y - dy, _z, _zr=_frock)
+        lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y + dy, _z, _zr=_frock)
+        s_m = self.get_s_pt(_lgp, lgt_m, _y - dy, _z, _zr=_frock)
+        s_p = self.get_s_pt(_lgp, lgt_p, _y + dy, _z, _zr=_frock)
+        return (s_p - s_m) / (2 * dy)
+    
     def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0,
                             dz=0.01, **kw):
         """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
@@ -4030,18 +4063,58 @@ class hhe_z_mixtures():
         and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
         """
         _y = self._to_yprime(_y, _z)
-        lgp, _ = self.get_logp_logt_srho(_s, _lgrho, _y, _z, _zr=_frock)
-        if np.isscalar(lgp) and not np.isfinite(lgp):
-            return np.nan
-        lgt_m = self.get_logt_rhop(_lgrho, lgp, _y, _z - dz, _zr=_frock)
-        lgt_p = self.get_logt_rhop(_lgrho, lgp, _y, _z + dz, _zr=_frock)
-        s_m = self._s_pt(lgp, lgt_m, _y, _z - dz, _zr=_frock)
-        s_p = self._s_pt(lgp, lgt_p, _y, _z + dz, _zr=_frock)
+        # lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y, _z - dz, _zr=_frock)
+        # lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y, _z + dz, _zr=_frock)
+        # s_m = self.get_s_pt(_lgp, lgt_m, _y, _z - dz, _zr=_frock)
+        # s_p = self.get_s_pt(_lgp, lgt_p, _    y, _z + dz, _zr=_frock)
+        # return (s_p - s_m) / (2 * dz) 
+
+        # dPdS|{rho, Y, Z}:
+        dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=dz, **kw)
+        #dPdZ|{S, rho, Z}:
+        dpdz_srho = self.get_dpdz_srho(_s, _lgrho, _y, _z, _frock, dz=dz, **kw)
+        #dSdZ|{rho, P, Y} = -dPdZ|{S, rho, Z} / dPdS|{rho, Y, Z}
+        dsdz_rhopz = -dpdz_srho/dpds_rhoy_srho # triple product rule
+        return dsdz_rhopz
+
+    def get_dsdz_rhop(self, _lgrho, _lgp, _y, _z, _frock=0.0,
+                            dz=0.01, **kw):
+        """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
+
+        Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Z
+        and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
+        """
+        _y = self._to_yprime(_y, _z)
+        lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y, _z - dz, _zr=_frock)
+        lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y, _z + dz, _zr=_frock)
+        s_m = self._s_pt(_lgp, lgt_m, _y, _z - dz, _zr=_frock)
+        s_p = self._s_pt(_lgp, lgt_p, _y, _z + dz, _zr=_frock)
         return (s_p - s_m) / (2 * dz)
 
     # =================================================================
     # S-ρ-basis derivatives
     # =================================================================
+
+    def get_dpds_rhoy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1, **kw):
+        """dP/dS|_{ρ,Y,Z} via FD on the S-ρ inversion."""
+        _y = self._to_yprime(_y, _z)
+        lgp_m, _ = self.get_logp_logt_srho(_s - ds, _lgrho, _y, _z, _zr=_frock)
+        lgp_p, _ = self.get_logp_logt_srho(_s + ds, _lgrho, _y, _z, _zr=_frock)
+        return (10.0 ** lgp_p - 10.0 ** lgp_m) / (2 * ds / erg_to_kbbar)
+    
+    def get_dpdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
+        """dP/dY|_{S,ρ} via FD on the S-ρ inversion."""
+        _y = self._to_yprime(_y, _z)
+        lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, _y - dy, _z, _zr=_frock)
+        lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, _y + dy, _z, _zr=_frock)
+        return (10.0 ** lgp_p - 10.0 ** lgp_m) / (2 * dy)
+    
+    def get_dpdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
+        """dP/dZ|_{S,ρ} via FD on the S-ρ inversion."""
+        _y = self._to_yprime(_y, _z)
+        lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, _y, _z - dz, _zr=_frock)
+        lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, _y, _z + dz, _zr=_frock)
+        return (10.0 ** lgp_p - 10.0 ** lgp_m) / (2 * dz)
 
     def get_dtdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
         """dT/dY|_{S,ρ} via FD on the S-ρ inversion."""
