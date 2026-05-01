@@ -196,6 +196,16 @@ def build_parser():
                         "filtering along the two physical axes. "
                         "Recommended: 0.5. (default: 0.0 = off)")
 
+    # Parallelism
+    p.add_argument('--n_workers', type=int, default=1,
+                   help="Number of worker processes for the inversion "
+                        "build (default: 1 = serial).  Y' rows are "
+                        "split across workers.  Each worker constructs "
+                        "its own EOS instance once at startup.  "
+                        "Capped at the number of Y' rows.  Has no "
+                        "effect for --basis pt (PT build is already "
+                        "fully vectorised).")
+
     # Output
     p.add_argument('--output', type=str, default=None,
                    help='Output path (default: auto from hhe_eos/z_eos)')
@@ -241,6 +251,8 @@ def main():
         print(f"  srho basis:  rho-T (1-D outer Newton in T)")
     if args.smooth_sigma > 0:
         print(f"  smooth_sigma:{args.smooth_sigma}")
+    if args.n_workers > 1 and args.basis != 'pt':
+        print(f"  n_workers:   {args.n_workers}")
     nY, nZ = len(yvals), len(zvals)
     print(f"  Y' grid:     [{yvals[0]:.3f}, {yvals[-1]:.3f}] step {args.y_step} ({nY} pts)")
     print(f"  Z grid:      [{zvals[0]:.3f}, {zvals[-1]:.3f}] step {args.z_step} ({nZ} pts)")
@@ -315,17 +327,20 @@ def main():
         result = eos.build_sp_table(yvals, zvals,
                                     s_lo=args.s_lo, s_hi=args.s_hi,
                                     s_step=args.s_step,
-                                    smooth_sigma=args.smooth_sigma)
+                                    smooth_sigma=args.smooth_sigma,
+                                    n_workers=args.n_workers)
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
         result = eos.build_rhot_table(yvals, zvals,
-                                      smooth_sigma=args.smooth_sigma)
+                                      smooth_sigma=args.smooth_sigma,
+                                      n_workers=args.n_workers)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':
         result = eos.build_rhop_table(yvals, zvals,
-                                      smooth_sigma=args.smooth_sigma)
+                                      smooth_sigma=args.smooth_sigma,
+                                      n_workers=args.n_workers)
         eos.save_rhop_table(result, path=args.output)
 
     elif args.basis == 'srho':
@@ -343,7 +358,8 @@ def main():
         result = eos.build_srho_table(yvals, zvals,
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
-                                      smooth_sigma=args.smooth_sigma)
+                                      smooth_sigma=args.smooth_sigma,
+                                      n_workers=args.n_workers)
         eos.save_srho_table(result, path=args.output)
 
     elapsed = time.time() - t0

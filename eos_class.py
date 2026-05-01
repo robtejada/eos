@@ -1304,6 +1304,92 @@ class val_mixtures:
         return result
 
 
+# =====================================================================
+# Module-level worker scaffolding for parallel inversion-table builds
+#
+# multiprocessing on macOS uses spawn semantics: each worker re-imports
+# this module and reconstructs the eos instance from kwargs.  The worker
+# instance is held in a module global (_WORKER_EOS) so subsequent task
+# dispatches re-use the same RGI tables instead of rebuilding them.
+# =====================================================================
+
+_WORKER_EOS = None
+
+
+def _worker_init(init_kwargs, build_kind):
+    """Pool initializer.  Constructs one ``hhe_z_mixtures`` per worker.
+
+    Called once when the worker process starts.  ``build_kind`` selects
+    which tables the worker should auto-load:
+      - 'sp', 'rhot', 'rhop': only the P-T forward table is needed.
+      - 'srho': both P-T and rho-T tables are needed (rho-T inversion
+        is read inside the residual at every Newton iteration).
+
+    The kwargs override the parent's pt_tab/inv_tab/srho_tab flags so
+    the worker loads exactly the tables it needs (no more, no less).
+    """
+    global _WORKER_EOS
+    kwargs = dict(init_kwargs)
+    if build_kind in ('sp', 'rhot', 'rhop'):
+        kwargs['pt_tab'] = True
+        kwargs['inv_tab'] = False
+        kwargs['srho_tab'] = False
+    elif build_kind == 'srho':
+        kwargs['pt_tab'] = True
+        kwargs['inv_tab'] = True
+        kwargs['srho_tab'] = False
+    else:
+        raise ValueError(f"Unknown build_kind: {build_kind!r}")
+    _WORKER_EOS = hhe_z_mixtures(**kwargs)
+
+
+def _worker_sp_yrow(args):
+    """Run ``_build_sp_yrow`` on the worker's eos instance."""
+    yp, zvals, _zm, _za, _zr, svals, logp = args
+    return _WORKER_EOS._build_sp_yrow(
+        float(yp), zvals, _zm, _za, _zr, svals, logp)
+
+
+def _worker_rhot_yrow(args):
+    """Run ``_build_rhot_yrow`` on the worker's eos instance."""
+    (yp, zvals, _zm, _za, _zr,
+     logrho, logt, lgp_lo, lgp_hi) = args
+    return _WORKER_EOS._build_rhot_yrow(
+        float(yp), zvals, _zm, _za, _zr,
+        logrho, logt, lgp_lo, lgp_hi)
+
+
+def _worker_rhop_yrow(args):
+    """Run ``_build_rhop_yrow`` on the worker's eos instance."""
+    yp, zvals, _zm, _za, _zr, logrho, logp = args
+    return _WORKER_EOS._build_rhop_yrow(
+        float(yp), zvals, _zm, _za, _zr, logrho, logp)
+
+
+def _worker_srho_yrow(args):
+    """Run ``_build_srho_yrow`` on the worker's eos instance."""
+    (yp, zvals, _zm, _za, _zr,
+     svals, logrho, lo_abs, hi_abs) = args
+    return _WORKER_EOS._build_srho_yrow(
+        float(yp), zvals, _zm, _za, _zr,
+        svals, logrho, lo_abs, hi_abs)
+
+
+_WORKER_DISPATCH = {
+    'sp':   _worker_sp_yrow,
+    'rhot': _worker_rhot_yrow,
+    'rhop': _worker_rhop_yrow,
+    'srho': _worker_srho_yrow,
+}
+
+_BUILD_DESC = {
+    'sp':   "Inverting P,T -> S,P (parallel)",
+    'rhot': "Inverting P,T -> rho,T (parallel)",
+    'rhop': "Inverting P,T -> rho,P (parallel)",
+    'srho': "Inverting P,T -> S,rho (parallel)",
+}
+
+
 class hhe_z_mixtures():
     """H-He-Z EOS with pre-computed inversion tables.
 
@@ -1416,6 +1502,23 @@ class hhe_z_mixtures():
         self.sp_rhop_smooth = sp_rhop_smooth
         self.y_prime = y_prime
         self._interp_method = interp_method
+
+        # Store all init kwargs so worker processes can reconstruct
+        # an equivalent instance (used by parallel build dispatchers).
+        self._init_kwargs = dict(
+            hhe_eos_name=hhe_eos_name, hg=hg,
+            smooth_hhe=smooth_hhe, smooth_z=smooth_z,
+            mu_h_vary=mu_h_vary,
+            species_list=species_list,
+            z_eos=z_eos,
+            pt_tab=pt_tab, inv_tab=inv_tab, srho_tab=srho_tab,
+            sp_rhop_smooth=sp_rhop_smooth,
+            y_prime=y_prime,
+            logp_range=logp_range, logp_step=logp_step,
+            logt_range=logt_range,
+            logrho_range=logrho_range, logrho_step=logrho_step,
+            interp_method=interp_method,
+        )
 
         # --- Forward-model mixer ---
         self.val = val_mixtures(
@@ -2542,10 +2645,97 @@ class hhe_z_mixtures():
     # Table generation
     # =================================================================
 
+    def _parallel_yrow_dispatch(self, kind, tasks, n_workers, verbose=True):
+        """Dispatch a list of Y'-row build tasks across worker processes.
+
+        Each worker process constructs its own ``hhe_z_mixtures`` instance
+        once at startup (loading the relevant tables), then handles its
+        assigned Y' rows.  Within a worker, the Z-axis warm-start chain
+        is preserved exactly as in the serial path: each Y' row resets
+        ``prev_sol`` to None, and the inner Z loop carries it forward.
+        Y' rows are independent of one another, so the embarrassing-
+        parallel split incurs no algorithmic change vs the serial build.
+
+        Parameters
+        ----------
+        kind : str
+            Build basis: 'sp', 'rhot', 'rhop', or 'srho'.  Selects the
+            module-level worker function and the table-loading flags.
+        tasks : list of tuple
+            Per-Y'-row argument tuples.  Order is preserved in the
+            returned list so the caller can stack rows along the Y' axis
+            without reshuffling.
+        n_workers : int
+            Number of worker processes.  Capped internally at len(tasks).
+        verbose : bool
+            Print a progress bar.
+
+        Returns
+        -------
+        rows : list of ndarray
+            One slab per task, in the same order as ``tasks``.
+        """
+        import multiprocessing as mp
+
+        worker_fn = _WORKER_DISPATCH[kind]
+        n = max(1, min(int(n_workers), len(tasks)))
+
+        if verbose:
+            print(f"  Parallel build: {len(tasks)} Y' rows across "
+                  f"{n} worker processes")
+
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=n,
+                      initializer=_worker_init,
+                      initargs=(self._init_kwargs, kind)) as pool:
+            rows = [None] * len(tasks)
+            iterator = pool.imap(worker_fn, tasks)
+            pbar = tqdm(total=len(tasks),
+                        desc=_BUILD_DESC[kind],
+                        disable=not verbose,
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                   '[{elapsed}<{remaining}]')
+            for i, slab in enumerate(iterator):
+                rows[i] = slab
+                pbar.update(1)
+            pbar.close()
+        return rows
+
+    def _build_sp_yrow(self, yp, zvals, _zm, _za, _zr, svals, logp):
+        """Build all Z slabs for ONE Y' row of the S-P table.
+
+        Returns a (nS, nP, nZ) slab.  Inner Z loop preserves the
+        warm-start chain (prev_sol from the previous Z is used as
+        the initial guess for the next).  Used by both the serial
+        and parallel build paths in ``build_sp_table``.
+        """
+        S_2d, P_2d = np.meshgrid(svals, logp, indexing='ij')
+        nZ = len(zvals)
+        out = np.full((len(svals), len(logp), nZ), np.nan, dtype=float)
+        prev_sol = None
+        for iz, zv in enumerate(zvals):
+            if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                guess = prev_sol
+            else:
+                guess = np.full_like(S_2d, 0.5 * (1.5 + 7.0))
+
+            def residual(lgt_2d, _yp=yp, _zv=zv,
+                         _zm_=_zm, _za_=_za, _zr_=_zr):
+                s_test = self._s_pt(P_2d, lgt_2d, _yp, _zv,
+                                    _zm_, _za_, _zr_) * erg_to_kbbar
+                return s_test - S_2d
+
+            sol, _ = self._newton_1d_vec(
+                residual, guess, lo_abs=1.5, hi_abs=7.0)
+            out[:, :, iz] = sol
+            prev_sol = sol
+        return out
+
     def build_sp_table(self, yvals, zvals,
                        _zm=0.0, _za=0.0, _zr=0.0,
                        s_lo=4.0, s_hi=12.0, s_step=0.1,
                        smooth_sigma=0.0,
+                       n_workers=1,
                        verbose=True):
         """Build logT on a uniform (S, logP, Y', Z) grid.
 
@@ -2561,6 +2751,13 @@ class hhe_z_mixtures():
             If > 0, apply a light Gaussian smoothing (in grid-cell
             units) along the S and logP axes after Hampel filtering.
             Recommended starting value: 0.5.
+        n_workers : int
+            If > 1, dispatch Y' rows across this many worker
+            processes via multiprocessing.  Capped at len(yvals).
+            Default 1 (serial).  Each worker constructs its own
+            ``hhe_z_mixtures`` instance once (loading the PT-RGI),
+            then handles its assigned Y' rows; the warm-start chain
+            within each Y' row is preserved.
         verbose : bool
             Print progress.
 
@@ -2589,55 +2786,28 @@ class hhe_z_mixtures():
             print(f"  Total cells: {nS}x{nP}x{nY}x{nZ} = "
                   f"{nS*nP*nY*nZ:,}")
 
-        logt_sp = np.full((nS, nP, nY, nZ), np.nan, dtype=float)
-
-        # 2-D mesh of (S, P) targets used by the vectorized Newton
-        S_2d, P_2d = np.meshgrid(svals, logp, indexing='ij')  # (nS, nP)
-
-        total = nY * nZ
-        pbar = tqdm(total=total,
-                     desc="Inverting P,T -> S,P (vectorized)",
-                     disable=not verbose,
-                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
-                                '[{elapsed}<{remaining}]')
-
-        # Solve the entire (nS, nP) slab at each (Y', Z) in one
-        # vectorized Newton-Raphson sweep.  Warm-start from the
-        # previous Z's solution; on the first Z of each Y', use the
-        # ideal-gas guess.  _newton_1d_vec applies a vectorized
-        # bisection fallback to any cell where Newton oscillates,
-        # so no per-cell scalar polish is needed.
-        for iy, yp in enumerate(yvals):
-            prev_sol = None
-            for iz, zv in enumerate(zvals):
-                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+        # Run inversions over Y' rows (serial or parallel)
+        if int(n_workers) > 1 and nY > 1:
+            tasks = [(float(yp), zvals, _zm, _za, _zr, svals, logp)
+                     for yp in yvals]
+            rows = self._parallel_yrow_dispatch(
+                'sp', tasks, int(n_workers), verbose=verbose)
+        else:
+            pbar = tqdm(total=nY,
+                         desc="Inverting P,T -> S,P (vectorized)",
+                         disable=not verbose,
+                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                    '[{elapsed}<{remaining}]')
+            rows = []
+            for yp in yvals:
+                pbar.set_postfix_str(f"Y'={yp:.3f}")
+                rows.append(self._build_sp_yrow(
+                    float(yp), zvals, _zm, _za, _zr, svals, logp))
                 pbar.update(1)
+            pbar.close()
 
-                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
-                    guess = prev_sol
-                else:
-                    # Cold start: mid-range logT.  Newton converges
-                    # in 20-30 iterations from here; subsequent Z
-                    # slabs warm-start and converge in 3-6.
-                    guess = np.full_like(S_2d, 0.5 * (1.5 + 7.0))
-
-                def residual(lgt_2d, _yp=yp, _zv=zv,
-                             _zm_=_zm, _za_=_za, _zr_=_zr):
-                    s_test = self._s_pt(P_2d, lgt_2d, _yp, _zv,
-                                        _zm_, _za_, _zr_) * erg_to_kbbar
-                    return s_test - S_2d
-
-                sol, _conv = self._newton_1d_vec(
-                    residual, guess, lo_abs=1.5, hi_abs=7.0)
-                # _newton_1d_vec already performs vectorized
-                # bisection on cells where Newton oscillated; cells
-                # that still didn't converge here are out-of-domain
-                # (no sign change in [lo, hi]) and remain NaN.
-
-                logt_sp[:, :, iy, iz] = sol
-                prev_sol = sol
-
-        pbar.close()
+        # Stack rows into the (nS, nP, nY, nZ) table
+        logt_sp = np.stack(rows, axis=2)
 
         # --- NaN filling ---
         n_nan_before = np.isnan(logt_sp).sum()
@@ -2793,9 +2963,40 @@ class hhe_z_mixtures():
         self._logp_rhot_rgi = RGI(
             (logrhovals, logt, yv, zv), data['logp_rhot'], **inv_rgi_kw)
 
+    def _build_rhot_yrow(self, yp, zvals, _zm, _za, _zr,
+                          logrho, logt, lgp_lo, lgp_hi):
+        """Build all Z slabs for ONE Y' row of the rho-T table.
+
+        Returns a (nR, nT, nZ) slab.  Inner Z loop preserves the
+        warm-start chain.  Used by both serial and parallel paths in
+        ``build_rhot_table``.
+        """
+        R_2d, T_2d = np.meshgrid(logrho, logt, indexing='ij')
+        nZ = len(zvals)
+        out = np.full((len(logrho), len(logt), nZ), np.nan, dtype=float)
+        prev_sol = None
+        for iz, zv in enumerate(zvals):
+            if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                guess = prev_sol
+            else:
+                guess = np.full_like(R_2d, 0.5 * (lgp_lo + lgp_hi))
+
+            def residual(lgp_2d, _yp=yp, _zv=zv,
+                         _zm_=_zm, _za_=_za, _zr_=_zr):
+                rho_test = self._logrho_pt(lgp_2d, T_2d, _yp, _zv,
+                                            _zm_, _za_, _zr_)
+                return rho_test - R_2d
+
+            sol, _ = self._newton_1d_vec(
+                residual, guess, lo_abs=lgp_lo, hi_abs=lgp_hi)
+            out[:, :, iz] = sol
+            prev_sol = sol
+        return out
+
     def build_rhot_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          smooth_sigma=0.0,
+                         n_workers=1,
                          verbose=True):
         """Build logP on a uniform (logrho, logT, Y', Z) grid.
 
@@ -2808,6 +3009,9 @@ class hhe_z_mixtures():
         smooth_sigma : float
             If > 0, apply a light Gaussian smoothing (in grid-cell
             units) along the rho and logT axes after Hampel filtering.
+        n_workers : int
+            If > 1, dispatch Y' rows across this many worker processes.
+            Default 1 (serial).
         verbose : bool
             Print progress.
         """
@@ -2816,7 +3020,8 @@ class hhe_z_mixtures():
         logrho = self.logrho_vals
         logt = self.logt_vals
         nR, nT, nY, nZ = len(logrho), len(logt), len(yvals), len(zvals)
-        lgp_lo, lgp_hi = self.logp_vals[0], self.logp_vals[-1]
+        lgp_lo = float(self.logp_vals[0])
+        lgp_hi = float(self.logp_vals[-1])
 
         if verbose:
             print(f"Building rho-T square table: "
@@ -2826,48 +3031,32 @@ class hhe_z_mixtures():
             print(f"  Total cells: {nR}x{nT}x{nY}x{nZ} = "
                   f"{nR*nT*nY*nZ:,}")
 
-        logp_tab = np.full((nR, nT, nY, nZ), np.nan, dtype=float)
-
-        total = nY * nZ
-        pbar = tqdm(total=total,
-                     desc="Inverting P,T -> rho,T (square)",
-                     disable=not verbose,
-                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
-                                '[{elapsed}<{remaining}]')
-
-        # 2-D mesh of (rho, T) targets used by the vectorized Newton
-        R_2d, T_2d = np.meshgrid(logrho, logt, indexing='ij')  # (nR, nT)
-
-        # Newton bounds in logP — span the build's logP grid
-        lgp_lo = float(self.logp_vals[0])
-        lgp_hi = float(self.logp_vals[-1])
-
         # Vectorized Newton on the entire (nR, nT) slab per (Y', Z).
         # _newton_1d_vec applies a vectorized bisection fallback to
         # any cell where Newton oscillates.
-        for iy, yp in enumerate(yvals):
-            prev_sol = None
-            for iz, zv in enumerate(zvals):
-                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+        if int(n_workers) > 1 and nY > 1:
+            tasks = [(float(yp), zvals, _zm, _za, _zr,
+                      logrho, logt, lgp_lo, lgp_hi)
+                     for yp in yvals]
+            rows = self._parallel_yrow_dispatch(
+                'rhot', tasks, int(n_workers), verbose=verbose)
+        else:
+            pbar = tqdm(total=nY,
+                         desc="Inverting P,T -> rho,T (vectorized)",
+                         disable=not verbose,
+                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                    '[{elapsed}<{remaining}]')
+            rows = []
+            for yp in yvals:
+                pbar.set_postfix_str(f"Y'={yp:.3f}")
+                rows.append(self._build_rhot_yrow(
+                    float(yp), zvals, _zm, _za, _zr,
+                    logrho, logt, lgp_lo, lgp_hi))
                 pbar.update(1)
+            pbar.close()
 
-                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
-                    guess = prev_sol
-                else:
-                    guess = np.full_like(R_2d, 0.5 * (lgp_lo + lgp_hi))
-
-                def residual(lgp_2d, _yp=yp, _zv=zv,
-                             _zm_=_zm, _za_=_za, _zr_=_zr):
-                    rho_test = self._logrho_pt(lgp_2d, T_2d, _yp, _zv,
-                                                _zm_, _za_, _zr_)
-                    return rho_test - R_2d
-
-                sol, _conv = self._newton_1d_vec(
-                    residual, guess, lo_abs=lgp_lo, hi_abs=lgp_hi)
-                logp_tab[:, :, iy, iz] = sol
-                prev_sol = sol
-
-        pbar.close()
+        # Stack rows into the (nR, nT, nY, nZ) table
+        logp_tab = np.stack(rows, axis=2)
 
         # --- NaN filling ---
         n_nan = np.isnan(logp_tab).sum()
@@ -3083,9 +3272,39 @@ class hhe_z_mixtures():
         self._logt_rhop_rgi = RGI(
             (logrhovals, logp, yv, zv), data['logt_rhop'], **rgi_kw)
 
+    def _build_rhop_yrow(self, yp, zvals, _zm, _za, _zr, logrho, logp):
+        """Build all Z slabs for ONE Y' row of the rho-P table.
+
+        Returns a (nR, nP, nZ) slab.  Inner Z loop preserves the
+        warm-start chain.  Used by both serial and parallel paths in
+        ``build_rhop_table``.
+        """
+        R_2d, P_2d = np.meshgrid(logrho, logp, indexing='ij')
+        nZ = len(zvals)
+        out = np.full((len(logrho), len(logp), nZ), np.nan, dtype=float)
+        prev_sol = None
+        for iz, zv in enumerate(zvals):
+            if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                guess = prev_sol
+            else:
+                guess = np.full_like(R_2d, 0.5 * (1.5 + 7.0))
+
+            def residual(lgt_2d, _yp=yp, _zv=zv,
+                         _zm_=_zm, _za_=_za, _zr_=_zr):
+                rho_test = self._logrho_pt(P_2d, lgt_2d, _yp, _zv,
+                                            _zm_, _za_, _zr_)
+                return rho_test - R_2d
+
+            sol, _ = self._newton_1d_vec(
+                residual, guess, lo_abs=1.5, hi_abs=7.0)
+            out[:, :, iz] = sol
+            prev_sol = sol
+        return out
+
     def build_rhop_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          smooth_sigma=0.0,
+                         n_workers=1,
                          verbose=True):
         """Build logT on a uniform (logrho, logP, Y', Z) grid.
 
@@ -3098,6 +3317,9 @@ class hhe_z_mixtures():
         smooth_sigma : float
             If > 0, apply a light Gaussian smoothing (in grid-cell
             units) along the rho and logP axes after Hampel filtering.
+        n_workers : int
+            If > 1, dispatch Y' rows across this many worker processes.
+            Default 1 (serial).
         verbose : bool
             Print progress.
         """
@@ -3115,44 +3337,30 @@ class hhe_z_mixtures():
             print(f"  Total cells: {nR}x{nP}x{nY}x{nZ} = "
                   f"{nR*nP*nY*nZ:,}")
 
-        logt_tab = np.full((nR, nP, nY, nZ), np.nan, dtype=float)
-
-        total = nY * nZ
-        pbar = tqdm(total=total,
-                     desc="Inverting P,T -> rho,P (square)",
-                     disable=not verbose,
-                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
-                                '[{elapsed}<{remaining}]')
-
-        # 2-D mesh of (rho, P) targets used by the vectorized Newton
-        R_2d, P_2d = np.meshgrid(logrho, logp, indexing='ij')  # (nR, nP)
-
         # Vectorized Newton on the entire (nR, nP) slab per (Y', Z).
         # _newton_1d_vec applies a vectorized bisection fallback to
         # any cell where Newton oscillates.
-        for iy, yp in enumerate(yvals):
-            prev_sol = None
-            for iz, zv in enumerate(zvals):
-                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+        if int(n_workers) > 1 and nY > 1:
+            tasks = [(float(yp), zvals, _zm, _za, _zr, logrho, logp)
+                     for yp in yvals]
+            rows = self._parallel_yrow_dispatch(
+                'rhop', tasks, int(n_workers), verbose=verbose)
+        else:
+            pbar = tqdm(total=nY,
+                         desc="Inverting P,T -> rho,P (vectorized)",
+                         disable=not verbose,
+                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                    '[{elapsed}<{remaining}]')
+            rows = []
+            for yp in yvals:
+                pbar.set_postfix_str(f"Y'={yp:.3f}")
+                rows.append(self._build_rhop_yrow(
+                    float(yp), zvals, _zm, _za, _zr, logrho, logp))
                 pbar.update(1)
+            pbar.close()
 
-                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
-                    guess = prev_sol
-                else:
-                    guess = np.full_like(R_2d, 0.5 * (1.5 + 7.0))
-
-                def residual(lgt_2d, _yp=yp, _zv=zv,
-                             _zm_=_zm, _za_=_za, _zr_=_zr):
-                    rho_test = self._logrho_pt(P_2d, lgt_2d, _yp, _zv,
-                                                _zm_, _za_, _zr_)
-                    return rho_test - R_2d
-
-                sol, _conv = self._newton_1d_vec(
-                    residual, guess, lo_abs=1.5, hi_abs=7.0)
-                logt_tab[:, :, iy, iz] = sol
-                prev_sol = sol
-
-        pbar.close()
+        # Stack rows into the (nR, nP, nY, nZ) table
+        logt_tab = np.stack(rows, axis=2)
 
         # --- NaN filling ---
         n_nan = np.isnan(logt_tab).sum()
@@ -3421,10 +3629,57 @@ class hhe_z_mixtures():
             (svals, logrho, yv, zv), data['logt_srho'], **rgi_kw)
         self._svals_srho = svals
 
+    def _build_srho_yrow(self, yp, zvals, _zm, _za, _zr,
+                          svals, logrho, lo_abs, hi_abs):
+        """Build all Z slabs for ONE Y' row of the S-rho table.
+
+        Returns a tuple (logp_slab, logt_slab), each (nS, nR, nZ).
+        Inner Z loop preserves the warm-start chain in logT.  The
+        residual reads P from the worker's own rho-T inversion table
+        at every Newton iteration.  Used by both serial and parallel
+        paths in ``build_srho_table``.
+        """
+        S_2d, R_2d = np.meshgrid(svals, logrho, indexing='ij')
+        nZ = len(zvals)
+        nS, nR = len(svals), len(logrho)
+        out_p = np.full((nS, nR, nZ), np.nan, dtype=float)
+        out_t = np.full((nS, nR, nZ), np.nan, dtype=float)
+        prev_sol = None
+        for iz, zv in enumerate(zvals):
+            if prev_sol is not None and np.all(np.isfinite(prev_sol)):
+                guess = prev_sol
+            else:
+                guess = np.full_like(S_2d, 0.5 * (lo_abs + hi_abs))
+
+            def residual(lgt_2d, _yp=yp, _zv=zv,
+                         _zm_=_zm, _za_=_za, _zr_=_zr):
+                lgp = self.get_logp_rhot(
+                    R_2d, lgt_2d, _yp, _zv, _zm_, _za_, _zr_,
+                    use_tab=True)
+                s_test = self._s_pt(
+                    lgp, lgt_2d, _yp, _zv,
+                    _zm_, _za_, _zr_) * erg_to_kbbar
+                return s_test - S_2d
+
+            sol, _ = self._newton_1d_vec(
+                residual, guess, lo_abs=lo_abs, hi_abs=hi_abs)
+
+            # Recover P from the rho-T table at the converged T
+            lgp_slab = self.get_logp_rhot(
+                R_2d, sol, yp, zv, _zm, _za, _zr,
+                use_tab=True)
+
+            bad_final = ~(np.isfinite(lgp_slab) & np.isfinite(sol))
+            out_p[:, :, iz] = np.where(bad_final, np.nan, lgp_slab)
+            out_t[:, :, iz] = np.where(bad_final, np.nan, sol)
+            prev_sol = sol
+        return out_p, out_t
+
     def build_srho_table(self, yvals, zvals,
                          _zm=0.0, _za=0.0, _zr=0.0,
                          s_lo=4.0, s_hi=12.0, s_step=0.1,
                          smooth_sigma=0.0,
+                         n_workers=1,
                          verbose=True):
         """Build logP, logT on a uniform (S, logrho, Y', Z) grid.
 
@@ -3485,19 +3740,6 @@ class hhe_z_mixtures():
             print(f"  Decomposition: 1-D outer Newton in T using "
                   f"the rho-T table for the inner P(rho,T) step.")
 
-        logp_tab = np.full((nS, nR, nY, nZ), np.nan, dtype=float)
-        logt_tab = np.full((nS, nR, nY, nZ), np.nan, dtype=float)
-
-        total = nY * nZ
-        pbar = tqdm(total=total,
-                     desc="Inverting P,T -> S,rho (1-D via rho-T)",
-                     disable=not verbose,
-                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
-                                '[{elapsed}<{remaining}]')
-
-        # 2-D mesh of (S, rho) targets used by the vectorized Newton
-        S_2d, R_2d = np.meshgrid(svals, logrho, indexing='ij')  # (nS, nR)
-
         # Outer Newton bounds in logT
         lo_abs, hi_abs = 1.5, 7.0
 
@@ -3506,49 +3748,31 @@ class hhe_z_mixtures():
         # the loaded rho-T RGI, so each vectorized Newton iteration is
         # a few batched RGI calls.  _newton_1d_vec applies a vectorized
         # bisection fallback to any cell where Newton oscillates.
-        for iy, yp in enumerate(yvals):
-            prev_sol = None
-            for iz, zv in enumerate(zvals):
-                pbar.set_postfix_str(f"Y'={yp:.3f} Z={zv:.3f}")
+        if int(n_workers) > 1 and nY > 1:
+            tasks = [(float(yp), zvals, _zm, _za, _zr,
+                      svals, logrho, lo_abs, hi_abs)
+                     for yp in yvals]
+            row_results = self._parallel_yrow_dispatch(
+                'srho', tasks, int(n_workers), verbose=verbose)
+        else:
+            pbar = tqdm(total=nY,
+                         desc="Inverting P,T -> S,rho (1-D via rho-T)",
+                         disable=not verbose,
+                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                                    '[{elapsed}<{remaining}]')
+            row_results = []
+            for yp in yvals:
+                pbar.set_postfix_str(f"Y'={yp:.3f}")
+                row_results.append(self._build_srho_yrow(
+                    float(yp), zvals, _zm, _za, _zr,
+                    svals, logrho, lo_abs, hi_abs))
                 pbar.update(1)
+            pbar.close()
 
-                if prev_sol is not None and np.all(np.isfinite(prev_sol)):
-                    guess = prev_sol
-                else:
-                    guess = np.full_like(S_2d, 0.5 * (lo_abs + hi_abs))
-
-                # Residual in S, with P read from the rho-T table at
-                # each iteration via use_tab=True (one batched RGI
-                # lookup per Newton step).
-                def residual(lgt_2d, _yp=yp, _zv=zv,
-                             _zm_=_zm, _za_=_za, _zr_=_zr):
-                    lgp = self.get_logp_rhot(
-                        R_2d, lgt_2d, _yp, _zv, _zm_, _za_, _zr_,
-                        use_tab=True)
-                    s_test = self._s_pt(
-                        lgp, lgt_2d, _yp, _zv,
-                        _zm_, _za_, _zr_) * erg_to_kbbar
-                    return s_test - S_2d
-
-                sol, _conv = self._newton_1d_vec(
-                    residual, guess, lo_abs=lo_abs, hi_abs=hi_abs)
-
-                # Recover P from the rho-T table at the converged T
-                lgt_slab = sol
-                lgp_slab = self.get_logp_rhot(
-                    R_2d, lgt_slab, yp, zv, _zm, _za, _zr,
-                    use_tab=True)
-
-                # Mark cells as NaN if either piece failed
-                bad_final = ~(np.isfinite(lgp_slab) & np.isfinite(lgt_slab))
-                lgp_slab = np.where(bad_final, np.nan, lgp_slab)
-                lgt_slab = np.where(bad_final, np.nan, lgt_slab)
-
-                logp_tab[:, :, iy, iz] = lgp_slab
-                logt_tab[:, :, iy, iz] = lgt_slab
-                prev_sol = sol
-
-        pbar.close()
+        # Each row_results entry is (logp_slab, logt_slab) of shape
+        # (nS, nR, nZ).  Stack along the Y' axis (axis=2).
+        logp_tab = np.stack([r[0] for r in row_results], axis=2)
+        logt_tab = np.stack([r[1] for r in row_results], axis=2)
 
         # --- NaN filling ---
         n_nan = np.isnan(logp_tab).sum()
