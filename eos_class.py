@@ -4055,7 +4055,7 @@ class hhe_z_mixtures():
         s_p = self.get_s_pt(_lgp, lgt_p, _y + dy, _z, _zr=_frock)
         return (s_p - s_m) / (2 * dy)
     
-    def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0,
+    def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1,
                             dz=0.01, **kw):
         """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
 
@@ -4070,7 +4070,7 @@ class hhe_z_mixtures():
         # return (s_p - s_m) / (2 * dz) 
 
         # dPdS|{rho, Y, Z}:
-        dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=dz, **kw)
+        dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=ds, **kw)
         #dPdZ|{S, rho, Z}:
         dpdz_srho = self.get_dpdz_srho(_s, _lgrho, _y, _z, _frock, dz=dz, **kw)
         #dSdZ|{rho, P, Y} = -dPdZ|{S, rho, Z} / dPdS|{rho, Y, Z}
