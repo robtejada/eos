@@ -1450,7 +1450,8 @@ class hhe_z_mixtures():
                  logp_range=(6.0, 14.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
-                 interp_method='linear'):
+                 interp_method='linear',
+                 table_suffix=''):
         """
         Parameters
         ----------
@@ -1487,10 +1488,24 @@ class hhe_z_mixtures():
             Interpolation method for inversion-table RGIs.
             'linear' (default) is C⁰; 'cubic' is C² but slower.
             The PT forward-model table always uses 'linear'.
+        table_suffix : str
+            Optional tag appended to the canonical table filename so
+            multiple variants of the same (hhe_eos, z_eos) tables can
+            coexist on disk without overwriting each other. Empty (the
+            default) preserves the original canonical path
+            ``{hhe}_{z}_{basis}_square.npz``; a non-empty value
+            ``'highz'`` (say) loads/saves
+            ``{hhe}_{z}_{basis}_square_highz.npz`` instead. Pair with
+            the ``--suffix`` flag of ``eos_inversions.py`` when building
+            tables from the CLI.
         """
 
         self.hhe_eos_name = hhe_eos_name
         self.z_eos_label = z_eos
+        # Optional name tag for table variants (e.g. high-Z extension).
+        # Normalize: strip leading/trailing underscores so callers can
+        # pass either 'highz' or '_highz' and get the same filename.
+        self.table_suffix = str(table_suffix).strip('_')
         self.pt_tab = pt_tab
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
@@ -1511,6 +1526,7 @@ class hhe_z_mixtures():
             logt_range=logt_range,
             logrho_range=logrho_range, logrho_step=logrho_step,
             interp_method=interp_method,
+            table_suffix=table_suffix,
         )
 
         # --- Forward-model mixer ---
@@ -1554,9 +1570,19 @@ class hhe_z_mixtures():
     # =================================================================
 
     def _table_path(self, basis):
-        """Return the expected on-disk file path for a given basis table."""
+        """Return the expected on-disk file path for a given basis table.
+
+        When ``self.table_suffix`` is non-empty, the suffix is inserted
+        between the canonical stem and ``.npz``. This lets multiple
+        variants of a table coexist (e.g. a high-Z, low-S extension
+        built for sub-Neptune work) without overwriting the production
+        ``_square.npz`` files.
+        """
         fname = self._TABLE_BASES[basis].format(
             hhe=self.hhe_eos_name, z=self.z_eos_label)
+        if self.table_suffix:
+            stem, ext = os.path.splitext(fname)
+            fname = f'{stem}_{self.table_suffix}{ext}'
         return os.path.join(CURR_DIR, self.hhe_eos_name, fname)
 
     def _auto_load_tables(self):

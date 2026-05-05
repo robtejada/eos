@@ -255,6 +255,13 @@ def build_parser():
     # Output
     p.add_argument('--output', type=str, default=None,
                    help='Output path (default: auto from hhe_eos/z_eos)')
+    p.add_argument('--suffix', type=str, default='',
+                   help="Optional tag appended to the auto-output "
+                        "filename, e.g. --suffix highz produces "
+                        "{hhe}_{z}_<basis>_square_highz.npz instead "
+                        "of overwriting the canonical _square.npz "
+                        "table. Pair with table_suffix='highz' when "
+                        "loading from hhe_z_mixtures(...).")
 
     return p
 
@@ -281,6 +288,9 @@ def main():
     print("=" * 65)
     print(f"  H-He EOS:    {args.hhe_eos}")
     print(f"  Z EOS:       {args.z_eos}")
+    if args.suffix:
+        print(f"  Suffix:      {args.suffix}  "
+              f"(-> ..._square_{args.suffix}.npz)")
     print(f"  Species:     {args.species}")
     print(f"  HG23:        {hg}")
     print(f"  Smooth H-He: {smooth_hhe}")
@@ -360,6 +370,7 @@ def main():
         logt_range=(args.logt_lo, args.logt_hi),
         logrho_range=(args.logrho_lo, args.logrho_hi),
         logrho_step=args.logrho_step,
+        table_suffix=args.suffix,
     )
 
     # --- Build table ---
