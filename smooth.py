@@ -463,9 +463,16 @@ def smooth_eos_table(grids, logt_1d, logp_1d):
             neighbor_window=3, threshold=3.0,
         )
 
-    # Step 1: Low-P validity masking + extrapolation
+    # Step 1: Low-P validity masking + extrapolation.
+    # dev_thresh=2.0 (the function default) is loose enough that the
+    # natural low-P curvature of cold isotherms (logT < ~2.5, where
+    # H-He has supercritical-molecular / ortho-para behavior that
+    # genuinely diverges from the warm-interior linear gradient) is
+    # not falsely flagged as "invalid" and overwritten with a
+    # warm-regime extrapolation.  Tighter thresholds (e.g. 1.0)
+    # shift cold isentropes upward by 0.1-0.6 dex of logT.
     for key in ['logrho', 'logs', 'logu']:
-        invalid_lowp = detect_invalid_lowp(smoothed[key], logp_1d, dev_thresh=1.0)
+        invalid_lowp = detect_invalid_lowp(smoothed[key], logp_1d, dev_thresh=2.0)
         smoothed[key] = extrapolate_from_boundary(
             smoothed[key], logp_1d, invalid_mask=invalid_lowp, side='left', n_anchor=5
         )
@@ -483,12 +490,14 @@ def smooth_eos_table(grids, logt_1d, logp_1d):
     # Step 3: 2D Gaussian smoothing in the low-P region.
     # Applied AFTER the Hampel filter, which already removed
     # sharp outliers that would otherwise get smeared into
-    # broad bumps by the Gaussian.
+    # broad bumps by the Gaussian.  sigma=1 grid cell is just
+    # enough to give smooth FD derivatives without shifting
+    # the underlying isentropes by a visible amount.
     for key in ['logrho', 'logs', 'logu']:
         smoothed[key] = smooth_lowp_2d(
             smoothed[key], logp_1d,
             logp_thresh=10.0, blend_width=2.0,
-            sigma_t=3.0, sigma_p=3.0,
+            sigma_t=1.0, sigma_p=1.0,
         )
 
     # Step 4: PPT floor + post-floor repair (high-P only)
@@ -499,11 +508,17 @@ def smooth_eos_table(grids, logt_1d, logp_1d):
         )
 
     # Step 5: Targeted 2D Gaussian in dissociation/ionization zone.
+    # The window is centred on the H2 dissociation ridge itself
+    # (~ logT 2.7-3.4) instead of the entire low-T half of the
+    # table, and the kernel is reduced to sigma=1 grid cell.
+    # Gaussian shifts go as sigma**2 * curvature, so this is ~25x
+    # less feature-distortion than the previous (5,3) defaults
+    # while still providing enough blur for clean FD derivatives.
     for key in ['logrho', 'logs', 'logu']:
         smoothed[key] = targeted_gaussian_smooth(
             smoothed[key], logt_1d, logp_1d,
-            logt_range=(2.0, 3.5), logp_range=(6.0, 16.0),
-            sigma_t=5.0, sigma_p=3.0,
+            logt_range=(2.7, 3.4), logp_range=(6.0, 16.0),
+            sigma_t=1.0, sigma_p=1.0,
         )
 
     return smoothed
