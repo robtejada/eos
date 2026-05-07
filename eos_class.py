@@ -3985,8 +3985,15 @@ class hhe_z_mixtures():
         return (r2 - r1) * log10_to_loge / (2 * ds / erg_to_kbbar)
 
     def get_dtds_sp(self, _s, _lgp, _y, _z, _frock=0.0, ds=0.1, **kw):
-        """dT/dS|_P [K·g·K/erg] via FD on the S-P inversion."""
-        _y = self._to_yprime(_y, _z)
+        """dT/dS|_P [K·g·K/erg] via FD on the S-P inversion.
+
+        NOTE: get_logt_sp() already calls self._to_yprime(_yp, _z) at
+        line 2335, so we MUST NOT call it here as well -- doing so
+        applies the (1-Z) division twice when self.y_prime=False, which
+        sends the lookup to Y'/(1-Z) (e.g. Y'=0.275 becomes 5.5 at
+        Z=0.95) and produces garbage extrapolation. Pass the caller's
+        _y straight through to get_logt_sp and let it do the conversion.
+        """
         t1 = 10.0 ** self.get_logt_sp(_s - ds, _lgp, _y, _z, _zr=_frock)
         t2 = 10.0 ** self.get_logt_sp(_s + ds, _lgp, _y, _z, _zr=_frock)
         return (t2 - t1) * erg_to_kbbar / (2 * ds)
