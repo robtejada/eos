@@ -3922,19 +3922,39 @@ class hhe_z_mixtures():
     # PT-basis derivatives
     # =================================================================
 
+    @staticmethod
+    def _fd_xpair(x, dx, lo=0.0, hi=1.0, dx_min=1e-3):
+        """Composition finite-difference abscissae, robust at the edges.
+
+        Returns (x_m, x_p, denom) with x_m/x_p clipped to [lo, hi] and
+        denom = x_p - x_m.  The step is floored at dx_min so a shrunken
+        step (e.g. adaptive_dx -> 1e-6 at Z = 0) cannot amplify
+        table-interpolation noise by a vanishing denominator; near the
+        edges the stencil degrades gracefully to a one-sided difference
+        of full width instead of stepping outside the table domain.
+        """
+        x = np.asarray(x, dtype=float)
+        dx_eff = np.maximum(np.asarray(dx, dtype=float), dx_min)
+        x_m = np.clip(x - dx_eff, lo, hi)
+        x_p = np.clip(x + dx_eff, lo, hi)
+        denom = np.maximum(x_p - x_m, dx_min)
+        return x_m, x_p, denom
+
     def get_dsdy_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, dy=0.01, **kw):
         """dS/dY|_{P,T} via FD on the P-T forward model."""
         _y = self._to_yprime(_y, _z)
-        s1 = self._s_pt(_lgp, _lgt, _y - dy, _z, _zr=_frock)
-        s2 = self._s_pt(_lgp, _lgt, _y + dy, _z, _zr=_frock)
-        return (s2 - s1) / (2 * dy)
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        s1 = self._s_pt(_lgp, _lgt, y_m, _z, _zr=_frock)
+        s2 = self._s_pt(_lgp, _lgt, y_p, _z, _zr=_frock)
+        return (s2 - s1) / dy2
 
     def get_dsdz_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dS/dZ|_{P,T} via FD on the P-T forward model."""
         _y = self._to_yprime(_y, _z)
-        s1 = self._s_pt(_lgp, _lgt, _y, _z - dz, _zr=_frock)
-        s2 = self._s_pt(_lgp, _lgt, _y, _z + dz, _zr=_frock)
-        return (s2 - s1) / (2 * dz)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        s1 = self._s_pt(_lgp, _lgt, _y, z_m, _zr=_frock)
+        s2 = self._s_pt(_lgp, _lgt, _y, z_p, _zr=_frock)
+        return (s2 - s1) / dz2
 
     def get_dlogrho_dlogt_py(self, _lgp, _lgt, _y, _z, _frock=0.0,
                               dt=1e-2, **kw):
@@ -4118,11 +4138,12 @@ class hhe_z_mixtures():
         and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
         """
         _y = self._to_yprime(_y, _z)
-        lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y, _z - dz, _zr=_frock)
-        lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y, _z + dz, _zr=_frock)
-        s_m = self._s_pt(_lgp, lgt_m, _y, _z - dz, _zr=_frock)
-        s_p = self._s_pt(_lgp, lgt_p, _y, _z + dz, _zr=_frock)
-        return (s_p - s_m) / (2 * dz)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y, z_m, _zr=_frock)
+        lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y, z_p, _zr=_frock)
+        s_m = self._s_pt(_lgp, lgt_m, _y, z_m, _zr=_frock)
+        s_p = self._s_pt(_lgp, lgt_p, _y, z_p, _zr=_frock)
+        return (s_p - s_m) / dz2
 
     # =================================================================
     # S-ρ-basis derivatives
@@ -4138,48 +4159,54 @@ class hhe_z_mixtures():
     def get_dpdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
         """dP/dY|_{S,ρ} via FD on the S-ρ inversion."""
         _y = self._to_yprime(_y, _z)
-        lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, _y - dy, _z, _zr=_frock)
-        lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, _y + dy, _z, _zr=_frock)
-        return (10.0 ** lgp_p - 10.0 ** lgp_m) / (2 * dy)
-    
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, y_m, _z, _zr=_frock)
+        lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, y_p, _z, _zr=_frock)
+        return (10.0 ** lgp_p - 10.0 ** lgp_m) / dy2
+
     def get_dpdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dP/dZ|_{S,ρ} via FD on the S-ρ inversion."""
         _y = self._to_yprime(_y, _z)
-        lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, _y, _z - dz, _zr=_frock)
-        lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, _y, _z + dz, _zr=_frock)
-        return (10.0 ** lgp_p - 10.0 ** lgp_m) / (2 * dz)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, _y, z_m, _zr=_frock)
+        lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, _y, z_p, _zr=_frock)
+        return (10.0 ** lgp_p - 10.0 ** lgp_m) / dz2
 
     def get_dtdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
         """dT/dY|_{S,ρ} via FD on the S-ρ inversion."""
         _y = self._to_yprime(_y, _z)
-        _, lgt_m = self.get_logp_logt_srho(_s, _lgrho, _y - dy, _z, _zr=_frock)
-        _, lgt_p = self.get_logp_logt_srho(_s, _lgrho, _y + dy, _z, _zr=_frock)
-        return (10.0 ** lgt_p - 10.0 ** lgt_m) / (2 * dy)
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        _, lgt_m = self.get_logp_logt_srho(_s, _lgrho, y_m, _z, _zr=_frock)
+        _, lgt_p = self.get_logp_logt_srho(_s, _lgrho, y_p, _z, _zr=_frock)
+        return (10.0 ** lgt_p - 10.0 ** lgt_m) / dy2
 
     def get_dtdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dT/dZ|_{S,ρ} via FD on the S-ρ inversion."""
         _y = self._to_yprime(_y, _z)
-        _, lgt_m = self.get_logp_logt_srho(_s, _lgrho, _y, _z - dz, _zr=_frock)
-        _, lgt_p = self.get_logp_logt_srho(_s, _lgrho, _y, _z + dz, _zr=_frock)
-        return (10.0 ** lgt_p - 10.0 ** lgt_m) / (2 * dz)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        _, lgt_m = self.get_logp_logt_srho(_s, _lgrho, _y, z_m, _zr=_frock)
+        _, lgt_p = self.get_logp_logt_srho(_s, _lgrho, _y, z_p, _zr=_frock)
+        return (10.0 ** lgt_p - 10.0 ** lgt_m) / dz2
 
     def get_dudy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
         """dU/dY|_{S,ρ} via FD on the S-ρ inversion + U(P,T)."""
         _y = self._to_yprime(_y, _z)
-        p_m, t_m = self.get_logp_logt_srho(_s, _lgrho, _y - dy, _z, _zr=_frock)
-        p_p, t_p = self.get_logp_logt_srho(_s, _lgrho, _y + dy, _z, _zr=_frock)
-        u_m = self.val.get_u_pt_val(p_m, t_m, _y - dy, _z, _zr=_frock)
-        u_p = self.val.get_u_pt_val(p_p, t_p, _y + dy, _z, _zr=_frock)
-        return (u_p - u_m) / (2 * dy)
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        p_m, t_m = self.get_logp_logt_srho(_s, _lgrho, y_m, _z, _zr=_frock)
+        p_p, t_p = self.get_logp_logt_srho(_s, _lgrho, y_p, _z, _zr=_frock)
+        u_m = self.val.get_u_pt_val(p_m, t_m, y_m, _z, _zr=_frock)
+        u_p = self.val.get_u_pt_val(p_p, t_p, y_p, _z, _zr=_frock)
+        return (u_p - u_m) / dy2
 
     def get_dudz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dU/dZ|_{S,ρ} via FD on the S-ρ inversion + U(P,T)."""
         _y = self._to_yprime(_y, _z)
-        p_m, t_m = self.get_logp_logt_srho(_s, _lgrho, _y, _z - dz, _zr=_frock)
-        p_p, t_p = self.get_logp_logt_srho(_s, _lgrho, _y, _z + dz, _zr=_frock)
-        u_m = self.val.get_u_pt_val(p_m, t_m, _y, _z - dz, _zr=_frock)
-        u_p = self.val.get_u_pt_val(p_p, t_p, _y, _z + dz, _zr=_frock)
-        return (u_p - u_m) / (2 * dz)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        p_m, t_m = self.get_logp_logt_srho(_s, _lgrho, _y, z_m, _zr=_frock)
+        p_p, t_p = self.get_logp_logt_srho(_s, _lgrho, _y, z_p, _zr=_frock)
+        u_m = self.val.get_u_pt_val(p_m, t_m, _y, z_m, _zr=_frock)
+        u_p = self.val.get_u_pt_val(p_p, t_p, _y, z_p, _zr=_frock)
+        return (u_p - u_m) / dz2
 
     # =================================================================
     # Forward-model aliases (legacy ORCHARD interface)
@@ -5883,26 +5910,38 @@ class mixtures(hhe_eos):
 
     # adaptive delta function for z and y derivatives
     def adaptive_dx(self, x_profile, initial_dx=0.01, tolerance=1e-3):
-        # Initialize dx as an array with an initial value
-        dx = np.full_like(x_profile, initial_dx, dtype=float)
+        """Finite-difference step for composition derivatives.
 
-        # Adjust each dz based on z_profile constraints
-        for i in range(len(x_profile)):
-            # Adjust dz so z_profile[i] - dz[i] >= 0
-            if x_profile[i] - dx[i] < 0:
-                dx[i] = x_profile[i]  # Set dz to the maximum allowed value to keep z_profile - dz non-negative
+        Historically this shrank dx to x near the domain edges, which
+        collapsed the step to 0 at Z = 0 (or Y = 0) and made the FD
+        derivatives divide table-interpolation noise by a vanishing
+        denominator. The FD methods now clip their stencils to [0, 1]
+        internally (see _fd_xpair), so the step no longer needs to
+        shrink at the edges -- it only needs a finite floor.
+        """
+        x = np.asarray(x_profile, dtype=float)
+        dx = np.full_like(x, initial_dx)
+        dx = np.minimum(dx, np.maximum(x, tolerance))
+        dx = np.minimum(dx, np.maximum(1.0 - x, tolerance))
+        return np.maximum(dx, tolerance)
 
-            # Adjust dz so z_profile[i] + dz[i] <= 1
-            elif x_profile[i] + dx[i] > 1:
-                dx[i] = 1 - x_profile[i]  # Set dz to the maximum allowed value to keep z_profile + dz <= 1
+    @staticmethod
+    def _fd_xpair(x, dx, lo=0.0, hi=1.0, dx_min=1e-3):
+        """Composition finite-difference abscissae, robust at the edges.
 
-            # Add a tolerance check to prevent overshooting the bounds
-            if x_profile[i] - dx[i] < 0:
-                dx[i] = max(dx[i] - tolerance, 0)
-            if x_profile[i] + dx[i] > 0.999:
-                dx[i] = min(dx[i] - tolerance, 1 - x_profile[i])
-
-        return dx
+        Returns (x_m, x_p, denom) with x_m/x_p clipped to [lo, hi] and
+        denom = x_p - x_m. The step is floored at dx_min so a shrunken
+        step cannot amplify table-interpolation noise by a vanishing
+        denominator; near the edges the stencil degrades gracefully to
+        a one-sided difference of full width instead of stepping
+        outside the table domain (e.g. negative Z).
+        """
+        x = np.asarray(x, dtype=float)
+        dx_eff = np.maximum(np.asarray(dx, dtype=float), dx_min)
+        x_m = np.clip(x - dx_eff, lo, hi)
+        x_p = np.clip(x + dx_eff, lo, hi)
+        denom = np.maximum(x_p - x_m, dx_min)
+        return x_m, x_p, denom
 
 
     def interpolate_non_converged_temperatures_1d(self, _lgrho, temperatures, converged, interp_kind='linear'):
@@ -6606,19 +6645,21 @@ class mixtures(hhe_eos):
     def get_dpdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         dy = _y*0.1 if dy is None else dy
-        p1 = 10**self.get_logp_srho(_s, _lgrho, _y - dy, _z, **kwargs)
-        p2 = 10**self.get_logp_srho(_s, _lgrho, _y + dy, _z, **kwargs)
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        p1 = 10**self.get_logp_srho(_s, _lgrho, y_m, _z, **kwargs)
+        p2 = 10**self.get_logp_srho(_s, _lgrho, y_p, _z, **kwargs)
 
-        return (p2 - p1) / (2 * dy)
+        return (p2 - p1) / dy2
 
 
     def get_dpdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
         dz = _z*0.1 if dz is None else dz
-        p1 = 10**self.get_logp_srho(_s, _lgrho, _y, _z - dz, _frock, **kwargs)
-        p2 = 10**self.get_logp_srho(_s, _lgrho, _y, _z + dz, _frock, **kwargs)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        p1 = 10**self.get_logp_srho(_s, _lgrho, _y, z_m, _frock, **kwargs)
+        p2 = 10**self.get_logp_srho(_s, _lgrho, _y, z_p, _frock, **kwargs)
 
-        return (p2 - p1) / (2 * dz)
+        return (p2 - p1) / dz2
 
     ########### Triple product rule dsdx_rhop version ###########
 
@@ -6742,34 +6783,38 @@ class mixtures(hhe_eos):
     def get_dudy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.1, ideal_guess=True, arr_p_guess=None, arr_t_guess=None, method='newton_brentq', tab=True):
         kwargs = {'ideal_guess': ideal_guess, 'arr_p_guess': arr_p_guess, 'arr_t_guess': arr_p_guess, 'method': method, 'tab':tab}
         dy = _y*0.1 if dy is None else dy
-        u1 = 10**self.get_logu_srho(_s, _lgrho, _y - dy, _z, _frock, **kwargs)
-        u2 = 10**self.get_logu_srho(_s, _lgrho, _y + dy, _z, _frock, **kwargs)
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        u1 = 10**self.get_logu_srho(_s, _lgrho, y_m, _z, _frock, **kwargs)
+        u2 = 10**self.get_logu_srho(_s, _lgrho, y_p, _z, _frock, **kwargs)
 
-        return (u2 - u1)/(2 * dy)
+        return (u2 - u1)/dy2
 
     def get_dudz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_p_guess=None, arr_t_guess=None, method='newton_brentq', tab=True):
         kwargs = {'ideal_guess': ideal_guess, 'arr_p_guess': arr_p_guess, 'arr_t_guess': arr_p_guess, 'method': method, 'tab':tab}
         dz = _z*0.1 if dz is None else dz
-        u1 = 10**self.get_logu_srho(_s, _lgrho, _y, _z - dz, _frock, **kwargs)
-        u2 = 10**self.get_logu_srho(_s, _lgrho, _y, _z + dz, _frock, **kwargs)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        u1 = 10**self.get_logu_srho(_s, _lgrho, _y, z_m, _frock, **kwargs)
+        u2 = 10**self.get_logu_srho(_s, _lgrho, _y, z_p, _frock, **kwargs)
 
-        return (u2 - u1)/(2 * dz)
+        return (u2 - u1)/dz2
 
     ########### Conductive Flux Terms ###########
 
     def get_dtdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
-        t1 = 10**self.get_logt_srho(_s, _lgrho, _y - dy, _z, _frock, **kwargs)
-        t2 = 10**self.get_logt_srho(_s, _lgrho, _y + dy, _z, _frock, **kwargs)
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        t1 = 10**self.get_logt_srho(_s, _lgrho, y_m, _z, _frock, **kwargs)
+        t2 = 10**self.get_logt_srho(_s, _lgrho, y_p, _z, _frock, **kwargs)
 
-        return (t2 - t1)/(2 * dy)
+        return (t2 - t1)/dy2
 
     def get_dtdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.1, ideal_guess=True, arr_guess=None, method='newton_brentq', tab=True):
         kwargs = {'ideal_guess': ideal_guess, 'arr_guess': arr_guess, 'method': method, 'tab':tab}
-        t1 = 10**self.get_logt_srho(_s, _lgrho, _y, _z - dz, _frock, **kwargs)
-        t2 = 10**self.get_logt_srho(_s, _lgrho, _y, _z + dz, _frock, **kwargs)
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        t1 = 10**self.get_logt_srho(_s, _lgrho, _y, z_m, _frock, **kwargs)
+        t2 = 10**self.get_logt_srho(_s, _lgrho, _y, z_p, _frock, **kwargs)
 
-        return (t2 - t1)/(2 * dz)
+        return (t2 - t1)/dz2
 
     ########## Thermodynamic Consistency Test ###########
 
