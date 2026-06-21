@@ -871,32 +871,42 @@ class z_eos:
 
         return out.item() if scalar else out
 class z_eos_val_mixtures:
-    """Volume Addition Law (VAL) mixer for up to three Z species.
+    """Volume Addition Law (VAL) mixer for up to four Z species.
 
-    A deliberately simple heavy-element mixer.  Given up to three
-    ``z_eos`` species (e.g. water + rock), it returns the mixture
-    density, entropy and internal energy as functions of (P, T,
-    fractions).
+    A deliberately simple heavy-element mixer.  Given a set of
+    ``z_eos`` species (water, methane, ammonia, rock), it returns the
+    metal-mixture density, entropy and internal energy as functions of
+    (P, T, metal sub-fractions).
 
     Unlike ``val_mixtures`` (which mixes H-He-Z with both ideal and
     HG23 non-ideal corrections), this class:
       - mixes Z species only,
       - applies the Volume Addition Law for density,
       - mass-weights the per-species S and U,
-      - adds the *ideal* entropy of mixing (there is no non-ideal
-        information available for Z-Z mixtures).
+      - optionally adds the *ideal* entropy of mixing for the
+        standalone ``get_s_pt`` (there is no non-ideal information
+        available for Z-Z mixtures),
+      - fills the AQUA superionic NaN corner so that interpolation and
+        inversion stay finite and well posed (see ``fill_z_nans``).
 
-    Composition convention
-    ----------------------
-    Two explicit mass fractions ``_f2`` and ``_f3`` give the fraction
-    of the second and third species; the first species takes the
-    remainder::
+    ``val_mixtures`` delegates its metal mixing (``get_logrho_z``,
+    ``get_s_z``, ``get_u_z``) to this class, which is why the same
+    nested sub-fraction convention is used.
 
-        f1 = 1 - _f2 - _f3
+    Composition convention (same nested convention as ``val_mixtures``)
+    ------------------------------------------------------------------
+        _zm  : methane fraction within the metal budget
+        _za  : ammonia fraction in the remainder after methane
+        _zr  : rock fraction in the remainder after ammonia
+        Physical mass fractions (within Z):
+            f_water   = (1 - _zm) * (1 - _za) * (1 - _zr)
+            f_methane = _zm * (1 - _za) * (1 - _zr)
+            f_ammonia = _za * (1 - _zr)
+            f_rock    = _zr
 
     For the canonical 50/50 water/rock mixture
-    (``z_eos1='aqua_revised'``, ``z_eos2='mg2sio4'``) call the methods
-    with ``_f2 = f_rock`` (and ``_f3 = 0``).
+    (``species_list=['water_revised', 'mg2sio4']``) call the methods
+    with ``_zr = f_rock`` (and ``_zm = _za = 0``).
 
     Units (CGS, consistent with ``z_eos`` / ``val_mixtures``)
     --------------------------------------------------------
@@ -918,32 +928,34 @@ class z_eos_val_mixtures:
     # imposed on filled corner cells so T(S,P) always brackets a root.
     _MONO_EPS = 1e-3
 
-    def __init__(self, z_eos1='aqua_revised', z_eos2='mg2sio4',
-                 z_eos3=None, smooth_z=False, fill_z_nans=True):
+    def __init__(self, species_list=None, smooth_z=False, fill_z_nans=True):
         """
         Parameters
         ----------
-        z_eos1, z_eos2, z_eos3 : str or None
-            Species selectors.  Recognised names:
-              'aqua_revised'                -> revised AQUA water
-              'aqua' / 'aqua_original' /
-                'water'                     -> original AQUA water
-              'mg2sio4' / 'rock'            -> Mg2SiO4 forsterite
-              'methane', 'ammonia', 'iron'  -> respective z_eos species
-            ``z_eos3=None`` builds a two-species mixture.
+        species_list : list of str or None
+            Which Z species to load.  Default: all four metals
+            ``['water_revised', 'methane', 'ammonia', 'mg2sio4']``
+            (same default as ``val_mixtures``).  Recognised names:
+              'water_revised' / 'aqua_revised'  -> revised AQUA water
+              'water' / 'aqua' / 'aqua_original' -> original AQUA water
+              'mg2sio4' / 'rock'                -> Mg2SiO4 forsterite
+              'methane', 'ammonia', 'iron'      -> respective z_eos
+            Each name maps to a canonical role key ('water', 'methane',
+            'ammonia', 'mg2sio4', 'iron') used to index ``self.z``.
+            For a simple water/rock mixture pass
+            ``['water_revised', 'mg2sio4']``.
         smooth_z : bool
             Passed through to each underlying ``z_eos`` table loader.
         fill_z_nans : bool
             If True (default), build a NaN-free entropy interpolator for
-            any sub-EOS whose ``logs_pt`` table has missing cells.  The
+            any species whose ``logs_pt`` table has missing cells.  The
             revised AQUA water table flags entropy as unavailable (raw
             sentinel = -1) in the high-P / low-T superionic-and-solid
             corner (logP >~ 12.9), which would otherwise poison the
             mixture entropy (and its T(S,P) inversion) with NaNs.  The
-            gap is filled by 2-D ``np.interp`` along P then T, which
-            extends each isotherm's last finite value flatly to higher
-            pressure (smooth and monotone along isotherms, so the
-            S<->T inversion stays well posed in this corner).
+            gap is filled by 2-D ``np.interp`` along P then T, then a
+            strict-monotonization pass so S increases in T across the
+            corner (smooth along isotherms, single-valued for inversion).
             These filled values are *extrapolated and not validated* —
             they exist only to keep the mixer finite and well behaved in
             a region where planetary interiors are hot anyway.  The
@@ -951,62 +963,59 @@ class z_eos_val_mixtures:
             interpolator lives inside this mixer.  Set False to recover
             the raw (NaN-bearing) behaviour.
         """
-        names = [z_eos1, z_eos2, z_eos3]
+        if species_list is None:
+            species_list = ['water_revised', 'methane', 'ammonia', 'mg2sio4']
         self.fill_z_nans = fill_z_nans
 
-        self._eos = []   # list of z_eos instances
-        self._mu = []    # parallel list of molecular weights
-        for name in names:
-            if name is None:
-                continue
-            eos_obj, mu = self._make_z_eos(name, smooth_z)
-            self._eos.append(eos_obj)
-            self._mu.append(mu)
+        # Z EOS instances keyed by canonical role
+        # ('water', 'methane', 'ammonia', 'mg2sio4', 'iron').
+        self.z = {}
+        for name in species_list:
+            key, eos_obj = self._make_z_eos(name, smooth_z)
+            self.z[key] = eos_obj
 
-        if len(self._eos) < 2:
-            raise ValueError("z_eos_val_mixtures needs at least two "
-                             "species (z_eos1 and z_eos2).")
+        if len(self.z) < 1:
+            raise ValueError("z_eos_val_mixtures needs at least one species.")
 
         # Per-species log10(S) accessor f(lgp, lgt).  Uses a NaN-filled
         # interpolator where the raw table has gaps (and fill_z_nans is
-        # on); otherwise falls through to the sub-EOS's get_logs_pt.
-        self._logs_fn = []
-        for eos_obj in self._eos:
+        # on); otherwise falls through to the species' get_logs_pt.
+        self._logs_fn = {}
+        for key, eos_obj in self.z.items():
             filled = self._build_filled_logs(eos_obj) if fill_z_nans else None
-            self._logs_fn.append(filled if filled is not None
-                                 else eos_obj.get_logs_pt)
-
-        # Mass-weighted ideal-gas EOS for inversion initial guesses.
-        # mu is updated per call to reflect the requested fractions.
-        self._ideal = ideal_eos.IdealEOS(self._mu[0])
+            self._logs_fn[key] = (filled if filled is not None
+                                  else eos_obj.get_logs_pt)
 
     # -----------------------------------------------------------------
     # construction helper
     # -----------------------------------------------------------------
     def _make_z_eos(self, name, smooth_z):
-        """Map a user-facing name to a (z_eos instance, mu) pair."""
+        """Map a user-facing name to a (canonical_key, z_eos) pair."""
         key = name.lower()
-        if key == 'aqua_revised':
-            return (z_eos(species='water', smooth_z=smooth_z,
-                          aqua_version='revised'), self._m_water)
-        if key in ('aqua', 'aqua_original', 'water'):
-            return (z_eos(species='water', smooth_z=smooth_z,
-                          aqua_version='original'), self._m_water)
+        if key in ('water_revised', 'aqua_revised'):
+            return 'water', z_eos(species='water', smooth_z=smooth_z,
+                                  aqua_version='revised')
+        if key in ('water', 'aqua', 'aqua_original'):
+            return 'water', z_eos(species='water', smooth_z=smooth_z,
+                                  aqua_version='original')
         if key in ('mg2sio4', 'rock', 'forsterite'):
-            return (z_eos(species='mg2sio4', smooth_z=smooth_z),
-                    self._m_rock)
+            return 'mg2sio4', z_eos(species='mg2sio4', smooth_z=smooth_z)
         if key == 'methane':
-            return (z_eos(species='methane', smooth_z=smooth_z),
-                    self._m_methane)
+            return 'methane', z_eos(species='methane', smooth_z=smooth_z)
         if key == 'ammonia':
-            return (z_eos(species='ammonia', smooth_z=smooth_z),
-                    self._m_ammonia)
+            return 'ammonia', z_eos(species='ammonia', smooth_z=smooth_z)
         if key == 'iron':
-            return (z_eos(species='iron', smooth_z=smooth_z),
-                    self._m_iron)
+            return 'iron', z_eos(species='iron', smooth_z=smooth_z)
         raise ValueError(f"Unknown z_eos species name '{name}'. Use one of "
-                         "'aqua_revised', 'aqua', 'mg2sio4', 'methane', "
+                         "'water_revised', 'water', 'mg2sio4', 'methane', "
                          "'ammonia', 'iron'.")
+
+    # Molecular weight for each canonical role (ideal entropy of mixing)
+    @property
+    def _mu_by_key(self):
+        return {'water': self._m_water, 'methane': self._m_methane,
+                'ammonia': self._m_ammonia, 'mg2sio4': self._m_rock,
+                'iron': self._m_iron}
 
     # -----------------------------------------------------------------
     # NaN-filled entropy interpolator (AQUA superionic corner)
@@ -1126,109 +1135,144 @@ class z_eos_val_mixtures:
         out[pos] = x[pos] * np.log(x[pos])
         return out
 
-    def _fractions(self, _f2, _f3):
-        """Return the per-species mass fractions [f1, f2, f3...].
+    def _metal_fractions(self, _zm, _za, _zr):
+        """Physical mass fractions **within** the metal budget Z.
 
-        ``f1`` is the remainder ``1 - _f2 - _f3``.  Only as many
-        entries as there are loaded species are returned (a two-species
-        mixture ignores ``_f3``).
+        Same nested convention as ``val_mixtures._metal_fractions``.
         """
-        fracs = [1.0 - np.asarray(_f2, dtype=float) - np.asarray(_f3, dtype=float),
-                 np.asarray(_f2, dtype=float),
-                 np.asarray(_f3, dtype=float)]
-        return fracs[:len(self._eos)]
+        f_water   = (1.0 - _zm) * (1.0 - _za) * (1.0 - _zr)
+        f_methane = _zm * (1.0 - _za) * (1.0 - _zr)
+        f_ammonia = _za * (1.0 - _zr)
+        f_rock    = _zr
+        return f_water, f_methane, f_ammonia, f_rock
 
-    def _smix_ideal_z(self, fracs):
+    def _smix_ideal_z(self, f_w, f_m, f_a, f_r):
         """Ideal entropy of mixing  -Σ(x_i ln x_i) / q   [kb/baryon].
 
-        Simplified, Z-only analogue of ``val_mixtures._smix_ideal``.
-
-        Parameters
-        ----------
-        fracs : list of (array-like) mass fractions, one per species,
-            in the same order as ``self._eos`` / ``self._mu``.
-
-        Returns value in kb/baryon.  Caller divides by ``erg_to_kbbar``
-        to convert to erg/(g.K).
+        Simplified, Z-only analogue of ``val_mixtures._smix_ideal``
+        over the four metal species (water, methane, ammonia, rock).
+        Returns kb/baryon; caller divides by ``erg_to_kbbar`` for
+        erg/(g.K).
         """
+        species = [(f_w, self._m_water), (f_m, self._m_methane),
+                   (f_a, self._m_ammonia), (f_r, self._m_rock)]
         n_list = [np.where(np.asarray(f) > 0,
                            np.asarray(f, dtype=float) / mu, 0.0)
-                  for f, mu in zip(fracs, self._mu)]
+                  for f, mu in species]
         Ntot = sum(n_list)
 
         x_list = [n / Ntot for n in n_list]
-        q = sum(mu * x for mu, x in zip(self._mu, x_list))
+        q = sum(mu * x for (_, mu), x in zip(species, x_list))
 
         s_id = -sum(self._guarded_xlogx(x) for x in x_list) / q
         return s_id
 
+    # ordered (canonical_key, fraction-index) used by the metal loops
+    _METAL_KEYS = ('water', 'methane', 'ammonia', 'mg2sio4')
+
     # =================================================================
-    # forward models  (P, T, fractions)
+    # metal mixing  (drop-in for val_mixtures.get_logrho_z / _s_z / _u_z)
     # =================================================================
 
-    def get_logrho_pt(self, _lgp, _lgt, _f2=0.0, _f3=0.0):
-        """Z-mixture density via the Volume Addition Law (log10 g/cm^3)."""
-        fracs = self._fractions(_f2, _f3)
+    def get_logrho_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Metal-mixture density via VAL (log10 g/cm³)."""
+        fracs = self._metal_fractions(_zm, _za, _zr)
 
         v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
-        for eos_obj, f in zip(self._eos, fracs):
-            if np.any(np.asarray(f) > 0):
-                rho_i = 10.0 ** eos_obj.get_logrho_pt(_lgp, _lgt)
+        for key, f in zip(self._METAL_KEYS, fracs):
+            if np.any(np.asarray(f) > 0) and key in self.z:
+                rho_i = 10.0 ** self.z[key].get_logrho_pt(_lgp, _lgt)
                 v_mix = v_mix + f / rho_i
 
         result = np.log10(1.0 / v_mix)
         if np.isscalar(_lgp) and np.isscalar(_lgt):
-            return np.atleast_1d(result).item()
+            return result.item()
         return result
 
-    def get_s_pt(self, _lgp, _lgt, _f2=0.0, _f3=0.0):
-        """Z-mixture entropy (erg/(g.K)).
+    def _s_massweighted(self, _lgp, _lgt, fracs):
+        """Mass-weighted metal entropy (erg/(g·K)), NaN-filled, NO mixing."""
+        s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+        for key, f in zip(self._METAL_KEYS, fracs):
+            if np.any(np.asarray(f) > 0) and key in self.z:
+                s_mix = s_mix + f * 10.0 ** self._logs_fn[key](_lgp, _lgt)
+        return s_mix
 
-        Mass-weighted per-species entropy plus the ideal entropy of
+    def get_s_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Metal-mixture entropy, mass-weighted (erg/(g·K)).
+
+        NOTE: does NOT include ideal entropy of mixing — that is added
+        at the full H-He-Z level in ``val_mixtures.get_s_pt_val`` (and
+        in this class's standalone ``get_s_pt``).  Uses the NaN-filled
+        entropy accessor in the AQUA superionic corner.
+        """
+        s_mix = self._s_massweighted(_lgp, _lgt,
+                                     self._metal_fractions(_zm, _za, _zr))
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return s_mix.item()
+        return s_mix
+
+    def get_u_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Metal-mixture internal energy, mass-weighted (erg/g)."""
+        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+
+        u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+        for key, f in zip(self._METAL_KEYS, (f_w, f_m, f_a, f_r)):
+            if np.any(np.asarray(f) > 0) and key in self.z:
+                u_mix = u_mix + f * self.z[key].get_u_pt(_lgp, _lgt)
+        if np.any(np.asarray(f_r) > 0) and 'iron' in self.z:
+            u_mix = u_mix + f_r * self.z['iron'].get_u_pt(_lgp, _lgt)  # iron shares rock fraction for now
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return u_mix.item()
+        return u_mix
+
+    # =================================================================
+    # standalone forward models (with ideal entropy of mixing)
+    # =================================================================
+
+    def get_logrho_pt(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Alias for ``get_logrho_z`` (density has no mixing term)."""
+        return self.get_logrho_z(_lgp, _lgt, _zm, _za, _zr)
+
+    def get_u_pt(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Alias for ``get_u_z`` (internal energy is mass-weighted)."""
+        return self.get_u_z(_lgp, _lgt, _zm, _za, _zr)
+
+    def get_s_pt(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
+        """Standalone Z-mixture entropy (erg/(g·K)).
+
+        Mass-weighted per-species entropy **plus** the ideal entropy of
         mixing.  At an end-member (one fraction = 1) the mixing term
         vanishes and the result reduces to the pure species value.
+        (``val_mixtures`` does not call this — it uses ``get_s_z`` and
+        adds the full H-He-Z mixing itself.)
         """
-        fracs = self._fractions(_f2, _f3)
-
-        s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
-        for logs_fn, f in zip(self._logs_fn, fracs):
-            if np.any(np.asarray(f) > 0):
-                s_mix = s_mix + f * 10.0 ** logs_fn(_lgp, _lgt)
+        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+        s_mix = self._s_massweighted(_lgp, _lgt, (f_w, f_m, f_a, f_r))
 
         # Ideal entropy of mixing (kb/baryon -> erg/(g.K))
-        s_mix = s_mix + self._smix_ideal_z(fracs) / erg_to_kbbar
+        s_mix = s_mix + self._smix_ideal_z(f_w, f_m, f_a, f_r) / erg_to_kbbar
 
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return np.atleast_1d(s_mix).item()
         return s_mix
 
-    def get_u_pt(self, _lgp, _lgt, _f2=0.0, _f3=0.0):
-        """Z-mixture internal energy, mass-weighted (erg/g)."""
-        fracs = self._fractions(_f2, _f3)
-
-        u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
-        for eos_obj, f in zip(self._eos, fracs):
-            if np.any(np.asarray(f) > 0):
-                u_mix = u_mix + f * eos_obj.get_u_pt(_lgp, _lgt)
-
-        if np.isscalar(_lgp) and np.isscalar(_lgt):
-            return np.atleast_1d(u_mix).item()
-        return u_mix
-
     # =================================================================
     # inversions  (reuse the self-contained z_eos._newton_1d_z solver)
     # =================================================================
 
-    def _mu_mix(self, _f2, _f3):
+    def _mu_mix(self, _zm, _za, _zr):
         """Mass-weighted molecular weight for ideal-gas initial guesses."""
-        fracs = self._fractions(_f2, _f3)
-        f2 = float(np.mean(np.atleast_1d(fracs[1])))
-        f3 = float(np.mean(np.atleast_1d(fracs[2]))) if len(fracs) > 2 else 0.0
-        f1 = 1.0 - f2 - f3
-        fvals = [f1, f2, f3][:len(self._eos)]
-        return sum(f * mu for f, mu in zip(fvals, self._mu))
+        fracs = self._metal_fractions(_zm, _za, _zr)
+        mus = (self._m_water, self._m_methane, self._m_ammonia, self._m_rock)
+        return sum(float(np.mean(np.atleast_1d(f))) * mu
+                   for f, mu in zip(fracs, mus))
 
-    def get_logt_sp(self, _s_kb, _lgp, _f2=0.0, _f3=0.0):
+    def _newton_solver(self):
+        """The self-contained z_eos Newton/brentq solver (any species)."""
+        return next(iter(self.z.values()))._newton_1d_z
+
+    def get_logt_sp(self, _s_kb, _lgp, _zm=0.0, _za=0.0, _zr=0.0):
         """Temperature from (S, P, fractions) via Newton-Raphson.
 
         Inverts ``get_s_pt(P, T) = _s_kb`` for logT.  The target
@@ -1247,8 +1291,8 @@ class z_eos_val_mixtures:
         # Target entropy in erg/(g.K)
         s_target_cgs = _s_kb / erg_to_kbbar
 
-        newton = self._eos[0]._newton_1d_z
-        ideal = ideal_eos.IdealEOS(self._mu_mix(_f2, _f3))
+        newton = self._newton_solver()
+        ideal = ideal_eos.IdealEOS(self._mu_mix(_zm, _za, _zr))
 
         prev_sol = None
         for idx in np.ndindex(s_target_cgs.shape):
@@ -1257,7 +1301,7 @@ class z_eos_val_mixtures:
             p_i = float(_lgp[idx])
 
             def err(lgt, _s=s_i, _p=p_i):
-                return float(self.get_s_pt(_p, lgt, _f2, _f3) - _s)
+                return float(self.get_s_pt(_p, lgt, _zm, _za, _zr) - _s)
 
             if prev_sol is not None:
                 guess = prev_sol
@@ -1271,10 +1315,10 @@ class z_eos_val_mixtures:
 
         return out.item() if scalar else out
 
-    def get_logt_rhop(self, _lgrho, _lgp, _f2=0.0, _f3=0.0):
+    def get_logt_rhop(self, _lgrho, _lgp, _zm=0.0, _za=0.0, _zr=0.0):
         """Temperature from (rho, P, fractions) via Newton-Raphson.
 
-        Inverts ``get_logrho_pt(P, T) = _lgrho`` for logT.
+        Inverts ``get_logrho_z(P, T) = _lgrho`` for logT.
         """
         scalar = np.isscalar(_lgrho) and np.isscalar(_lgp)
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
@@ -1284,8 +1328,8 @@ class z_eos_val_mixtures:
 
         lo_t, hi_t = 2.0, 7.0
 
-        newton = self._eos[0]._newton_1d_z
-        ideal = ideal_eos.IdealEOS(self._mu_mix(_f2, _f3))
+        newton = self._newton_solver()
+        ideal = ideal_eos.IdealEOS(self._mu_mix(_zm, _za, _zr))
 
         prev_sol = None
         for idx in np.ndindex(_lgrho.shape):
@@ -1293,7 +1337,7 @@ class z_eos_val_mixtures:
             p_i = float(_lgp[idx])
 
             def err(lgt, _rho=rho_i, _p=p_i):
-                return float(self.get_logrho_pt(_p, lgt, _f2, _f3) - _rho)
+                return float(self.get_logrho_z(_p, lgt, _zm, _za, _zr) - _rho)
 
             if prev_sol is not None:
                 guess = prev_sol
@@ -1390,19 +1434,13 @@ class val_mixtures:
         # H-He EOS
         self.hhe = hhe_eos(hhe_eos_name, smooth_hhe=smooth_hhe)
 
-        # Z EOS instances — one per species
-        # 'water_revised' and 'water' both map to the 'water' key in self.z
-        # but load different AQUA table versions.
-        self.z = {}
-        for sp in species_list:
-            if sp == 'water_revised':
-                self.z['water'] = z_eos(species='water', smooth_z=smooth_z,
-                                        aqua_version='revised')
-            elif sp == 'water':
-                self.z['water'] = z_eos(species='water', smooth_z=smooth_z,
-                                        aqua_version='original')
-            else:
-                self.z[sp] = z_eos(species=sp, smooth_z=smooth_z)
+        # Metal mixing is delegated to z_eos_val_mixtures, which loads the
+        # Z EOS instances and adds NaN interpolation/extrapolation in the
+        # AQUA superionic corner.  self.z is shared (same dict) so the
+        # metal-mixing methods below read the same species objects.
+        self.zmetal = z_eos_val_mixtures(species_list=species_list,
+                                         smooth_z=smooth_z, fill_z_nans=True)
+        self.z = self.zmetal.z
 
     # =================================================================
     # helpers
@@ -1546,72 +1584,28 @@ class val_mixtures:
     # =================================================================
 
     def get_logrho_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
-        """Metal-mixture density via VAL (log10 g/cm³)."""
-        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+        """Metal-mixture density via VAL (log10 g/cm³).
 
-        v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
-
-        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
-            rho_w = 10.0 ** self.z['water'].get_logrho_pt(_lgp, _lgt)
-            v_mix = v_mix + f_w / rho_w
-        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
-            rho_m = 10.0 ** self.z['methane'].get_logrho_pt(_lgp, _lgt)
-            v_mix = v_mix + f_m / rho_m
-        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
-            rho_a = 10.0 ** self.z['ammonia'].get_logrho_pt(_lgp, _lgt)
-            v_mix = v_mix + f_a / rho_a
-        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
-            rho_r = 10.0 ** self.z['mg2sio4'].get_logrho_pt(_lgp, _lgt)
-            v_mix = v_mix + f_r / rho_r
-
-        result = np.log10(1.0 / v_mix)
-        if np.isscalar(_lgp) and np.isscalar(_lgt):
-            return result.item()
-        return result
+        Delegated to ``z_eos_val_mixtures`` (which adds AQUA NaN-corner
+        interpolation/extrapolation).
+        """
+        return self.zmetal.get_logrho_z(_lgp, _lgt, _zm, _za, _zr)
 
     def get_s_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
         """Metal-mixture entropy, mass-weighted (erg/(g·K)).
 
         NOTE: does NOT include ideal entropy of mixing — that is added
-        at the full H-He-Z level in get_s_pt_val.
+        at the full H-He-Z level in get_s_pt_val.  Delegated to
+        ``z_eos_val_mixtures`` (NaN-filled in the AQUA superionic corner).
         """
-        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
-
-        s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
-
-        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
-            s_mix = s_mix + f_w * 10.0 ** self.z['water'].get_logs_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
-            s_mix = s_mix + f_m * 10.0 ** self.z['methane'].get_logs_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
-            s_mix = s_mix + f_a * 10.0 ** self.z['ammonia'].get_logs_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
-            s_mix = s_mix + f_r * 10.0 ** self.z['mg2sio4'].get_logs_pt(_lgp, _lgt)
-
-        if np.isscalar(_lgp) and np.isscalar(_lgt):
-            return s_mix.item()
-        return s_mix
+        return self.zmetal.get_s_z(_lgp, _lgt, _zm, _za, _zr)
 
     def get_u_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
-        """Metal-mixture internal energy, mass-weighted (erg/g)."""
-        f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
+        """Metal-mixture internal energy, mass-weighted (erg/g).
 
-        u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
-
-        if np.any(np.asarray(f_w) > 0) and 'water' in self.z:
-            u_mix = u_mix + f_w * self.z['water'].get_u_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_m) > 0) and 'methane' in self.z:
-            u_mix = u_mix + f_m * self.z['methane'].get_u_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_a) > 0) and 'ammonia' in self.z:
-            u_mix = u_mix + f_a * self.z['ammonia'].get_u_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_r) > 0) and 'mg2sio4' in self.z:
-            u_mix = u_mix + f_r * self.z['mg2sio4'].get_u_pt(_lgp, _lgt)
-        if np.any(np.asarray(f_r) > 0) and 'iron' in self.z:
-            u_mix = u_mix + f_r * self.z['iron'].get_u_pt(_lgp, _lgt)  # iron shares rock fraction for now
-
-        if np.isscalar(_lgp) and np.isscalar(_lgt):
-            return u_mix.item()
-        return u_mix
+        Delegated to ``z_eos_val_mixtures``.
+        """
+        return self.zmetal.get_u_z(_lgp, _lgt, _zm, _za, _zr)
 
     # =================================================================
     # Full H-He-Z mixing
