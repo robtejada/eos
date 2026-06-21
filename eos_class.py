@@ -870,6 +870,442 @@ class z_eos:
                 prev_sol = sol
 
         return out.item() if scalar else out
+class z_eos_val_mixtures:
+    """Volume Addition Law (VAL) mixer for up to three Z species.
+
+    A deliberately simple heavy-element mixer.  Given up to three
+    ``z_eos`` species (e.g. water + rock), it returns the mixture
+    density, entropy and internal energy as functions of (P, T,
+    fractions).
+
+    Unlike ``val_mixtures`` (which mixes H-He-Z with both ideal and
+    HG23 non-ideal corrections), this class:
+      - mixes Z species only,
+      - applies the Volume Addition Law for density,
+      - mass-weights the per-species S and U,
+      - adds the *ideal* entropy of mixing (there is no non-ideal
+        information available for Z-Z mixtures).
+
+    Composition convention
+    ----------------------
+    Two explicit mass fractions ``_f2`` and ``_f3`` give the fraction
+    of the second and third species; the first species takes the
+    remainder::
+
+        f1 = 1 - _f2 - _f3
+
+    For the canonical 50/50 water/rock mixture
+    (``z_eos1='aqua_revised'``, ``z_eos2='mg2sio4'``) call the methods
+    with ``_f2 = f_rock`` (and ``_f3 = 0``).
+
+    Units (CGS, consistent with ``z_eos`` / ``val_mixtures``)
+    --------------------------------------------------------
+        logP   : log10(dyn/cm^2)
+        logT   : log10(K)
+        logrho : log10(g/cm^3)
+        S      : erg/(g.K)   (linear; ``get_logt_sp`` takes kb/baryon)
+        U      : erg/g       (linear)
+    """
+
+    # Molecular weights for ideal entropy of mixing
+    _m_water   = 18.015
+    _m_methane = 16.04
+    _m_ammonia = 17.031
+    _m_rock    = 140.6935   # Mg2SiO4 (forsterite)
+    _m_iron    = 55.845
+
+    # Minimum strictly-increasing step (dex of log10 S per grid cell)
+    # imposed on filled corner cells so T(S,P) always brackets a root.
+    _MONO_EPS = 1e-3
+
+    def __init__(self, z_eos1='aqua_revised', z_eos2='mg2sio4',
+                 z_eos3=None, smooth_z=False, fill_z_nans=True):
+        """
+        Parameters
+        ----------
+        z_eos1, z_eos2, z_eos3 : str or None
+            Species selectors.  Recognised names:
+              'aqua_revised'                -> revised AQUA water
+              'aqua' / 'aqua_original' /
+                'water'                     -> original AQUA water
+              'mg2sio4' / 'rock'            -> Mg2SiO4 forsterite
+              'methane', 'ammonia', 'iron'  -> respective z_eos species
+            ``z_eos3=None`` builds a two-species mixture.
+        smooth_z : bool
+            Passed through to each underlying ``z_eos`` table loader.
+        fill_z_nans : bool
+            If True (default), build a NaN-free entropy interpolator for
+            any sub-EOS whose ``logs_pt`` table has missing cells.  The
+            revised AQUA water table flags entropy as unavailable (raw
+            sentinel = -1) in the high-P / low-T superionic-and-solid
+            corner (logP >~ 12.9), which would otherwise poison the
+            mixture entropy (and its T(S,P) inversion) with NaNs.  The
+            gap is filled by 2-D ``np.interp`` along P then T, which
+            extends each isotherm's last finite value flatly to higher
+            pressure (smooth and monotone along isotherms, so the
+            S<->T inversion stays well posed in this corner).
+            These filled values are *extrapolated and not validated* —
+            they exist only to keep the mixer finite and well behaved in
+            a region where planetary interiors are hot anyway.  The
+            shared ``z_eos`` instances are never modified; the filled
+            interpolator lives inside this mixer.  Set False to recover
+            the raw (NaN-bearing) behaviour.
+        """
+        names = [z_eos1, z_eos2, z_eos3]
+        self.fill_z_nans = fill_z_nans
+
+        self._eos = []   # list of z_eos instances
+        self._mu = []    # parallel list of molecular weights
+        for name in names:
+            if name is None:
+                continue
+            eos_obj, mu = self._make_z_eos(name, smooth_z)
+            self._eos.append(eos_obj)
+            self._mu.append(mu)
+
+        if len(self._eos) < 2:
+            raise ValueError("z_eos_val_mixtures needs at least two "
+                             "species (z_eos1 and z_eos2).")
+
+        # Per-species log10(S) accessor f(lgp, lgt).  Uses a NaN-filled
+        # interpolator where the raw table has gaps (and fill_z_nans is
+        # on); otherwise falls through to the sub-EOS's get_logs_pt.
+        self._logs_fn = []
+        for eos_obj in self._eos:
+            filled = self._build_filled_logs(eos_obj) if fill_z_nans else None
+            self._logs_fn.append(filled if filled is not None
+                                 else eos_obj.get_logs_pt)
+
+        # Mass-weighted ideal-gas EOS for inversion initial guesses.
+        # mu is updated per call to reflect the requested fractions.
+        self._ideal = ideal_eos.IdealEOS(self._mu[0])
+
+    # -----------------------------------------------------------------
+    # construction helper
+    # -----------------------------------------------------------------
+    def _make_z_eos(self, name, smooth_z):
+        """Map a user-facing name to a (z_eos instance, mu) pair."""
+        key = name.lower()
+        if key == 'aqua_revised':
+            return (z_eos(species='water', smooth_z=smooth_z,
+                          aqua_version='revised'), self._m_water)
+        if key in ('aqua', 'aqua_original', 'water'):
+            return (z_eos(species='water', smooth_z=smooth_z,
+                          aqua_version='original'), self._m_water)
+        if key in ('mg2sio4', 'rock', 'forsterite'):
+            return (z_eos(species='mg2sio4', smooth_z=smooth_z),
+                    self._m_rock)
+        if key == 'methane':
+            return (z_eos(species='methane', smooth_z=smooth_z),
+                    self._m_methane)
+        if key == 'ammonia':
+            return (z_eos(species='ammonia', smooth_z=smooth_z),
+                    self._m_ammonia)
+        if key == 'iron':
+            return (z_eos(species='iron', smooth_z=smooth_z),
+                    self._m_iron)
+        raise ValueError(f"Unknown z_eos species name '{name}'. Use one of "
+                         "'aqua_revised', 'aqua', 'mg2sio4', 'methane', "
+                         "'ammonia', 'iron'.")
+
+    # -----------------------------------------------------------------
+    # NaN-filled entropy interpolator (AQUA superionic corner)
+    # -----------------------------------------------------------------
+    def _fill_grid_nans_2d(self, grid, t_axis):
+        """Fill NaN cells in a 2-D log10(S) grid (returns a copy).
+
+        Pass 1 interpolates/extrapolates along the **pressure** axis;
+        Pass 2 mops up any remainder along T.  Both use ``np.interp``,
+        which clamps to the nearest finite endpoint.
+
+        Pressure-first is deliberate.  In the AQUA superionic corner the
+        missing-data boundary runs along pressure: at a fixed low T,
+        entropy is tabulated up to logP ~ 12.8 and absent above.  Filling
+        along P therefore extends each isotherm's last finite value
+        flatly to higher P, which is (a) continuous across the boundary
+        and (b) monotone along every isotherm.  Filling T-first instead
+        clamps each P-row to its own low-T boundary; because those
+        boundaries sit at very different temperatures (logT ~ 2.0 at
+        logP=12.9 but ~3.3 at logP=13.5) with order-of-magnitude
+        different S, that produces large non-monotone jumps along
+        isotherms (up to ~2 dex) that break the S<->T inversion.
+
+        After filling, a monotonization pass forces S to be *strictly*
+        increasing in T within the *filled cells only* (real cells are
+        never touched), by at least ``_MONO_EPS`` dex of log10(S) per
+        grid cell.  The AQUA boundary entropy is itself non-monotone in T
+        across the superionic transition, so the pressure-clamped corner
+        inherits S(T) dips (and flats) that would give T(S,P) multiple
+        roots or no bracket at all (the deep corner carries essentially
+        no T information).  Pulling the filled cells down onto a strictly
+        increasing profile — anchored at the real boundary above —
+        guarantees a unique, finite, well-posed inversion in this
+        otherwise unphysical region.  The imposed slope is tiny
+        (~0.08 dex total across the block), so isotherms stay tame.
+        """
+        grid = np.asarray(grid, dtype=float)
+        nan_mask = np.isnan(grid)
+        out = grid.copy()
+        p_axis = 1 - t_axis
+
+        def _interp_line(line):
+            bad = np.isnan(line)
+            good = ~bad
+            if bad.any() and good.sum() >= 2:
+                line[bad] = np.interp(np.where(bad)[0],
+                                      np.where(good)[0], line[good])
+            return line
+
+        # Pass 1: along P (clamps the high-P edge; continuous across the
+        # P-aligned data boundary, monotone along isotherms)
+        out = np.apply_along_axis(_interp_line, p_axis, out)
+        # Pass 2: along T for any still-NaN line (safety net)
+        if np.isnan(out).any():
+            out = np.apply_along_axis(_interp_line, t_axis, out)
+
+        # Pass 3: enforce S *strictly* increasing in T over the
+        # originally-NaN cells, so T(S,P) is single-valued and always
+        # brackets a root there.  Work in (P, T) view.
+        work = out if t_axis == 1 else out.T          # view, shape (nP, nT)
+        mask = nan_mask if t_axis == 1 else nan_mask.T
+        for ip in range(work.shape[0]):
+            line = work[ip]
+            ml = mask[ip]
+            for i in range(line.size - 2, -1, -1):    # high T -> low T
+                if ml[i]:
+                    cap = line[i + 1] - self._MONO_EPS
+                    if line[i] > cap:
+                        line[i] = cap
+        return out
+
+    def _build_filled_logs(self, eos_obj):
+        """Build a NaN-free log10(S) accessor ``f(lgp, lgt)`` for one
+        sub-EOS, or return None if its ``logs_pt`` grid has no NaNs.
+
+        The new interpolator mirrors the sub-EOS's own axis convention
+        (water/mg2sio4/iron store (logP, logT); methane/ammonia store
+        (logT, logP)) and leaves the shared ``z_eos`` untouched.
+        """
+        grid = np.asarray(getattr(eos_obj, 'logs_pt'), dtype=float)
+        if not np.isnan(grid).any():
+            return None
+
+        lp = eos_obj.logpvals_pt
+        lt = eos_obj.logtvals_pt
+        if eos_obj.species in ('water', 'mg2sio4', 'iron'):
+            axes, t_axis = (lp, lt), 1          # grid is (n_p, n_t)
+            reorder = lambda a, b: (a, b)       # query (lgp, lgt)
+        else:
+            axes, t_axis = (lt, lp), 0          # grid is (n_t, n_p)
+            reorder = lambda a, b: (b, a)       # query (lgt, lgp)
+
+        filled = self._fill_grid_nans_2d(grid, t_axis)
+        rgi = RGI(axes, filled, method='linear',
+                  bounds_error=False, fill_value=None)
+
+        def _accessor(_lgp, _lgt):
+            a, b = reorder(_lgp, _lgt)
+            pts = np.column_stack([np.atleast_1d(a), np.atleast_1d(b)])
+            res = rgi(pts)
+            if np.isscalar(_lgp) and np.isscalar(_lgt):
+                return res.item()
+            return res
+
+        return _accessor
+
+    # =================================================================
+    # helpers
+    # =================================================================
+
+    @staticmethod
+    def _guarded_xlogx(x):
+        """x * ln(x), returning 0 when x == 0."""
+        x = np.asarray(x, dtype=float)
+        out = np.zeros_like(x)
+        pos = x > 0.0
+        out[pos] = x[pos] * np.log(x[pos])
+        return out
+
+    def _fractions(self, _f2, _f3):
+        """Return the per-species mass fractions [f1, f2, f3...].
+
+        ``f1`` is the remainder ``1 - _f2 - _f3``.  Only as many
+        entries as there are loaded species are returned (a two-species
+        mixture ignores ``_f3``).
+        """
+        fracs = [1.0 - np.asarray(_f2, dtype=float) - np.asarray(_f3, dtype=float),
+                 np.asarray(_f2, dtype=float),
+                 np.asarray(_f3, dtype=float)]
+        return fracs[:len(self._eos)]
+
+    def _smix_ideal_z(self, fracs):
+        """Ideal entropy of mixing  -Σ(x_i ln x_i) / q   [kb/baryon].
+
+        Simplified, Z-only analogue of ``val_mixtures._smix_ideal``.
+
+        Parameters
+        ----------
+        fracs : list of (array-like) mass fractions, one per species,
+            in the same order as ``self._eos`` / ``self._mu``.
+
+        Returns value in kb/baryon.  Caller divides by ``erg_to_kbbar``
+        to convert to erg/(g.K).
+        """
+        n_list = [np.where(np.asarray(f) > 0,
+                           np.asarray(f, dtype=float) / mu, 0.0)
+                  for f, mu in zip(fracs, self._mu)]
+        Ntot = sum(n_list)
+
+        x_list = [n / Ntot for n in n_list]
+        q = sum(mu * x for mu, x in zip(self._mu, x_list))
+
+        s_id = -sum(self._guarded_xlogx(x) for x in x_list) / q
+        return s_id
+
+    # =================================================================
+    # forward models  (P, T, fractions)
+    # =================================================================
+
+    def get_logrho_pt(self, _lgp, _lgt, _f2=0.0, _f3=0.0):
+        """Z-mixture density via the Volume Addition Law (log10 g/cm^3)."""
+        fracs = self._fractions(_f2, _f3)
+
+        v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+        for eos_obj, f in zip(self._eos, fracs):
+            if np.any(np.asarray(f) > 0):
+                rho_i = 10.0 ** eos_obj.get_logrho_pt(_lgp, _lgt)
+                v_mix = v_mix + f / rho_i
+
+        result = np.log10(1.0 / v_mix)
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return np.atleast_1d(result).item()
+        return result
+
+    def get_s_pt(self, _lgp, _lgt, _f2=0.0, _f3=0.0):
+        """Z-mixture entropy (erg/(g.K)).
+
+        Mass-weighted per-species entropy plus the ideal entropy of
+        mixing.  At an end-member (one fraction = 1) the mixing term
+        vanishes and the result reduces to the pure species value.
+        """
+        fracs = self._fractions(_f2, _f3)
+
+        s_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+        for logs_fn, f in zip(self._logs_fn, fracs):
+            if np.any(np.asarray(f) > 0):
+                s_mix = s_mix + f * 10.0 ** logs_fn(_lgp, _lgt)
+
+        # Ideal entropy of mixing (kb/baryon -> erg/(g.K))
+        s_mix = s_mix + self._smix_ideal_z(fracs) / erg_to_kbbar
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return np.atleast_1d(s_mix).item()
+        return s_mix
+
+    def get_u_pt(self, _lgp, _lgt, _f2=0.0, _f3=0.0):
+        """Z-mixture internal energy, mass-weighted (erg/g)."""
+        fracs = self._fractions(_f2, _f3)
+
+        u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+        for eos_obj, f in zip(self._eos, fracs):
+            if np.any(np.asarray(f) > 0):
+                u_mix = u_mix + f * eos_obj.get_u_pt(_lgp, _lgt)
+
+        if np.isscalar(_lgp) and np.isscalar(_lgt):
+            return np.atleast_1d(u_mix).item()
+        return u_mix
+
+    # =================================================================
+    # inversions  (reuse the self-contained z_eos._newton_1d_z solver)
+    # =================================================================
+
+    def _mu_mix(self, _f2, _f3):
+        """Mass-weighted molecular weight for ideal-gas initial guesses."""
+        fracs = self._fractions(_f2, _f3)
+        f2 = float(np.mean(np.atleast_1d(fracs[1])))
+        f3 = float(np.mean(np.atleast_1d(fracs[2]))) if len(fracs) > 2 else 0.0
+        f1 = 1.0 - f2 - f3
+        fvals = [f1, f2, f3][:len(self._eos)]
+        return sum(f * mu for f, mu in zip(fvals, self._mu))
+
+    def get_logt_sp(self, _s_kb, _lgp, _f2=0.0, _f3=0.0):
+        """Temperature from (S, P, fractions) via Newton-Raphson.
+
+        Inverts ``get_s_pt(P, T) = _s_kb`` for logT.  The target
+        entropy ``_s_kb`` is in kb/baryon (consistent with
+        ``z_eos.get_logt_sp``); it is converted internally to the
+        erg/(g.K) used by ``get_s_pt``.
+        """
+        scalar = np.isscalar(_s_kb) and np.isscalar(_lgp)
+        _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
+        _lgp = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _s_kb, _lgp = np.broadcast_arrays(_s_kb, _lgp)
+        out = np.full_like(_s_kb, np.nan, dtype=float)
+
+        lo_t, hi_t = 2.0, 7.0
+
+        # Target entropy in erg/(g.K)
+        s_target_cgs = _s_kb / erg_to_kbbar
+
+        newton = self._eos[0]._newton_1d_z
+        ideal = ideal_eos.IdealEOS(self._mu_mix(_f2, _f3))
+
+        prev_sol = None
+        for idx in np.ndindex(s_target_cgs.shape):
+            s_i = float(s_target_cgs[idx])
+            s_kb_i = float(_s_kb[idx])
+            p_i = float(_lgp[idx])
+
+            def err(lgt, _s=s_i, _p=p_i):
+                return float(self.get_s_pt(_p, lgt, _f2, _f3) - _s)
+
+            if prev_sol is not None:
+                guess = prev_sol
+            else:
+                guess = float(np.clip(ideal.get_t_sp(s_kb_i, p_i, 0.0),
+                                      lo_t, hi_t))
+            sol, ok = newton(err, guess, lo_t, hi_t)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
+
+        return out.item() if scalar else out
+
+    def get_logt_rhop(self, _lgrho, _lgp, _f2=0.0, _f3=0.0):
+        """Temperature from (rho, P, fractions) via Newton-Raphson.
+
+        Inverts ``get_logrho_pt(P, T) = _lgrho`` for logT.
+        """
+        scalar = np.isscalar(_lgrho) and np.isscalar(_lgp)
+        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
+        _lgp = np.atleast_1d(np.asarray(_lgp, dtype=float))
+        _lgrho, _lgp = np.broadcast_arrays(_lgrho, _lgp)
+        out = np.full_like(_lgrho, np.nan, dtype=float)
+
+        lo_t, hi_t = 2.0, 7.0
+
+        newton = self._eos[0]._newton_1d_z
+        ideal = ideal_eos.IdealEOS(self._mu_mix(_f2, _f3))
+
+        prev_sol = None
+        for idx in np.ndindex(_lgrho.shape):
+            rho_i = float(_lgrho[idx])
+            p_i = float(_lgp[idx])
+
+            def err(lgt, _rho=rho_i, _p=p_i):
+                return float(self.get_logrho_pt(_p, lgt, _f2, _f3) - _rho)
+
+            if prev_sol is not None:
+                guess = prev_sol
+            else:
+                guess = float(np.clip(ideal.get_t_rhop(rho_i, p_i, 0.0),
+                                      lo_t, hi_t))
+            sol, ok = newton(err, guess, lo_t, hi_t)
+            if np.isfinite(sol):
+                out[idx] = sol
+                prev_sol = sol
+
+        return out.item() if scalar else out
 
 
 class val_mixtures:
