@@ -89,6 +89,26 @@ read it), then any of {sp, rhop, srho}.
                                  --z_step 0.05 \\
                                  --n_workers 10 --smooth_inverted
 
+Rock mass fraction
+------------------
+By default the metal (Z) component is pure water (``--species
+water_revised``).  To build a table set whose metal is a fixed
+water/rock mixture, pass ``--f_rock`` — the rock (mg2sio4) mass fraction
+*within* the metal budget Z (the nested sub-fraction ``_zr``, with
+``_zm = _za = 0``).  For example a 50/50 water/rock set:
+
+    for b in pt rhot sp rhop srho; do
+        python eos/eos_inversions.py --basis $b --hhe_eos cd \\
+            --z_eos aqua_revised --f_rock 0.5 [--other-grid-flags ...]
+    done
+
+When ``--f_rock > 0`` the script auto-adds 'mg2sio4' to the species list
+and tags every output file with ``frock{f_rock:.2f}`` (e.g.
+``cd_aqua_revised_pt_square_frock0.50.npz``) so the pure-water
+``_square.npz`` tables are never overwritten.  Load such a set with
+``hhe_z_mixtures(..., table_suffix='frock0.50')``.  ``--f_rock 0``
+(default) reproduces the canonical pure-water tables and naming.
+
 Default toggles
 ---------------
     HG23 non-ideal mixing      : ON   (disable with --no_hg)
@@ -96,6 +116,7 @@ Default toggles
     H-He smoothing             : OFF  (enable  with --smooth_hhe)
     Z smoothing                : OFF  (enable  with --smooth_z)
     Post-inversion smoothing   : OFF  (enable  with --smooth_inverted)
+    Rock fraction _zr          : 0.0  (set     with --f_rock)
 """
 
 import argparse
@@ -180,6 +201,15 @@ def build_parser():
     p.add_argument('--species', nargs='+',
                    default=['water_revised'],
                    help="Z species for val_mixtures (default: water_revised)")
+    p.add_argument('--f_rock', type=float, default=0.0,
+                   help="Rock (mg2sio4) mass fraction WITHIN the metal "
+                        "budget Z, i.e. the nested sub-fraction _zr "
+                        "(_zm=_za=0).  f_rock=0 -> pure water (default); "
+                        "f_rock=0.5 -> 50/50 water/rock; f_rock=1 -> pure "
+                        "rock.  When >0, 'mg2sio4' is auto-added to the "
+                        "species list and the output filename is tagged "
+                        "with 'frock{f_rock:.2f}' so it does not overwrite "
+                        "the pure-water _square.npz tables.")
 
     # P grid
     p.add_argument('--logp_lo', type=float, default=DEFAULTS['logp_lo'],
@@ -279,6 +309,33 @@ def main():
     smooth_z = args.smooth_z
     mu_h_vary = args.mu_h_vary
 
+    # --- Rock mass fraction (nested sub-fraction _zr; _zm = _za = 0) ---
+    f_rock = float(args.f_rock)
+    if not (0.0 <= f_rock <= 1.0):
+        parser.error(f"--f_rock must be in [0, 1] (got {f_rock})")
+
+    # The metal mixture needs the mg2sio4 EOS loaded whenever any rock is
+    # present.  Auto-add it (canonical role key 'mg2sio4') if the user
+    # did not include a rock species, so the rock fraction is not silently
+    # dropped by val_mixtures' 'mg2sio4 in self.z' guard.
+    species_list = list(args.species)
+    _rock_names = {'mg2sio4', 'rock', 'forsterite'}
+    if f_rock > 0.0 and not any(s.lower() in _rock_names for s in species_list):
+        species_list.append('mg2sio4')
+        print(f"Note: f_rock={f_rock:.3f} > 0 -> auto-added 'mg2sio4' "
+              f"to species list: {species_list}")
+
+    # Tag the output filename with the rock fraction so a 50/50 water/rock
+    # table does not overwrite the pure-water _square.npz.  Combine with
+    # any user --suffix (frock tag first).  f_rock=0 keeps the canonical
+    # naming for backward compatibility.
+    if f_rock > 0.0:
+        rock_tag = f"frock{f_rock:.2f}"
+        effective_suffix = (f"{rock_tag}_{args.suffix}"
+                            if args.suffix else rock_tag)
+    else:
+        effective_suffix = args.suffix
+
     # --- Print summary ---
     print("=" * 65)
     if args.basis == 'pt':
@@ -288,10 +345,11 @@ def main():
     print("=" * 65)
     print(f"  H-He EOS:    {args.hhe_eos}")
     print(f"  Z EOS:       {args.z_eos}")
-    if args.suffix:
-        print(f"  Suffix:      {args.suffix}  "
-              f"(-> ..._square_{args.suffix}.npz)")
-    print(f"  Species:     {args.species}")
+    print(f"  f_rock (_zr):{f_rock:.3f}")
+    if effective_suffix:
+        print(f"  Suffix:      {effective_suffix}  "
+              f"(-> ..._square_{effective_suffix}.npz)")
+    print(f"  Species:     {species_list}")
     print(f"  HG23:        {hg}")
     print(f"  Smooth H-He: {smooth_hhe}")
     print(f"  Smooth Z:    {smooth_z}")
@@ -360,7 +418,7 @@ def main():
         smooth_hhe=smooth_hhe,
         smooth_z=smooth_z,
         mu_h_vary=mu_h_vary,
-        species_list=args.species,
+        species_list=species_list,
         z_eos=args.z_eos,
         pt_tab=_pt_tab,
         inv_tab=_inv_tab,
@@ -370,18 +428,18 @@ def main():
         logt_range=(args.logt_lo, args.logt_hi),
         logrho_range=(args.logrho_lo, args.logrho_hi),
         logrho_step=args.logrho_step,
-        table_suffix=args.suffix,
+        table_suffix=effective_suffix,
     )
 
     # --- Build table ---
     t0 = time.time()
 
     if args.basis == 'pt':
-        result = eos.build_pt_table(yvals, zvals)
+        result = eos.build_pt_table(yvals, zvals, _zr=f_rock)
         eos.save_pt_table(result, path=args.output)
 
     elif args.basis == 'sp':
-        result = eos.build_sp_table(yvals, zvals,
+        result = eos.build_sp_table(yvals, zvals, _zr=f_rock,
                                     s_lo=args.s_lo, s_hi=args.s_hi,
                                     s_step=args.s_step,
                                     smooth_inverted=args.smooth_inverted,
@@ -389,13 +447,13 @@ def main():
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
-        result = eos.build_rhot_table(yvals, zvals,
+        result = eos.build_rhot_table(yvals, zvals, _zr=f_rock,
                                       smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':
-        result = eos.build_rhop_table(yvals, zvals,
+        result = eos.build_rhop_table(yvals, zvals, _zr=f_rock,
                                       smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_rhop_table(result, path=args.output)
@@ -412,7 +470,7 @@ def main():
                   "--basis rhot ...")
             sys.exit(1)
 
-        result = eos.build_srho_table(yvals, zvals,
+        result = eos.build_srho_table(yvals, zvals, _zr=f_rock,
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
                                       smooth_inverted=args.smooth_inverted,
