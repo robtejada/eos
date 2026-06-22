@@ -1883,7 +1883,7 @@ class hhe_z_mixtures():
                  interp_method='linear',
                  table_suffix='',
                  f_rock=0.0,
-                 rock_interp=False):
+                 rock_interp=None):
         """
         Parameters
         ----------
@@ -1941,25 +1941,32 @@ class hhe_z_mixtures():
             ``f_rock=0.5`` with ``z_eos='aqua_revised'`` loads
             ``cd_aqua_revised_{basis}_square_frock0.50.npz``.  Default 0
             (pure-water metal, canonical ``_square.npz`` tables).
-        rock_interp : bool
-            If True, build three fixed-composition sub-instances at
-            f_rock = 0.0, 0.5, 1.0 (loading the ``_square``,
-            ``frock0.50`` and ``frock1.00`` table sets) and return every
-            EOS quantity by 3-point piecewise-linear interpolation in the
-            per-call rock fraction (the 5th positional ``_frock``
-            argument, equivalently ``_zr``).  Lets the per-cell rock
-            fraction vary continuously over [0, 1].  Derivatives inherit
-            the interpolation automatically (they compose from the base
-            table-query methods).  The interpolating instance holds no
-            tables of its own — only the sub-instances do.  Default False
-            (single fixed-composition set, unchanged behaviour).
-            Activated in ORCHARD by ``rock_mixtures``.
+        rock_interp : bool or None
+            Whether to 3-point interpolate across the f_rock = 0.0, 0.5,
+            1.0 precomputed table sets.  Default None = AUTO-DETECT: it is
+            switched on iff ``f_rock`` is not one of the table fractions
+            {0.0, 0.5, 1.0}.  So f_rock=0.25 -> interpolation; f_rock=0.5
+            -> the single ``frock0.50`` table (no interpolation needed).
+            When on, three fixed-composition sub-instances are built
+            (loading the ``_square``, ``frock0.50`` and ``frock1.00`` sets)
+            and every EOS quantity is returned by piecewise-linear
+            interpolation in the per-call rock fraction (the 5th
+            positional ``_frock`` / ``_zr``); derivatives inherit it
+            automatically.  The interpolating instance holds no tables of
+            its own.  Pass an explicit bool to override the auto-detection
+            (e.g. False for the internal sub-instances).
         """
 
         # --- 3-point rock-fraction interpolation across precomputed sets -
-        # When on, this instance holds no tables of its own; the three
-        # fixed-composition sub-instances (built at the end of __init__)
-        # do, and every base query interpolates among them.
+        # Auto-detect: interpolation is needed iff the requested rock
+        # fraction is not one of the precomputed table fractions.  When on,
+        # this instance holds no tables of its own; the three fixed-
+        # composition sub-instances (built at the end of __init__) do, and
+        # every base query interpolates among them.
+        _ROCK_TABLE_FRACS = (0.0, 0.5, 1.0)
+        if rock_interp is None:
+            rock_interp = not any(abs(float(f_rock) - g) < 1e-9
+                                  for g in _ROCK_TABLE_FRACS)
         self.rock_interp = bool(rock_interp)
         _sub_pt_tab, _sub_inv_tab, _sub_srho_tab = pt_tab, inv_tab, srho_tab
         if self.rock_interp:
