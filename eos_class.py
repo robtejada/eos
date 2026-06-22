@@ -1881,7 +1881,9 @@ class hhe_z_mixtures():
                  logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
                  interp_method='linear',
-                 table_suffix=''):
+                 table_suffix='',
+                 f_rock=0.0,
+                 rock_interp=False):
         """
         Parameters
         ----------
@@ -1928,7 +1930,57 @@ class hhe_z_mixtures():
             ``{hhe}_{z}_{basis}_square_highz.npz`` instead. Pair with
             the ``--suffix`` flag of ``eos_inversions.py`` when building
             tables from the CLI.
+        f_rock : float
+            Fixed rock (mg2sio4) mass fraction WITHIN the metal budget Z
+            (the nested sub-fraction ``_zr``, with ``_zm = _za = 0``).
+            When > 0 this (a) ensures the mg2sio4 EOS is loaded so the
+            metal mixture actually contains rock, and (b) selects the
+            rock-fraction-tagged table variant by extending
+            ``table_suffix`` with ``frock{f_rock:.2f}`` — matching the
+            filenames written by ``eos_inversions.py --f_rock``.  So
+            ``f_rock=0.5`` with ``z_eos='aqua_revised'`` loads
+            ``cd_aqua_revised_{basis}_square_frock0.50.npz``.  Default 0
+            (pure-water metal, canonical ``_square.npz`` tables).
+        rock_interp : bool
+            If True, build three fixed-composition sub-instances at
+            f_rock = 0.0, 0.5, 1.0 (loading the ``_square``,
+            ``frock0.50`` and ``frock1.00`` table sets) and return every
+            EOS quantity by 3-point piecewise-linear interpolation in the
+            per-call rock fraction (the 5th positional ``_frock``
+            argument, equivalently ``_zr``).  Lets the per-cell rock
+            fraction vary continuously over [0, 1].  Derivatives inherit
+            the interpolation automatically (they compose from the base
+            table-query methods).  The interpolating instance holds no
+            tables of its own — only the sub-instances do.  Default False
+            (single fixed-composition set, unchanged behaviour).
+            Activated in ORCHARD by ``rock_mixtures``.
         """
+
+        # --- 3-point rock-fraction interpolation across precomputed sets -
+        # When on, this instance holds no tables of its own; the three
+        # fixed-composition sub-instances (built at the end of __init__)
+        # do, and every base query interpolates among them.
+        self.rock_interp = bool(rock_interp)
+        _sub_pt_tab, _sub_inv_tab, _sub_srho_tab = pt_tab, inv_tab, srho_tab
+        if self.rock_interp:
+            pt_tab = inv_tab = srho_tab = False
+            f_rock = 0.0   # the main instance carries no single rock fraction
+
+        # --- Fixed rock mass fraction within Z (nested _zr) -------------
+        # Resolve before species_list / table_suffix are consumed below.
+        self.f_rock = float(f_rock)
+        if self.f_rock > 0.0:
+            # Make sure the rock EOS is present in the metal mixture.
+            if species_list is not None:
+                _rock_names = {'mg2sio4', 'rock', 'forsterite'}
+                if not any(str(s).lower() in _rock_names
+                           for s in species_list):
+                    species_list = list(species_list) + ['mg2sio4']
+            # Select the rock-fraction-tagged tables (frock tag first,
+            # like eos_inversions.py).
+            _rock_tag = f'frock{self.f_rock:.2f}'
+            _suff = str(table_suffix).strip('_')
+            table_suffix = f'{_rock_tag}_{_suff}' if _suff else _rock_tag
 
         self.hhe_eos_name = hhe_eos_name
         self.z_eos_label = z_eos
@@ -1994,6 +2046,54 @@ class hhe_z_mixtures():
 
         # --- Auto-load tables based on pt_tab / inv_tab / srho_tab flags ---
         self._auto_load_tables()
+
+        # --- Rock-fraction interpolation sub-instances (f_rock=0,0.5,1) ---
+        if self.rock_interp:
+            self._rock_fracs = (0.0, 0.5, 1.0)
+            _sub_base = dict(
+                hhe_eos_name=hhe_eos_name, hg=hg,
+                smooth_hhe=smooth_hhe, smooth_z=smooth_z,
+                mu_h_vary=mu_h_vary, z_eos=self.z_eos_label,
+                interp_method=interp_method,
+                logp_range=logp_range, logp_step=logp_step,
+                logt_range=logt_range,
+                logrho_range=logrho_range, logrho_step=logrho_step,
+                pt_tab=_sub_pt_tab, inv_tab=_sub_inv_tab,
+                srho_tab=_sub_srho_tab, y_prime=y_prime,
+                rock_interp=False)
+            self._rock_subs = [
+                hhe_z_mixtures(species_list=['water_revised'],
+                               f_rock=fr, **_sub_base)
+                for fr in self._rock_fracs]
+
+    # =================================================================
+    # Rock-fraction interpolation helper
+    # =================================================================
+
+    def _interp_rock(self, frock, v0, v05, v1):
+        """3-point piecewise-linear interpolation in rock fraction over
+        the precomputed sets at f_rock = 0, 0.5, 1.0.
+
+        Handles scalar or array values and tuple returns (e.g. the S-ρ
+        inversion returns ``(logP, logT)``).  ``frock`` is clipped to
+        [0, 1] and may be a scalar or a per-cell array broadcastable
+        against the returned values.
+        """
+        if isinstance(v0, tuple):
+            return tuple(self._interp_rock(frock, a, b, c)
+                         for a, b, c in zip(v0, v05, v1))
+        f = np.clip(np.asarray(frock, dtype=float), 0.0, 1.0)
+        a0 = np.asarray(v0, dtype=float)
+        a1 = np.asarray(v05, dtype=float)
+        a2 = np.asarray(v1, dtype=float)
+        lower = f <= 0.5
+        t = np.where(lower, f / 0.5, (f - 0.5) / 0.5)
+        lo = np.where(lower, a0, a1)
+        hi = np.where(lower, a1, a2)
+        out = lo + (hi - lo) * t
+        if np.ndim(out) == 0:
+            return float(out)
+        return out
 
     # =================================================================
     # Auto-loading
@@ -2301,19 +2401,32 @@ class hhe_z_mixtures():
         return result
 
     def _s_pt(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0):
-        """S(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
+        """S(P, T, Y', Z) — uses table RGI if loaded, else VAL.
+
+        When ``rock_interp`` is on, interpolate among the f_rock=0,0.5,1
+        sub-instances using ``_zr`` (rock fraction within Z).
+        """
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[s._s_pt(lgp, lgt, yp, z)
+                                            for s in self._rock_subs])
         if self._s_pt_rgi is not None:
             return self._query_pt_rgi(self._s_pt_rgi, lgp, lgt, yp, z)
         return self.val.get_s_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
 
     def _logrho_pt(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0):
         """logrho(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[s._logrho_pt(lgp, lgt, yp, z)
+                                            for s in self._rock_subs])
         if self._logrho_pt_rgi is not None:
             return self._query_pt_rgi(self._logrho_pt_rgi, lgp, lgt, yp, z)
         return self.val.get_logrho_pt_val(lgp, lgt, yp, z, _zm, _za, _zr)
 
     def _logu_pt(self, lgp, lgt, yp, z, _zm=0.0, _za=0.0, _zr=0.0):
         """logU(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[s._logu_pt(lgp, lgt, yp, z)
+                                            for s in self._rock_subs])
         if self._logu_pt_rgi is not None:
             return self._query_pt_rgi(self._logu_pt_rgi, lgp, lgt, yp, z)
         return np.log10(self.val.get_u_pt_val(lgp, lgt, yp, z, _zm, _za, _zr))
@@ -2329,6 +2442,10 @@ class hhe_z_mixtures():
         Uses the pre-computed P-T table RGI by default.
         Set val=True to call val.get_s_pt_val() directly.
         """
+        if self.rock_interp:
+            return self._interp_rock(_frock, *[
+                s.get_s_pt_tab(_lgp, _lgt, _y, _z, val=val, **kw)
+                for s in self._rock_subs])
         _y = self._to_yprime(_y, _z)
         if val or self._s_pt_rgi is None:
             return self.val.get_s_pt_val(_lgp, _lgt, _y, _z)
@@ -2353,6 +2470,10 @@ class hhe_z_mixtures():
         Uses the pre-computed P-T table RGI by default.
         Set val=True to call val.get_logrho_pt_val() directly.
         """
+        if self.rock_interp:
+            return self._interp_rock(_frock, *[
+                s.get_logrho_pt_tab(_lgp, _lgt, _y, _z, val=val, **kw)
+                for s in self._rock_subs])
         _y = self._to_yprime(_y, _z)
         if val or self._logrho_pt_rgi is None:
             return self.val.get_logrho_pt_val(_lgp, _lgt, _y, _z)
@@ -2376,6 +2497,10 @@ class hhe_z_mixtures():
         Uses the pre-computed P-T table RGI by default.
         Set val=True to call val.get_u_pt_val() directly.
         """
+        if self.rock_interp:
+            return self._interp_rock(_frock, *[
+                s.get_logu_pt_tab(_lgp, _lgt, _y, _z, val=val, **kw)
+                for s in self._rock_subs])
         _y = self._to_yprime(_y, _z)
         if val or self._logu_pt_rgi is None:
             return np.log10(self.val.get_u_pt_val(_lgp, _lgt, _y, _z))
@@ -2721,7 +2846,7 @@ class hhe_z_mixtures():
         return x, ok_final
 
     def get_logt_sp(self, _s_kb, _lgp, _yp, _z=0.0,
-                    _zm=0.0, _za=0.0, _zr=0.0,
+                    _frock=0.0, _zm=0.0, _za=0.0, _zr=None,
                     use_tab=True, **kw):
         """Temperature from (S, P) via Newton-Raphson on the forward model.
 
@@ -2759,9 +2884,16 @@ class hhe_z_mixtures():
         logt : float or array
             log10 T [K].  NaN where S is outside the physical domain.
         """
-        # Legacy alias: _frock -> _zr
+        # Rock fraction within Z: 5th positional is _frock; an explicit
+        # _zr keyword overrides; accept legacy _frock-in-kw too.
         if '_frock' in kw:
             _zr = kw.pop('_frock')
+        if _zr is None:
+            _zr = _frock
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[
+                s.get_logt_sp(_s_kb, _lgp, _yp, _z, use_tab=use_tab, **kw)
+                for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
 
         def _make_err(s_i, p_i, yp_i, z_i, zm_i, za_i, zr_i):
@@ -2838,16 +2970,22 @@ class hhe_z_mixtures():
         return out
 
     def get_logrho_sp(self, _s_kb, _lgp, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
+                      _frock=0.0, _zm=0.0, _za=0.0, _zr=None, **kw):
         """Density from (S, P) — calls get_logt_sp then forward model.
 
-        Accepts ``_frock`` as a legacy alias for ``_zr``.
+        Rock fraction within Z is the 5th positional ``_frock`` (``_zr``
+        keyword overrides).
         """
-        # Legacy alias: _frock -> _zr
         if '_frock' in kw:
             _zr = kw.pop('_frock')
+        if _zr is None:
+            _zr = _frock
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[
+                s.get_logrho_sp(_s_kb, _lgp, _yp, _z, **kw)
+                for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
-        logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm, _za, _zr)
+        logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm=_zm, _za=_za, _zr=_zr)
         logt_arr = np.atleast_1d(logt)
         _lgp_arr = np.atleast_1d(_lgp)
         logt_arr, _lgp_arr = np.broadcast_arrays(logt_arr, _lgp_arr)
@@ -3391,14 +3529,23 @@ class hhe_z_mixtures():
     # =================================================================
 
     def get_logp_rhot(self, _lgrho, _lgt, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0,
+                      _frock=0.0, _zm=0.0, _za=0.0, _zr=None,
                       use_tab=True, **kw):
         """Pressure from (rho, T) via root-finding or pre-computed table.
 
         Inverts rho(P, T, Y', Z) = 10^_lgrho to find logP.
-        Set ``use_tab=False`` to force per-point Newton-Raphson
-        even when a ρ-T table is loaded.
+        Rock fraction within Z is the 5th positional ``_frock`` (``_zr``
+        keyword overrides).  Set ``use_tab=False`` to force per-point
+        Newton-Raphson even when a ρ-T table is loaded.
         """
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
+        if _zr is None:
+            _zr = _frock
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[
+                s.get_logp_rhot(_lgrho, _lgt, _yp, _z, use_tab=use_tab, **kw)
+                for s in self._rock_subs])
         # --- Fast path: pre-computed table ---
         if use_tab and self._logp_rhot_rgi is not None:
             return self._lookup_rhot_table(_lgrho, _lgt, _yp, _z)
@@ -3664,10 +3811,12 @@ class hhe_z_mixtures():
         return out
 
     def get_logt_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
-                      _zm=0.0, _za=0.0, _zr=0.0, **kw):
+                      _frock=0.0, _zm=0.0, _za=0.0, _zr=None, **kw):
         """Temperature from (ρ, P) via 1-D root-finding or table.
 
         Inverts ρ(P, T, Y', Z) = 10^logrho to find logT.
+        Rock fraction within Z is the 5th positional ``_frock``
+        (``_zr`` keyword overrides).
 
         Parameters
         ----------
@@ -3685,12 +3834,20 @@ class hhe_z_mixtures():
         logt : float or array
             log10 T [K].  NaN where no solution.
         """
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
+        if _zr is None:
+            _zr = _frock
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[
+                s.get_logt_rhop(_lgrho, _lgp, _yp, _z, **kw)
+                for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
         return self._logt_rhop_noconv(
             _lgrho, _lgp, _yp, _z, _zm, _za, _zr)
 
     def get_s_rhop(self, _lgrho, _lgp, _yp, _z=0.0,
-                   _zm=0.0, _za=0.0, _zr=0.0, **kw):
+                   _frock=0.0, _zm=0.0, _za=0.0, _zr=None, **kw):
         """Entropy from (ρ, P) via 1-D root-finding.
 
         Finds T such that ρ(P, T, Y', Z) = 10^logrho, then
@@ -3714,8 +3871,16 @@ class hhe_z_mixtures():
         s_kb : float or array
             Entropy in kb/baryon.  NaN where no solution.
         """
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
+        if _zr is None:
+            _zr = _frock
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[
+                s.get_s_rhop(_lgrho, _lgp, _yp, _z, **kw)
+                for s in self._rock_subs])
         logt = self.get_logt_rhop(
-            _lgrho, _lgp, _yp, _z, _zm, _za, _zr)
+            _lgrho, _lgp, _yp, _z, _zm=_zm, _za=_za, _zr=_zr)
         _yp = self._to_yprime(_yp, _z)
 
         logt_arr = np.atleast_1d(logt)
@@ -3932,7 +4097,7 @@ class hhe_z_mixtures():
 
         def err_t(lgt):
             lgp = self.get_logp_rhot(
-                rho_target, lgt, yp, z, zm, za, zr,
+                rho_target, lgt, yp, z, _zm=zm, _za=za, _zr=zr,
                 use_tab=use_tab)
             if not np.isfinite(lgp):
                 return np.nan
@@ -3946,7 +4111,7 @@ class hhe_z_mixtures():
         if not ok or not np.isfinite(sol_lgt):
             return np.nan, np.nan
         sol_lgp = self.get_logp_rhot(
-            rho_target, sol_lgt, yp, z, zm, za, zr,
+            rho_target, sol_lgt, yp, z, _zm=zm, _za=za, _zr=zr,
             use_tab=use_tab)
         return sol_lgp, sol_lgt
 
@@ -3963,7 +4128,7 @@ class hhe_z_mixtures():
 
         def err_p(lgp):
             lgt = self.get_logt_sp(
-                s_target, lgp, yp, z, zm, za, zr,
+                s_target, lgp, yp, z, _zm=zm, _za=za, _zr=zr,
                 use_tab=use_tab)
             if not np.isfinite(lgt):
                 return np.nan
@@ -3977,14 +4142,17 @@ class hhe_z_mixtures():
         if not ok or not np.isfinite(sol_lgp):
             return np.nan, np.nan
         sol_lgt = self.get_logt_sp(
-            s_target, sol_lgp, yp, z, zm, za, zr,
+            s_target, sol_lgp, yp, z, _zm=zm, _za=za, _zr=zr,
             use_tab=use_tab)
         return sol_lgp, sol_lgt
 
     def get_logp_logt_srho(self, _s_kb, _lgrho, _yp, _z=0.0,
-                            _zm=0.0, _za=0.0, _zr=0.0,
+                            _frock=0.0, _zm=0.0, _za=0.0, _zr=None,
                             basis='rhot', use_tab=True, **kw):
         """Pressure and temperature from (S, ρ).
+
+        Rock fraction within Z is the 5th positional ``_frock`` (``_zr``
+        keyword overrides).
 
         Parameters
         ----------
@@ -4017,6 +4185,15 @@ class hhe_z_mixtures():
             log10 P [dyn/cm²] and log10 T [K].
             NaN where the solver fails.
         """
+        if '_frock' in kw:
+            _zr = kw.pop('_frock')
+        if _zr is None:
+            _zr = _frock
+        if self.rock_interp:
+            return self._interp_rock(_zr, *[
+                s.get_logp_logt_srho(_s_kb, _lgrho, _yp, _z,
+                                     basis=basis, use_tab=use_tab, **kw)
+                for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
 
         # Fast path: use the pre-computed S-ρ table if loaded
@@ -4136,7 +4313,7 @@ class hhe_z_mixtures():
             def residual(lgt_2d, _yp=yp, _zv=zv,
                          _zm_=_zm, _za_=_za, _zr_=_zr):
                 lgp = self.get_logp_rhot(
-                    R_2d, lgt_2d, _yp, _zv, _zm_, _za_, _zr_,
+                    R_2d, lgt_2d, _yp, _zv, _zm=_zm_, _za=_za_, _zr=_zr_,
                     use_tab=True)
                 s_test = self._s_pt(
                     lgp, lgt_2d, _yp, _zv,
@@ -4148,7 +4325,7 @@ class hhe_z_mixtures():
 
             # Recover P from the rho-T table at the converged T
             lgp_slab = self.get_logp_rhot(
-                R_2d, sol, yp, zv, _zm, _za, _zr,
+                R_2d, sol, yp, zv, _zm=_zm, _za=_za, _zr=_zr,
                 use_tab=True)
 
             bad_final = ~(np.isfinite(lgp_slab) & np.isfinite(sol))
@@ -4371,19 +4548,22 @@ class hhe_z_mixtures():
         return x_m, x_p, denom
 
     def get_dsdy_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, dy=0.01, **kw):
-        """dS/dY|_{P,T} via FD on the P-T forward model."""
-        _y = self._to_yprime(_y, _z)
+        """dS/dY|_{P,T} (total Y) via FD on the P-T forward model.
+
+        Differentiates w.r.t. TOTAL Y: the step is taken in total Y and
+        get_s_pt_tab performs the single Y->Y' conversion per point.  Do
+        NOT pre-convert here (the leaf converts) -- see get_dtds_sp note.
+        """
         y_m, y_p, dy2 = self._fd_xpair(_y, dy)
-        s1 = self._s_pt(_lgp, _lgt, y_m, _z, _zr=_frock)
-        s2 = self._s_pt(_lgp, _lgt, y_p, _z, _zr=_frock)
+        s1 = self.get_s_pt_tab(_lgp, _lgt, y_m, _z, _frock)
+        s2 = self.get_s_pt_tab(_lgp, _lgt, y_p, _z, _frock)
         return (s2 - s1) / dy2
 
     def get_dsdz_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, dz=0.01, **kw):
-        """dS/dZ|_{P,T} via FD on the P-T forward model."""
-        _y = self._to_yprime(_y, _z)
+        """dS/dZ|_{P,T} (total Y held fixed) via FD on the P-T forward model."""
         z_m, z_p, dz2 = self._fd_xpair(_z, dz)
-        s1 = self._s_pt(_lgp, _lgt, _y, z_m, _zr=_frock)
-        s2 = self._s_pt(_lgp, _lgt, _y, z_p, _zr=_frock)
+        s1 = self.get_s_pt_tab(_lgp, _lgt, _y, z_m, _frock)
+        s2 = self.get_s_pt_tab(_lgp, _lgt, _y, z_p, _frock)
         return (s2 - s1) / dz2
 
     def get_dlogrho_dlogt_py(self, _lgp, _lgt, _y, _z, _frock=0.0,
@@ -4407,18 +4587,16 @@ class hhe_z_mixtures():
 
     def get_nabla_ad(self, _s, _lgp, _y, _z, _frock=0.0, dp=1e-2, **kw):
         """∇_ad = dlogT/dlogP|_S via FD on the S-P inversion."""
-        _y = self._to_yprime(_y, _z)
         lgt1 = self.get_logt_sp(_s, _lgp - dp, _y, _z, _zr=_frock)
         lgt2 = self.get_logt_sp(_s, _lgp + dp, _y, _z, _zr=_frock)
         return (lgt2 - lgt1) / (2 * dp)
 
     def get_gamma1(self, _s, _lgp, _y, _z, _frock=0.0, dp=1e-2, **kw):
         """Γ₁ = dlogP/dlogρ|_S via FD on the S-P inversion + ρ(P,T)."""
-        _y = self._to_yprime(_y, _z)
         lgt1 = self.get_logt_sp(_s, _lgp - dp, _y, _z, _zr=_frock)
         lgt2 = self.get_logt_sp(_s, _lgp + dp, _y, _z, _zr=_frock)
-        r1 = self._logrho_pt(_lgp - dp, lgt1, _y, _z, _zr=_frock)
-        r2 = self._logrho_pt(_lgp + dp, lgt2, _y, _z, _zr=_frock)
+        r1 = self.get_logrho_pt_tab(_lgp - dp, lgt1, _y, _z, _frock)
+        r2 = self.get_logrho_pt_tab(_lgp + dp, lgt2, _y, _z, _frock)
         return (2 * dp) / (r2 - r1)
 
     def get_dlogrho_ds_py(self, _s, _lgp, _y, _z, _frock=0.0,
@@ -4427,11 +4605,10 @@ class hhe_z_mixtures():
 
         FD on the S-P inversion: T(S±dS, P) → ρ(P, T) → difference.
         """
-        _y = self._to_yprime(_y, _z)
         lgt1 = self.get_logt_sp(_s - ds, _lgp, _y, _z, _zr=_frock)
         lgt2 = self.get_logt_sp(_s + ds, _lgp, _y, _z, _zr=_frock)
-        r1 = self._logrho_pt(_lgp, lgt1, _y, _z, _zr=_frock)
-        r2 = self._logrho_pt(_lgp, lgt2, _y, _z, _zr=_frock)
+        r1 = self.get_logrho_pt_tab(_lgp, lgt1, _y, _z, _frock)
+        r2 = self.get_logrho_pt_tab(_lgp, lgt2, _y, _z, _frock)
         return (r2 - r1) * log10_to_loge / (2 * ds / erg_to_kbbar)
 
     def get_dtds_sp(self, _s, _lgp, _y, _z, _frock=0.0, ds=0.1, **kw):
@@ -4457,17 +4634,15 @@ class hhe_z_mixtures():
 
         ρ-T basis: at each T±dT, find P via ρ-T inversion, then S(P,T).
         """
-        _y = self._to_yprime(_y, _z)
         p1 = self.get_logp_rhot(_lgrho, _lgt - dt, _y, _z, _zr=_frock)
         p2 = self.get_logp_rhot(_lgrho, _lgt + dt, _y, _z, _zr=_frock)
-        s1 = self._s_pt(p1, _lgt - dt, _y, _z, _zr=_frock)
-        s2 = self._s_pt(p2, _lgt + dt, _y, _z, _zr=_frock)
+        s1 = self.get_s_pt_tab(p1, _lgt - dt, _y, _z, _frock)
+        s2 = self.get_s_pt_tab(p2, _lgt + dt, _y, _z, _frock)
         return (s2 - s1) / (2 * dt * log10_to_loge)
 
     def get_dlogt_dy_rhop_rhot(self, _lgrho, _lgt, _y, _z, _frock=0.0,
                                 dy=0.01, dt=0.1, **kw):
         """dlogT/dY|_{ρ,P} = χ_Y / χ_T via FD on the ρ-T inversion."""
-        _y = self._to_yprime(_y, _z)
         chi_y = (self.get_logp_rhot(_lgrho, _lgt, _y + dy, _z, _zr=_frock)
                  - self.get_logp_rhot(_lgrho, _lgt, _y - dy, _z, _zr=_frock)
                  ) * log10_to_loge / (2 * dy)
@@ -4480,7 +4655,6 @@ class hhe_z_mixtures():
     def get_dlogt_dz_rhop_rhot(self, _lgrho, _lgt, _y, _z, _frock=0.0,
                                 dz=0.01, dt=0.1, **kw):
         """dlogT/dZ|_{ρ,P} = χ_Z / χ_T via FD on the ρ-T inversion."""
-        _y = self._to_yprime(_y, _z)
         chi_z = (self.get_logp_rhot(_lgrho, _lgt, _y, _z + dz, _zr=_frock)
                  - self.get_logp_rhot(_lgrho, _lgt, _y, _z - dz, _zr=_frock)
                  ) * log10_to_loge / (2 * dz)
@@ -4493,7 +4667,6 @@ class hhe_z_mixtures():
     def get_dpdt_rhot_rhoy(self, _lgrho, _lgt, _y, _z, _frock=0.0,
                             dT=0.1, **kw):
         """dP/dT|_{ρ,Y} [dyn/cm²/K] via FD on the ρ-T inversion."""
-        _y = self._to_yprime(_y, _z)
         T0 = 10.0 ** np.asarray(_lgt)
         T1 = T0 * (1 - dT)
         T2 = T0 * (1 + dT)
@@ -4511,9 +4684,10 @@ class hhe_z_mixtures():
 
         Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Y
         and using the ρ-P inversion to find T(ρ, P, Y±dY, Z).
-        """
-        _y = self._to_yprime(_y, _z)
 
+        Differentiates w.r.t. TOTAL Y; the leaf inversions perform the
+        single Y->Y' conversion, so we MUST NOT pre-convert here.
+        """
         # dPdS|{rho, Y, Z}:
         dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=ds, **kw)
         #dPdY|{S, rho, Y}:
@@ -4530,12 +4704,12 @@ class hhe_z_mixtures():
 
         Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Y
         and using the ρ-P inversion to find T(ρ, P, Y±dY, Z).
+        Differentiates w.r.t. TOTAL Y (leaves convert; do not pre-convert).
         """
-        _y = self._to_yprime(_y, _z)
         lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y - dy, _z, _zr=_frock)
         lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y + dy, _z, _zr=_frock)
-        s_m = self.get_s_pt(_lgp, lgt_m, _y - dy, _z, _zr=_frock)
-        s_p = self.get_s_pt(_lgp, lgt_p, _y + dy, _z, _zr=_frock)
+        s_m = self.get_s_pt(_lgp, lgt_m, _y - dy, _z, _frock)
+        s_p = self.get_s_pt(_lgp, lgt_p, _y + dy, _z, _frock)
         return (s_p - s_m) / (2 * dy)
     
     def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1,
@@ -4544,14 +4718,8 @@ class hhe_z_mixtures():
 
         Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Z
         and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
+        Total Y held fixed (leaves convert; do not pre-convert here).
         """
-        _y = self._to_yprime(_y, _z)
-        # lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y, _z - dz, _zr=_frock)
-        # lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y, _z + dz, _zr=_frock)
-        # s_m = self.get_s_pt(_lgp, lgt_m, _y, _z - dz, _zr=_frock)
-        # s_p = self.get_s_pt(_lgp, lgt_p, _    y, _z + dz, _zr=_frock)
-        # return (s_p - s_m) / (2 * dz) 
-
         # dPdS|{rho, Y, Z}:
         dpds_rhoy_srho = self.get_dpds_rhoy_srho(_s, _lgrho, _y, _z, _frock, ds=ds, **kw)
         #dPdZ|{S, rho, Z}:
@@ -4566,13 +4734,13 @@ class hhe_z_mixtures():
 
         Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Z
         and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
+        Total Y held fixed (leaves convert; do not pre-convert here).
         """
-        _y = self._to_yprime(_y, _z)
         z_m, z_p, dz2 = self._fd_xpair(_z, dz)
         lgt_m = self.get_logt_rhop(_lgrho, _lgp, _y, z_m, _zr=_frock)
         lgt_p = self.get_logt_rhop(_lgrho, _lgp, _y, z_p, _zr=_frock)
-        s_m = self._s_pt(_lgp, lgt_m, _y, z_m, _zr=_frock)
-        s_p = self._s_pt(_lgp, lgt_p, _y, z_p, _zr=_frock)
+        s_m = self.get_s_pt_tab(_lgp, lgt_m, _y, z_m, _frock)
+        s_p = self.get_s_pt_tab(_lgp, lgt_p, _y, z_p, _frock)
         return (s_p - s_m) / dz2
 
     # =================================================================
@@ -4581,14 +4749,12 @@ class hhe_z_mixtures():
 
     def get_dpds_rhoy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1, **kw):
         """dP/dS|_{ρ,Y,Z} via FD on the S-ρ inversion."""
-        _y = self._to_yprime(_y, _z)
         lgp_m, _ = self.get_logp_logt_srho(_s - ds, _lgrho, _y, _z, _zr=_frock)
         lgp_p, _ = self.get_logp_logt_srho(_s + ds, _lgrho, _y, _z, _zr=_frock)
         return (10.0 ** lgp_p - 10.0 ** lgp_m) / (2 * ds / erg_to_kbbar)
     
     def get_dpdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
-        """dP/dY|_{S,ρ} via FD on the S-ρ inversion."""
-        _y = self._to_yprime(_y, _z)
+        """dP/dY|_{S,ρ} (total Y) via FD on the S-ρ inversion."""
         y_m, y_p, dy2 = self._fd_xpair(_y, dy)
         lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, y_m, _z, _zr=_frock)
         lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, y_p, _z, _zr=_frock)
@@ -4596,15 +4762,13 @@ class hhe_z_mixtures():
 
     def get_dpdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dP/dZ|_{S,ρ} via FD on the S-ρ inversion."""
-        _y = self._to_yprime(_y, _z)
         z_m, z_p, dz2 = self._fd_xpair(_z, dz)
         lgp_m, _ = self.get_logp_logt_srho(_s, _lgrho, _y, z_m, _zr=_frock)
         lgp_p, _ = self.get_logp_logt_srho(_s, _lgrho, _y, z_p, _zr=_frock)
         return (10.0 ** lgp_p - 10.0 ** lgp_m) / dz2
 
     def get_dtdy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
-        """dT/dY|_{S,ρ} via FD on the S-ρ inversion."""
-        _y = self._to_yprime(_y, _z)
+        """dT/dY|_{S,ρ} (total Y) via FD on the S-ρ inversion."""
         y_m, y_p, dy2 = self._fd_xpair(_y, dy)
         _, lgt_m = self.get_logp_logt_srho(_s, _lgrho, y_m, _z, _zr=_frock)
         _, lgt_p = self.get_logp_logt_srho(_s, _lgrho, y_p, _z, _zr=_frock)
@@ -4612,30 +4776,31 @@ class hhe_z_mixtures():
 
     def get_dtdz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dT/dZ|_{S,ρ} via FD on the S-ρ inversion."""
-        _y = self._to_yprime(_y, _z)
         z_m, z_p, dz2 = self._fd_xpair(_z, dz)
         _, lgt_m = self.get_logp_logt_srho(_s, _lgrho, _y, z_m, _zr=_frock)
         _, lgt_p = self.get_logp_logt_srho(_s, _lgrho, _y, z_p, _zr=_frock)
         return (10.0 ** lgt_p - 10.0 ** lgt_m) / dz2
 
     def get_dudy_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dy=0.01, **kw):
-        """dU/dY|_{S,ρ} via FD on the S-ρ inversion + U(P,T)."""
-        _y = self._to_yprime(_y, _z)
+        """dU/dY|_{S,ρ} (total Y) via FD on the S-ρ inversion + U(P,T).
+
+        Total Y; the leaves convert.  get_logu_pt_tab takes total Y and
+        does the single conversion, so we do NOT pre-convert here.
+        """
         y_m, y_p, dy2 = self._fd_xpair(_y, dy)
         p_m, t_m = self.get_logp_logt_srho(_s, _lgrho, y_m, _z, _zr=_frock)
         p_p, t_p = self.get_logp_logt_srho(_s, _lgrho, y_p, _z, _zr=_frock)
-        u_m = self.val.get_u_pt_val(p_m, t_m, y_m, _z, _zr=_frock)
-        u_p = self.val.get_u_pt_val(p_p, t_p, y_p, _z, _zr=_frock)
+        u_m = 10.0 ** self.get_logu_pt_tab(p_m, t_m, y_m, _z, _frock)
+        u_p = 10.0 ** self.get_logu_pt_tab(p_p, t_p, y_p, _z, _frock)
         return (u_p - u_m) / dy2
 
     def get_dudz_srho(self, _s, _lgrho, _y, _z, _frock=0.0, dz=0.01, **kw):
         """dU/dZ|_{S,ρ} via FD on the S-ρ inversion + U(P,T)."""
-        _y = self._to_yprime(_y, _z)
         z_m, z_p, dz2 = self._fd_xpair(_z, dz)
         p_m, t_m = self.get_logp_logt_srho(_s, _lgrho, _y, z_m, _zr=_frock)
         p_p, t_p = self.get_logp_logt_srho(_s, _lgrho, _y, z_p, _zr=_frock)
-        u_m = self.val.get_u_pt_val(p_m, t_m, _y, z_m, _zr=_frock)
-        u_p = self.val.get_u_pt_val(p_p, t_p, _y, z_p, _zr=_frock)
+        u_m = 10.0 ** self.get_logu_pt_tab(p_m, t_m, _y, z_m, _frock)
+        u_p = 10.0 ** self.get_logu_pt_tab(p_p, t_p, _y, z_p, _frock)
         return (u_p - u_m) / dz2
 
     # =================================================================
@@ -4647,16 +4812,16 @@ class hhe_z_mixtures():
         return self._adaptive_dx(x, dx0)
 
     def get_s_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
-        """S(P, T, Y, Z).  Delegates to get_s_pt_tab."""
-        return self.get_s_pt_tab(_lgp, _lgt, _y, _z, **kw)
+        """S(P, T, Y, Z).  Delegates to get_s_pt_tab (forwards _frock)."""
+        return self.get_s_pt_tab(_lgp, _lgt, _y, _z, _frock=_frock, **kw)
 
     def get_logrho_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
-        """log10 ρ(P, T, Y, Z).  Delegates to get_logrho_pt_tab."""
-        return self.get_logrho_pt_tab(_lgp, _lgt, _y, _z, **kw)
+        """log10 ρ(P, T, Y, Z).  Delegates to get_logrho_pt_tab (forwards _frock)."""
+        return self.get_logrho_pt_tab(_lgp, _lgt, _y, _z, _frock=_frock, **kw)
 
     def get_logu_pt(self, _lgp, _lgt, _y, _z, _frock=0.0, **kw):
-        """log10 U(P, T, Y, Z).  Delegates to get_logu_pt_tab."""
-        return self.get_logu_pt_tab(_lgp, _lgt, _y, _z, **kw)
+        """log10 U(P, T, Y, Z).  Delegates to get_logu_pt_tab (forwards _frock)."""
+        return self.get_logu_pt_tab(_lgp, _lgt, _y, _z, _frock=_frock, **kw)
 
 
 class mixtures(hhe_eos):
