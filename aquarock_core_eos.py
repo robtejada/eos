@@ -770,3 +770,151 @@ class AQUAROCK_CORE_EOS:
                 out[idx] = (10.0 ** sol) * self.dyn_to_GPa
                 prev = sol
         return float(out.reshape(-1)[0]) if scalar else out
+
+
+class ROCKWATER_INTERP_CORE_EOS:
+    """Rock+water core EOS at ARBITRARY rock fraction, interpolating between
+    the two validated endpoint core EOSes:
+
+        f_rock = 0  ->  AQUA_REVISED_CORE_EOS  (mantle_comp='h2o', 'revised')
+        f_rock = 1  ->  MG2SIO4_ANEOS_EOS      (mantle_comp='mg2sio4')
+
+    Mixing laws (ideal, matching the VAL construction of AQUAROCK_CORE_EOS):
+      - density:  additive volume, 1/rho = (1-f)/rho_w + f/rho_r
+      - S, U, Cp, Cv: mass-weighted specific quantities
+      - alpha:    volume-weighted, alpha = rho_mix * [(1-f) a_w/rho_w + f a_r/rho_r]
+      - T(S, P):  vectorized bisection on the mass-weighted S(P, T)
+      - melt curve / latent heat / alpha_x: delegated to the ROCK endpoint
+        (forsterite curve), mirroring AQUAROCK_CORE_EOS's convention.
+
+    Exists because the cached AQUAROCK S-P inversion table only ships for
+    f_rock = 0.50; this class needs no per-f_rock tables. Same call surface
+    and unit conventions as the other mantle EOSes (P in GPa, S in kb/baryon).
+    """
+
+    def __init__(self, f_rock=0.5):
+        from eos.aqua_revised_core_eos import AQUA_REVISED_CORE_EOS
+        from eos.mg2sio4_aneos_eos import MG2SIO4_ANEOS_EOS
+        f = float(f_rock)
+        if not (0.0 <= f <= 1.0):
+            raise ValueError(f"f_rock must be in [0, 1] (got {f}).")
+        self.f_rock = f
+        self.water = AQUA_REVISED_CORE_EOS()
+        self.rock = MG2SIO4_ANEOS_EOS()
+
+        # Shared unit conventions (identical constants on both endpoints).
+        self.dyn_to_GPa = self.water.dyn_to_GPa
+        self.dyn_to_Pa = getattr(self.water, 'dyn_to_Pa',
+                                 self.dyn_to_GPa * 1e9)
+        self.erg_to_kbbar = self.water.erg_to_kbbar
+        self.kbbar_to_erg = getattr(self.water, 'kbbar_to_erg',
+                                    1.0 / self.erg_to_kbbar)
+        self._Uw = getattr(self.water, 'U_conv_cgs', 1.0)
+        self._Ur = getattr(self.rock, 'U_conv_cgs', 1.0)
+        self.U_conv_cgs = 1.0
+        # Forsterite melt curve / latent heat (AQUAROCK convention).
+        self.L = self.rock.L
+
+        # T bracket for the S(P,T) inversion: intersection of endpoint
+        # domains where exposed, else generous fixed bounds.
+        tlo, thi = 160.0, 5.0e4
+        for obj in (self.water, self.rock):
+            dom = getattr(obj, 'domain', None)
+            if dom is not None:
+                tlo = max(tlo, float(getattr(dom, 'T_min', tlo)))
+                thi = min(thi, float(getattr(dom, 'T_max', thi)))
+        self._logT_lo = np.log10(tlo * 1.001)
+        self._logT_hi = np.log10(thi * 0.999)
+
+    # ---------------- P-T basis (mixing laws) ----------------
+    def get_s_pt(self, P, T, **kwargs):
+        f = self.f_rock
+        return ((1.0 - f) * np.asarray(self.water.get_s_pt(P, T))
+                + f * np.asarray(self.rock.get_s_pt(P, T)))
+
+    def get_rho_pt(self, P, T, **kwargs):
+        f = self.f_rock
+        rw = np.asarray(self.water.get_rho_pt(P, T), dtype=float)
+        rr = np.asarray(self.rock.get_rho_pt(P, T), dtype=float)
+        return 1.0 / ((1.0 - f) / np.maximum(rw, 1e-99)
+                      + f / np.maximum(rr, 1e-99))
+
+    def get_u_pt(self, P, T, **kwargs):
+        f = self.f_rock
+        return ((1.0 - f) * np.asarray(self.water.get_u_pt(P, T)) * self._Uw
+                + f * np.asarray(self.rock.get_u_pt(P, T)) * self._Ur)
+
+    def get_cp_pt(self, P, T, **kwargs):
+        f = self.f_rock
+        return ((1.0 - f) * np.asarray(self.water.get_cp_pt(P, T))
+                + f * np.asarray(self.rock.get_cp_pt(P, T)))
+
+    def get_cv_pt(self, P, T, **kwargs):
+        f = self.f_rock
+        return ((1.0 - f) * np.asarray(self.water.get_cv_pt(P, T))
+                + f * np.asarray(self.rock.get_cv_pt(P, T)))
+
+    def get_alpha_pt(self, P, T, **kwargs):
+        f = self.f_rock
+        rw = np.asarray(self.water.get_rho_pt(P, T), dtype=float)
+        rr = np.asarray(self.rock.get_rho_pt(P, T), dtype=float)
+        aw = np.asarray(self.water.get_alpha_pt(P, T), dtype=float)
+        ar = np.asarray(self.rock.get_alpha_pt(P, T), dtype=float)
+        rho = 1.0 / ((1.0 - f) / np.maximum(rw, 1e-99)
+                     + f / np.maximum(rr, 1e-99))
+        return rho * ((1.0 - f) * aw / np.maximum(rw, 1e-99)
+                      + f * ar / np.maximum(rr, 1e-99))
+
+    # ---------------- S-P basis (bisection inversion) ----------------
+    def get_t_sp(self, S, P, **kwargs):
+        """T such that the mass-weighted S(P, T) equals the target.
+        Vectorized bisection in log10 T (monotone S(T) at fixed P).
+        S is in k_B/baryon (core-EOS convention: get_s_pt returns cgs,
+        get_t_sp takes k_B/baryon; callers bridge with erg_to_kbbar)."""
+        S_arr = np.atleast_1d(np.asarray(S, dtype=float))
+        P_arr = np.atleast_1d(np.asarray(P, dtype=float))
+        S_b, P_b = np.broadcast_arrays(S_arr, P_arr)
+        lo = np.full(S_b.shape, self._logT_lo)
+        hi = np.full(S_b.shape, self._logT_hi)
+        # Clamp targets into the achievable range at the brackets.
+        s_lo = self.get_s_pt(P_b, 10.0 ** lo)
+        s_hi = self.get_s_pt(P_b, 10.0 ** hi)
+        tgt = np.clip(S_b * self.kbbar_to_erg,
+                      np.minimum(s_lo, s_hi), np.maximum(s_lo, s_hi))
+        for _ in range(64):
+            mid = 0.5 * (lo + hi)
+            s_mid = self.get_s_pt(P_b, 10.0 ** mid)
+            go_up = s_mid < tgt
+            lo = np.where(go_up, mid, lo)
+            hi = np.where(go_up, hi, mid)
+        out = 10.0 ** (0.5 * (lo + hi))
+        return float(out.reshape(-1)[0]) if (np.isscalar(S) and np.isscalar(P)) else out
+
+    def get_rho_sp(self, S, P, **kwargs):
+        return self.get_rho_pt(P, self.get_t_sp(S, P))
+
+    def get_u_sp(self, S, P, **kwargs):
+        return self.get_u_pt(P, self.get_t_sp(S, P))
+
+    def get_cp_sp(self, S, P, **kwargs):
+        return self.get_cp_pt(P, self.get_t_sp(S, P))
+
+    def get_alpha_sp(self, S, P, **kwargs):
+        return self.get_alpha_pt(P, self.get_t_sp(S, P))
+
+    # ---------------- melt curve / latent heat (rock endpoint) --------
+    def get_T_melt(self, P, **kwargs):
+        return self.rock.get_T_melt(P, **kwargs)
+
+    def get_T_solidus(self, P, **kwargs):
+        fn = getattr(self.rock, 'get_T_solidus', None)
+        return fn(P, **kwargs) if fn is not None else self.rock.get_T_melt(P)
+
+    def get_S_liq_at_melt(self, P, **kwargs):
+        return self.rock.get_S_liq_at_melt(P, **kwargs)
+
+    def get_S_sol_at_melt(self, P, **kwargs):
+        return self.rock.get_S_sol_at_melt(P, **kwargs)
+
+    def get_alpha_x(self, P, T, rho, **kwargs):
+        return self.rock.get_alpha_x(P, T, rho, **kwargs)
