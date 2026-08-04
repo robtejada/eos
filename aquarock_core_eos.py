@@ -834,6 +834,24 @@ class ROCKWATER_INTERP_CORE_EOS:
         self._logT_lo = np.log10(tlo * 1.001)
         self._logT_hi = np.log10(thi * 0.999)
 
+        # Optional f_rock-tagged S-P table (same format as the AQUAROCK
+        # loader; built by eos/aquarock_sp_builder.py from THIS class's own
+        # fixed-bracket surfaces, so the table-backed and on-the-fly paths
+        # agree by construction).  Pure speed path with extrapolating RGI;
+        # the bisection below remains the fallback when no table exists.
+        self._t_sp_rgi = None
+        _sp_path = _SP_TABLE_DIR / f"aquarock_core_eos_sp_frock{f:.2f}.npz"
+        if _sp_path.exists():
+            try:
+                _d = np.load(_sp_path)
+                self._t_sp_rgi = RGI(
+                    (np.asarray(_d["svals_sp"], dtype=float),
+                     np.asarray(_d["pvals_sp"], dtype=float)),
+                    np.asarray(_d["t_grid_sp"], dtype=float),
+                    method="linear", bounds_error=False, fill_value=None)
+            except Exception:
+                self._t_sp_rgi = None
+
     # ---------------- P-T basis (mixing laws) ----------------
     def get_s_pt(self, P, T, **kwargs):
         f = self.f_rock
@@ -882,6 +900,12 @@ class ROCKWATER_INTERP_CORE_EOS:
         S_arr = np.atleast_1d(np.asarray(S, dtype=float))
         P_arr = np.atleast_1d(np.asarray(P, dtype=float))
         S_b, P_b = np.broadcast_arrays(S_arr, P_arr)
+        if self._t_sp_rgi is not None:
+            pts = np.column_stack([np.ravel(S_b), np.ravel(P_b)])
+            out = np.asarray(self._t_sp_rgi(pts), dtype=float).reshape(
+                S_b.shape)
+            return (float(out.reshape(-1)[0])
+                    if (np.isscalar(S) and np.isscalar(P)) else out)
         lo = np.full(S_b.shape, self._logT_lo)
         hi = np.full(S_b.shape, self._logT_hi)
         # Clamp targets into the achievable range at the brackets.
