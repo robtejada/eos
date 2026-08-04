@@ -815,14 +815,22 @@ class ROCKWATER_INTERP_CORE_EOS:
         # Forsterite melt curve / latent heat (AQUAROCK convention).
         self.L = self.rock.L
 
-        # T bracket for the S(P,T) inversion: intersection of endpoint
-        # domains where exposed, else generous fixed bounds.
-        tlo, thi = 160.0, 5.0e4
+        # T bracket for the S(P,T) inversion.  Upper bound 1e6 K: T must be
+        # allowed to extrapolate ABOVE the underlying AQUA water table
+        # ceiling (logT = 4.77, ~58,884 K), exactly as
+        # AQUAROCK_CORE_EOS.get_t_sp_inv documents and does -- a Jovian
+        # compact core thermally tied to the envelope base runs at ~1e5 K,
+        # and the endpoint RGIs (fill_value=None) extrapolate entropy above
+        # their grids.  The previous hard 5e4 K ceiling (min'd against the
+        # endpoint domains) pinned every f_rock != 0.5 core at
+        # 0.999*5e4 = 49,950 K, isothermal, for entire evolutions
+        # (jtc1/jtc2 forensics, 2026-08): only the lower bound keeps the
+        # endpoint-domain intersection.
+        tlo, thi = 160.0, 1.0e6
         for obj in (self.water, self.rock):
             dom = getattr(obj, 'domain', None)
             if dom is not None:
                 tlo = max(tlo, float(getattr(dom, 'T_min', tlo)))
-                thi = min(thi, float(getattr(dom, 'T_max', thi)))
         self._logT_lo = np.log10(tlo * 1.001)
         self._logT_hi = np.log10(thi * 0.999)
 
