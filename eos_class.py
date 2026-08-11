@@ -1877,6 +1877,7 @@ class hhe_z_mixtures():
                  inv_tab=True,
                  srho_tab=False,
                  y_prime=True,
+                 yprime_clip=False,
                  logp_range=(6.0, 14.0), logp_step=0.05,
                  logt_range=(1.3, 6.0),
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
@@ -1914,6 +1915,14 @@ class hhe_z_mixtures():
             ``inv_tab=True``.  Default False — the S-ρ inversion
             uses the 1-D decomposition via the ρ-T or S-P tables
             instead of the pre-computed 2-D S-ρ table.
+        yprime_clip : bool
+            If True, ``_to_yprime`` clips the converted Y' to [0, 1]
+            (the tabulated Y' domain).  Protects high-Z cells where
+            Y' = Y/(1-Z) blows past the table edge (e.g. Y=0.06 at
+            Z=0.95 gives Y'=1.2 and silent RGI extrapolation today).
+            Default False = bit-identical to the historical behavior;
+            production-range queries (Y' well inside [0, 1]) are
+            unaffected either way.
         logp_range, logp_step, logt_range, logrho_range, logrho_step :
             Grid bounds and steps for table-build mode.
         interp_method : str
@@ -1999,6 +2008,7 @@ class hhe_z_mixtures():
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
         self.y_prime = y_prime
+        self.yprime_clip = bool(yprime_clip)
         self._interp_method = interp_method
 
         # Store all init kwargs so worker processes can reconstruct
@@ -2067,6 +2077,7 @@ class hhe_z_mixtures():
                 logrho_range=logrho_range, logrho_step=logrho_step,
                 pt_tab=_sub_pt_tab, inv_tab=_sub_inv_tab,
                 srho_tab=_sub_srho_tab, y_prime=y_prime,
+                yprime_clip=yprime_clip,
                 rock_interp=False)
             self._rock_subs = [
                 hhe_z_mixtures(species_list=['water_revised'],
@@ -2157,11 +2168,20 @@ class hhe_z_mixtures():
         When self.y_prime=True, _y is already Y' and is returned as-is.
         When self.y_prime=False, _y is absolute Y and is divided by (1-Z).
         Works for scalar and array inputs.
+
+        With ``yprime_clip=True`` (constructor kwarg) the result is
+        clipped to the tabulated Y' domain [0, 1]: at high Z the
+        division amplifies any Y noise (Y'=Y/(1-Z) is 20x Y at Z=0.95)
+        and an off-domain Y' silently linear-extrapolates every RGI.
+        Clip off (default) is bit-identical to the historical behavior.
         """
         if self.y_prime:
             return _y
         _z_arr = np.asarray(_z, dtype=float)
-        return np.asarray(_y, dtype=float) / (1.0 - _z_arr + 1e-6)
+        _yp = np.asarray(_y, dtype=float) / (1.0 - _z_arr + 1e-6)
+        if self.yprime_clip:
+            _yp = np.clip(_yp, 0.0, 1.0)
+        return _yp
 
     # =================================================================
     # P-T basis table
@@ -2991,8 +3011,14 @@ class hhe_z_mixtures():
             return self._interp_rock(_zr, *[
                 s.get_logrho_sp(_s_kb, _lgp, _yp, _z, **kw)
                 for s in self._rock_subs])
-        _yp = self._to_yprime(_yp, _z)
+        # Y->Y' conversion bug fix (2026-08): get_logt_sp is the PUBLIC
+        # method and converts internally -- passing an already-converted
+        # Y' double-converted to Y/(1-Z)^2 (harmless at Z=0, +34% in T at
+        # Z=0.3, catastrophic at high Z).  Pass the caller's raw Y to
+        # get_logt_sp; convert once, separately, for the internal
+        # _logrho_pt leaf (which expects Y').
         logt = self.get_logt_sp(_s_kb, _lgp, _yp, _z, _zm=_zm, _za=_za, _zr=_zr)
+        _yp = self._to_yprime(_yp, _z)
         logt_arr = np.atleast_1d(logt)
         _lgp_arr = np.atleast_1d(_lgp)
         logt_arr, _lgp_arr = np.broadcast_arrays(logt_arr, _lgp_arr)
@@ -3553,11 +3579,16 @@ class hhe_z_mixtures():
             return self._interp_rock(_zr, *[
                 s.get_logp_rhot(_lgrho, _lgt, _yp, _z, use_tab=use_tab, **kw)
                 for s in self._rock_subs])
+        # Y->Y' conversion bug fix (2026-08): the table's axis 2 is Y',
+        # but the fast path used to feed it the caller's ABSOLUTE Y (the
+        # conversion below was unreachable with eos_tab=True) -- an error
+        # of ~(1-Z) in the Y coordinate for every rho-T table query.
+        # Convert before dispatching to either path.
+        _yp = self._to_yprime(_yp, _z)
         # --- Fast path: pre-computed table ---
         if use_tab and self._logp_rhot_rgi is not None:
             return self._lookup_rhot_table(_lgrho, _lgt, _yp, _z)
 
-        _yp = self._to_yprime(_yp, _z)
         # --- Slow path: Newton-Raphson per-point ---
         scalar_input = np.isscalar(_lgrho) and np.isscalar(_lgt)
         _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
@@ -4649,10 +4680,15 @@ class hhe_z_mixtures():
 
     def get_dlogt_dy_rhop_rhot(self, _lgrho, _lgt, _y, _z, _frock=0.0,
                                 dy=0.01, dt=0.1, **kw):
-        """dlogT/dY|_{ρ,P} = χ_Y / χ_T via FD on the ρ-T inversion."""
-        chi_y = (self.get_logp_rhot(_lgrho, _lgt, _y + dy, _z, _zr=_frock)
-                 - self.get_logp_rhot(_lgrho, _lgt, _y - dy, _z, _zr=_frock)
-                 ) * log10_to_loge / (2 * dy)
+        """dlogT/dY|_{ρ,P} = χ_Y / χ_T via FD on the ρ-T inversion.
+
+        The composition stencil is edge-clipped via _fd_xpair so it
+        never queries Y < 0 or Y > 1 (one-sided at the edges).
+        """
+        y_m, y_p, dy2 = self._fd_xpair(_y, dy)
+        chi_y = (self.get_logp_rhot(_lgrho, _lgt, y_p, _z, _zr=_frock)
+                 - self.get_logp_rhot(_lgrho, _lgt, y_m, _z, _zr=_frock)
+                 ) * log10_to_loge / dy2
         chi_t = (self.get_logp_rhot(_lgrho, _lgt + dt, _y, _z, _zr=_frock)
                  - self.get_logp_rhot(_lgrho, _lgt - dt, _y, _z, _zr=_frock)
                  ) / (2 * dt)
@@ -4661,10 +4697,15 @@ class hhe_z_mixtures():
 
     def get_dlogt_dz_rhop_rhot(self, _lgrho, _lgt, _y, _z, _frock=0.0,
                                 dz=0.01, dt=0.1, **kw):
-        """dlogT/dZ|_{ρ,P} = χ_Z / χ_T via FD on the ρ-T inversion."""
-        chi_z = (self.get_logp_rhot(_lgrho, _lgt, _y, _z + dz, _zr=_frock)
-                 - self.get_logp_rhot(_lgrho, _lgt, _y, _z - dz, _zr=_frock)
-                 ) * log10_to_loge / (2 * dz)
+        """dlogT/dZ|_{ρ,P} = χ_Z / χ_T via FD on the ρ-T inversion.
+
+        The composition stencil is edge-clipped via _fd_xpair so it
+        never queries Z < 0 or Z > 1 (one-sided at the edges).
+        """
+        z_m, z_p, dz2 = self._fd_xpair(_z, dz)
+        chi_z = (self.get_logp_rhot(_lgrho, _lgt, _y, z_p, _zr=_frock)
+                 - self.get_logp_rhot(_lgrho, _lgt, _y, z_m, _zr=_frock)
+                 ) * log10_to_loge / dz2
         chi_t = (self.get_logp_rhot(_lgrho, _lgt + dt, _y, _z, _zr=_frock)
                  - self.get_logp_rhot(_lgrho, _lgt - dt, _y, _z, _zr=_frock)
                  ) / (2 * dt)
