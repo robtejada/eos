@@ -112,6 +112,68 @@ svals_pt = aqua_data_pt['s']
 logrhovals_pt = aqua_data_pt['logrho']
 loguvals_pt = aqua_data_pt['logu']
 
+
+def _fill_s_pt_nans(s_grid, logt, n_fit=4):
+    """Fill the NaN cells of the P-T entropy grid with EXTRAPOLATED values.
+
+    The revised AQUA table carries s = -1 sentinels (read in as NaN) in its
+    cold dense corner, roughly logP in [12.9, 15.6] x logT in [2.0, 3.9] --
+    191 isobars, every NaN block starting at the lowest temperature, plus a
+    few small interior gaps.  Those cells are unphysical territory a planetary
+    evolution path should never visit, but NaNs there break square-table
+    builders and inversion routines that sweep the full grid.
+
+    Fill rule, per logP column (axis 1 is logT), acting on log10(s) so the
+    result is positive by construction:
+      * interior gaps: linear interpolation in logT between the bracketing
+        finite cells;
+      * the low-T run: linear extrapolation of log10(s) vs logT fitted to the
+        `n_fit` finite cells directly above the run.
+
+    THE FILLED VALUES ARE NOT DATA.  They exist so the grid is finite, not so
+    it is right; the returned mask records exactly which cells were invented,
+    and consumers that care about trust (e.g. ices_comb_eos.entropy_valid_pt)
+    must keep flagging that region.  The raw grid is kept as `svals_pt_raw`.
+    """
+    filled = np.array(s_grid, dtype=float, copy=True)
+    mask = ~np.isfinite(s_grid)
+    if not mask.any():
+        return filled, mask
+    with np.errstate(invalid='ignore', divide='ignore'):
+        logs = np.where(mask, np.nan, np.log10(np.maximum(filled, 1e-300)))
+    for i in np.where(mask.any(axis=1))[0]:
+        col = logs[i]
+        gi = np.where(np.isfinite(col))[0]
+        if gi.size < 2:
+            continue                      # handled by the nearest-pass below
+        for j in np.where(~np.isfinite(col))[0]:
+            if j < gi[0]:                 # low-T run: extrapolate downward
+                k = gi[:n_fit]
+                sl, ic = np.polyfit(logt[k], col[k], 1)
+                filled[i, j] = 10.0 ** (sl * logt[j] + ic)
+            elif j > gi[-1]:              # high-T run (none observed, but safe)
+                k = gi[-n_fit:]
+                sl, ic = np.polyfit(logt[k], col[k], 1)
+                filled[i, j] = 10.0 ** (sl * logt[j] + ic)
+            else:                         # interior gap: interpolate in logT
+                lo, hi = gi[gi < j][-1], gi[gi > j][0]
+                w = (logt[j] - logt[lo]) / (logt[hi] - logt[lo])
+                filled[i, j] = 10.0 ** ((1.0 - w) * col[lo] + w * col[hi])
+    # safety net for any cell still non-finite (e.g. a column with < 2 finite
+    # cells): nearest finite neighbour along logP at fixed logT
+    still = ~np.isfinite(filled)
+    if still.any():
+        for j in np.where(still.any(axis=0))[0]:
+            colP = filled[:, j]
+            good = np.where(np.isfinite(colP))[0]
+            for i in np.where(~np.isfinite(colP))[0]:
+                filled[i, j] = colP[good[np.argmin(np.abs(good - i))]]
+    return filled, mask
+
+
+svals_pt_raw = svals_pt.copy()
+svals_pt, svals_pt_filled_mask = _fill_s_pt_nans(svals_pt, logtvals)
+
 s_rgi_pt = RGI((logpvals_pt, logtvals), svals_pt, method='linear', \
             bounds_error=False, fill_value=None)
 

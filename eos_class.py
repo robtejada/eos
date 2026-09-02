@@ -928,7 +928,8 @@ class z_eos_val_mixtures:
     # imposed on filled corner cells so T(S,P) always brackets a root.
     _MONO_EPS = 1e-3
 
-    def __init__(self, species_list=None, smooth_z=False, fill_z_nans=True):
+    def __init__(self, species_list=None, smooth_z=False, fill_z_nans=True,
+                 ices_eos=False, ices_gauge='thirdlaw'):
         """
         Parameters
         ----------
@@ -962,10 +963,68 @@ class z_eos_val_mixtures:
             shared ``z_eos`` instances are never modified; the filled
             interpolator lives inside this mixer.  Set False to recover
             the raw (NaN-bearing) behaviour.
+        ices_eos : bool
+            If True, the three ice species (water + CH4 + NH3) are served
+            as ONE volume-addition component by
+            ``eos.ices_comb_eos.ICES_COMB_EOS`` (Tejada Arevalo et al.
+            2026 ternary: revised AQUA water + the joint CH4/NH3
+            Helmholtz fit), and only the rock (and iron) species are read
+            from ``self.z``.  Rock is then mixed with that block by the
+            same VAL, which is exact: volume addition is associative, so
+            grouping the ices changes nothing about the mixing law.
+            Default False = the legacy per-species path, unchanged.
+
+            What DOES change when it is switched on (measured on a
+            logP 6-14 x logT 2-4.4 sweep):
+              * CH4 and NH3 come from the new joint Helmholtz fit instead
+                of the legacy ``*_eos_pt_extended.npz`` tables.  Inside
+                the DFT-supported region the densities agree to a median
+                0.008 dex; in the extrapolated corners they differ by up
+                to ~1.4 dex, and the internal energies by factors of
+                tens.  Their entropies are in the THIRD-LAW gauge (each
+                species' ``s_offset`` removed, ~6 k_B/baryon), so they
+                share a gauge with AQUA water and with each other; the
+                legacy tables did not.
+              * Water is bit-identical in rho and u, and identical in
+                entropy ON the table nodes, but ``ices_comb`` interpolates
+                LINEAR s where this class interpolates log10 s, so
+                off-node entropies differ by a median 3e-5 relative
+                (worst 5.7e-2, in the steep cold corner).  Linear is
+                forced: the third-law CH4/NH3 entropy is negative in the
+                cold-dense corner, where log10 s does not exist.
+
+            Two consequences a table builder must know:
+              * In the third-law gauge the CH4/NH3 entropy is NEGATIVE in
+                the cold-dense corner, so ``get_s_z`` (and the full
+                mixture entropy at high Z) can be <= 0 there.  Measured on
+                the sweep above: every such cell lies OUTSIDE
+                ``self.ices.entropy_valid_pt(P, T, Z_m, Z_a)``, i.e. in
+                the region both paths were inventing anyway.  Nothing here
+                takes log10 of the metal entropy, but an S-axis inversion
+                table should be gated on that mask.
+              * Domain: ices_comb covers logT 2.00-4.48 and logP 6-14,
+                which is WIDER in T than the legacy CH4 (2.30-4.30) and
+                NH3 (2.60-4.30) tables it replaces, so the standard
+                logT 1.3-6.0 build grid extrapolates less than before.
+                Beyond the tables every path extrapolates linearly.
+        ices_gauge : {'thirdlaw', 'table'}
+            Entropy gauge handed to ``ICES_COMB_EOS``.  'thirdlaw'
+            (default) removes the CH4/NH3 offsets so all three ices share
+            water's gauge — the only choice that makes a mixture entropy
+            meaningful.  'table' keeps the raw fit offsets and is for
+            diagnostics only.
         """
         if species_list is None:
             species_list = ['water_revised', 'methane', 'ammonia', 'mg2sio4']
         self.fill_z_nans = fill_z_nans
+
+        # Ternary ices module (water + CH4 + NH3 as one VAL component).
+        # Imported lazily so the default path costs nothing.
+        self.ices_eos = bool(ices_eos)
+        self.ices = None
+        if self.ices_eos:
+            from eos.ices_comb_eos import ICES_COMB_EOS
+            self.ices = ICES_COMB_EOS(s_gauge=ices_gauge)
 
         # Z EOS instances keyed by canonical role
         # ('water', 'methane', 'ammonia', 'mg2sio4', 'iron').
@@ -1171,11 +1230,99 @@ class z_eos_val_mixtures:
     _METAL_KEYS = ('water', 'methane', 'ammonia', 'mg2sio4')
 
     # =================================================================
+    # ices_comb block: water + CH4 + NH3 as ONE volume-addition species
+    # =================================================================
+
+    def _ice_direct(self, _zm, _za):
+        """Nested ice sub-fractions -> the DIRECT pair ``ices_comb`` takes.
+
+        Within the ice budget (i.e. after dividing out the 1 - _zr that
+        rock leaves behind) this class's convention is
+
+            f_water = (1-_zm)(1-_za),  f_methane = _zm(1-_za),  f_ammonia = _za
+
+        which is exactly ``ice_eos``'s nested convention, so
+        ``ICES_COMB_EOS.nested_to_direct`` applies unchanged and the rock
+        fraction never enters: Z_m = _zm(1-_za), Z_a = _za, and water is
+        the remainder 1 - Z_m - Z_a.
+        """
+        from eos.ices_comb_eos import ICES_COMB_EOS
+        return ICES_COMB_EOS.nested_to_direct(_zm, _za)
+
+    def _f_ice(self, _zr):
+        """Ice mass fraction within Z: f_water + f_methane + f_ammonia.
+
+        Identically 1 - _zr for every (_zm, _za), which is why the ices
+        can be grouped into a single component without touching the
+        nested convention.
+        """
+        return 1.0 - np.asarray(_zr, dtype=float)
+
+    def _ices_part(self, kind, _lgp, _lgt, Z_m, Z_a):
+        """The ices block's contribution: log10 rho, s [erg/(g.K)] or u [erg/g].
+
+        The entropy is requested with ``ideal_mixing=False`` (the module
+        default): the X-Y-Z ideal entropy of mixing is added ONCE, at the
+        full-mixture level, by ``val_mixtures.get_s_pt_val`` / this class's
+        ``get_s_pt``, from the same four physical sub-fractions.
+        """
+        if kind == 'rho':
+            return self.ices.get_logrho_pt_val(_lgp, _lgt, Z_m, Z_a)
+        if kind == 's':
+            return self.ices.get_s_pt_val(_lgp, _lgt, Z_m, Z_a)
+        return self.ices.get_u_pt_val(_lgp, _lgt, Z_m, Z_a)
+
+    def _rock_part(self, kind, _lgp, _lgt):
+        """The rock contribution in the same three flavours."""
+        rock = self.z['mg2sio4']
+        if kind == 'rho':
+            return rock.get_logrho_pt(_lgp, _lgt)
+        if kind == 's':
+            return 10.0 ** self._logs_fn['mg2sio4'](_lgp, _lgt)
+        return rock.get_u_pt(_lgp, _lgt)
+
+    def _ices_rock_mix(self, kind, _lgp, _lgt, _zm, _za, _zr):
+        """Z-mixture of the ices block with rock (``ices_eos=True`` path).
+
+        ``kind`` is 'rho' (returns log10 g/cm^3 via VAL), 's' (erg/(g.K),
+        mass-weighted) or 'u' (erg/g, mass-weighted).
+        """
+        Z_m, Z_a = self._ice_direct(_zm, _za)
+        f_ice = self._f_ice(_zr)
+        f_r = np.asarray(_zr, dtype=float)
+
+        parts = []                        # (mass fraction within Z, value)
+        if np.any(f_ice > 0.0):
+            parts.append((f_ice, self._ices_part(kind, _lgp, _lgt, Z_m, Z_a)))
+        if np.any(f_r > 0.0) and 'mg2sio4' in self.z:
+            parts.append((f_r, self._rock_part(kind, _lgp, _lgt)))
+
+        # A single component carrying the whole metal budget IS the mixture,
+        # so return it untouched.  Going through the sum would put log10 rho
+        # through 10**x, 1/x, 1/x and log10 again, and that round trip is not
+        # the identity in floating point: it costs an ulp at the pure corners,
+        # which are exactly where the mixture must reproduce its end member.
+        if len(parts) == 1 and np.all(parts[0][0] == 1.0):
+            return np.atleast_1d(np.asarray(parts[0][1], dtype=float))
+
+        acc = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
+        for f, q in parts:
+            q = np.asarray(q, dtype=float)
+            acc = acc + (f / 10.0 ** q if kind == 'rho' else f * q)
+
+        return np.log10(1.0 / acc) if kind == 'rho' else acc
+
+    # =================================================================
     # metal mixing  (drop-in for val_mixtures.get_logrho_z / _s_z / _u_z)
     # =================================================================
 
     def get_logrho_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
         """Metal-mixture density via VAL (log10 g/cm³)."""
+        if self.ices_eos:
+            result = self._ices_rock_mix('rho', _lgp, _lgt, _zm, _za, _zr)
+            if np.isscalar(_lgp) and np.isscalar(_lgt):
+                return result.item()
+            return result
         fracs = self._metal_fractions(_zm, _za, _zr)
 
         v_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
@@ -1205,14 +1352,22 @@ class z_eos_val_mixtures:
         in this class's standalone ``get_s_pt``).  Uses the NaN-filled
         entropy accessor in the AQUA superionic corner.
         """
-        s_mix = self._s_massweighted(_lgp, _lgt,
-                                     self._metal_fractions(_zm, _za, _zr))
+        if self.ices_eos:
+            s_mix = self._ices_rock_mix('s', _lgp, _lgt, _zm, _za, _zr)
+        else:
+            s_mix = self._s_massweighted(_lgp, _lgt,
+                                         self._metal_fractions(_zm, _za, _zr))
         if np.isscalar(_lgp) and np.isscalar(_lgt):
             return s_mix.item()
         return s_mix
 
     def get_u_z(self, _lgp, _lgt, _zm=0.0, _za=0.0, _zr=0.0):
         """Metal-mixture internal energy, mass-weighted (erg/g)."""
+        if self.ices_eos:
+            u_mix = self._ices_rock_mix('u', _lgp, _lgt, _zm, _za, _zr)
+            if np.isscalar(_lgp) and np.isscalar(_lgt):
+                return u_mix.item()
+            return u_mix
         f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
 
         u_mix = np.zeros_like(np.atleast_1d(_lgp), dtype=float)
@@ -1243,12 +1398,17 @@ class z_eos_val_mixtures:
 
         Mass-weighted per-species entropy **plus** the ideal entropy of
         mixing.  At an end-member (one fraction = 1) the mixing term
-        vanishes and the result reduces to the pure species value.
+        vanishes and the result reduces to the pure species value, on
+        either path (``ices_eos`` on or off).
         (``val_mixtures`` does not call this — it uses ``get_s_z`` and
         adds the full H-He-Z mixing itself.)
         """
         f_w, f_m, f_a, f_r = self._metal_fractions(_zm, _za, _zr)
-        s_mix = self._s_massweighted(_lgp, _lgt, (f_w, f_m, f_a, f_r))
+        # Through get_s_z, not _s_massweighted directly: get_s_z is the one
+        # accessor that honours ices_eos, and routing here keeps this
+        # getter and the (S, P) inversion built on it from ever drifting
+        # onto a different EOS than get_logrho_pt / get_u_pt.
+        s_mix = np.asarray(self.get_s_z(_lgp, _lgt, _zm, _za, _zr), dtype=float)
 
         # Ideal entropy of mixing (kb/baryon -> erg/(g.K))
         s_mix = s_mix + self._smix_ideal_z(f_w, f_m, f_a, f_r) / erg_to_kbbar
@@ -1401,7 +1561,8 @@ class val_mixtures:
 
     def __init__(self, hhe_eos_name='cd', hg=True,
                  smooth_hhe=False, smooth_z=False,
-                 species_list=None, mu_h_vary=True):
+                 species_list=None, mu_h_vary=True,
+                 ices_eos=False, ices_gauge='thirdlaw'):
         """
         Parameters
         ----------
@@ -1423,6 +1584,15 @@ class val_mixtures:
             hydrogen: mu_H = 2 below the H2 dissociation boundary and
             mu_H = 1 above it.  If False, use the legacy value mu_H = 1
             everywhere.
+        ices_eos : bool
+            Serve the ice block (water + CH4 + NH3) from
+            ``eos.ices_comb_eos.ICES_COMB_EOS`` instead of the legacy
+            per-species tables, giving a complete H-He-ice-rock volume
+            addition law in which the three ices share one entropy gauge.
+            Passed straight to ``z_eos_val_mixtures``, whose docstring
+            lists exactly what changes.  Default False.
+        ices_gauge : {'thirdlaw', 'table'}
+            Entropy gauge for that module ('thirdlaw' by default).
         """
         if species_list is None:
             species_list = ['water_revised', 'methane', 'ammonia', 'mg2sio4']
@@ -1439,8 +1609,13 @@ class val_mixtures:
         # AQUA superionic corner.  self.z is shared (same dict) so the
         # metal-mixing methods below read the same species objects.
         self.zmetal = z_eos_val_mixtures(species_list=species_list,
-                                         smooth_z=smooth_z, fill_z_nans=True)
+                                         smooth_z=smooth_z, fill_z_nans=True,
+                                         ices_eos=ices_eos,
+                                         ices_gauge=ices_gauge)
         self.z = self.zmetal.z
+        # The ternary ices module when ices_eos=True, else None.
+        self.ices_eos = self.zmetal.ices_eos
+        self.ices = self.zmetal.ices
 
     # =================================================================
     # helpers
@@ -1884,7 +2059,9 @@ class hhe_z_mixtures():
                  interp_method='linear',
                  table_suffix='',
                  f_rock=0.0,
-                 rock_interp=None):
+                 rock_interp=None,
+                 ices_eos=False,
+                 ices_gauge='thirdlaw'):
         """
         Parameters
         ----------
@@ -1964,6 +2141,26 @@ class hhe_z_mixtures():
             automatically.  The interpolating instance holds no tables of
             its own.  Pass an explicit bool to override the auto-detection
             (e.g. False for the internal sub-instances).
+        ices_eos : bool
+            Serve the ice block (water + CH4 + NH3) from
+            ``eos.ices_comb_eos.ICES_COMB_EOS`` rather than the legacy
+            per-species tables, so that ``_zm``, ``_za`` and ``_zr`` give
+            a complete H-He-ice-rock volume addition law with one entropy
+            gauge across the three ices.  Forwarded to ``val_mixtures``;
+            ``z_eos_val_mixtures``'s docstring lists what changes
+            numerically.  Default False.
+
+            Because the forward model changes, this instance's cached
+            tables MUST NOT share filenames with the legacy ones:
+            ``table_suffix`` is automatically extended with ``icescomb``
+            (after any ``frock`` tag), so ``ices_eos=True`` with
+            ``z_eos='ice_mixture'`` loads/saves
+            ``cd_ice_mixture_{basis}_square_icescomb.npz``.  Those tables
+            do not exist until they are built, so pair this flag with
+            ``pt_tab=False, inv_tab=False`` (on-the-fly VAL and
+            root-finding) until they are.
+        ices_gauge : {'thirdlaw', 'table'}
+            Entropy gauge for that module ('thirdlaw' by default).
         """
 
         # --- 3-point rock-fraction interpolation across precomputed sets -
@@ -1998,6 +2195,18 @@ class hhe_z_mixtures():
             _suff = str(table_suffix).strip('_')
             table_suffix = f'{_rock_tag}_{_suff}' if _suff else _rock_tag
 
+        # --- Ternary ices module (water + CH4 + NH3 in one VAL block) ---
+        # The forward model differs from the legacy per-species path, so
+        # the cached tables get their own filenames and can never be
+        # confused with (or overwrite) the legacy ones.
+        # Idempotent, because _init_kwargs below stores the tagged suffix
+        # alongside ices_eos=True: a build worker reconstructed from those
+        # kwargs must land on the same filename, not on *_icescomb_icescomb.
+        self.ices_eos = bool(ices_eos)
+        _suff = str(table_suffix).strip('_')
+        if self.ices_eos and not _suff.endswith('icescomb'):
+            table_suffix = f'{_suff}_icescomb' if _suff else 'icescomb'
+
         self.hhe_eos_name = hhe_eos_name
         self.z_eos_label = z_eos
         # Optional name tag for table variants (e.g. high-Z extension).
@@ -2026,6 +2235,7 @@ class hhe_z_mixtures():
             logrho_range=logrho_range, logrho_step=logrho_step,
             interp_method=interp_method,
             table_suffix=table_suffix,
+            ices_eos=ices_eos, ices_gauge=ices_gauge,
         )
 
         # --- Forward-model mixer ---
@@ -2033,7 +2243,10 @@ class hhe_z_mixtures():
             hhe_eos_name=hhe_eos_name, hg=hg,
             smooth_hhe=smooth_hhe, smooth_z=smooth_z,
             mu_h_vary=mu_h_vary,
-            species_list=species_list)
+            species_list=species_list,
+            ices_eos=ices_eos, ices_gauge=ices_gauge)
+        # convenience handle: the ICES_COMB_EOS instance, or None
+        self.ices = self.val.ices
 
         # --- Grid parameters (used by table builders) ---
         self.logp_vals = np.arange(logp_range[0],
@@ -2078,6 +2291,7 @@ class hhe_z_mixtures():
                 pt_tab=_sub_pt_tab, inv_tab=_sub_inv_tab,
                 srho_tab=_sub_srho_tab, y_prime=y_prime,
                 yprime_clip=yprime_clip,
+                ices_eos=ices_eos, ices_gauge=ices_gauge,
                 rock_interp=False)
             self._rock_subs = [
                 hhe_z_mixtures(species_list=['water_revised'],
