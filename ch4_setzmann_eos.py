@@ -239,3 +239,80 @@ def get_s_rhot(rho, T):
     phi_o_tau = _phi_ideal_tau(tau)
     phi_r_tau = _phi_r_tau(delta, tau)
     return _R_cgs * (tau * (phi_o_tau + phi_r_tau) - phi_o - phi_r)
+
+
+# =====================================================================
+# Auxiliary equations for the phase boundaries (Setzmann & Wagner 1991,
+# Sec. 3, Table 26).  Added 2026-09 for the CH4/NH3 Helmholtz fit, whose
+# reference pseudo-data must stay outside the vapour-liquid dome and below
+# the melting line: Eq. (5.3) is a single-phase fluid equation, and inside
+# the two-phase region or in the solid it returns numbers that mean nothing
+# (measured: u/(R_s T) = -169 at rho = 0.176 g/cm^3, T = 136 K).
+#
+# All inputs T in K; outputs CGS (dyn/cm^2 and g/cm^3).
+# =====================================================================
+pc_MPa = 4.5922           # critical pressure [MPa], Eq. (2.3)
+Tt = 90.6941              # triple-point temperature [K]
+pt_MPa = 0.011696         # triple-point pressure [MPa], Eq. (3.7)
+_MPA_TO_CGS = 1.0e7       # 1 MPa = 1e7 dyn/cm^2
+
+# Eq. (3.2): ln(p_s/p_c) = (T_c/T) sum n_i theta^{t_i},  theta = 1 - T/T_c
+_ps_n = np.array([-6.036219, 1.409353, -0.4945199, -1.443048])
+_ps_t = np.array([1.0, 1.5, 2.0, 4.5])
+# Eq. (3.4): ln(rho'/rho_c) = sum n_i theta^{t_i}
+_rl_n = np.array([1.9906389, -0.78756197, 0.036976723])
+_rl_t = np.array([0.354, 0.5, 2.5])
+# Eq. (3.5): ln(rho''/rho_c) = sum n_i theta^{t_i}
+_rv_n = np.array([-1.8802840, -2.8526531, -3.0006480, -5.2511690,
+                  -13.191859, -37.553961])
+_rv_t = np.array([0.354, 5.0 / 6.0, 1.5, 2.5, 25.0 / 6.0, 47.0 / 6.0])
+# Eq. (3.7): p_m/p_t = 1 + n1 [(T/T_t)^1.85 - 1] + n2 [(T/T_t)^2.1 - 1]
+_pm_n1, _pm_n2 = 2.47568e4, -7.36602e3
+
+
+def _theta(T):
+    T = np.asarray(T, dtype=float)
+    return np.clip(1.0 - T / Tc, 0.0, None)
+
+
+def vapor_pressure(T):
+    """Saturation pressure p_s(T) [dyn/cm^2], Eq. (3.2); valid T_t <= T <= T_c."""
+    th = _theta(T)
+    T = np.asarray(T, dtype=float)
+    s = (th[..., None] ** _ps_t * _ps_n).sum(axis=-1)
+    return pc_MPa * _MPA_TO_CGS * np.exp(Tc / T * s)
+
+
+def rho_sat_liq(T):
+    """Saturated liquid density rho'(T) [g/cm^3], Eq. (3.4)."""
+    th = _theta(T)
+    s = (th[..., None] ** _rl_t * _rl_n).sum(axis=-1)
+    return rhoc / 1000.0 * np.exp(s)
+
+
+def rho_sat_vap(T):
+    """Saturated vapour density rho''(T) [g/cm^3], Eq. (3.5)."""
+    th = _theta(T)
+    s = (th[..., None] ** _rv_t * _rv_n).sum(axis=-1)
+    return rhoc / 1000.0 * np.exp(s)
+
+
+def melting_pressure(T):
+    """Melting pressure p_m(T) [dyn/cm^2], Eq. (3.7); T >= T_t.
+
+    Simon-type form fitted by Setzmann & Wagner to the selected melting data
+    of Table 6 (90.7-370 K); above that it is an extrapolation of the same
+    form, which is all that is needed to bound the fluid region.
+    """
+    r = np.asarray(T, dtype=float) / Tt
+    return pt_MPa * _MPA_TO_CGS * (1.0 + _pm_n1 * (r ** 1.85 - 1.0)
+                                   + _pm_n2 * (r ** 2.1 - 1.0))
+
+
+def in_two_phase(rho, T):
+    """True where (rho, T) lies inside the vapour-liquid dome (T < T_c and
+    rho''(T) < rho < rho'(T))."""
+    rho = np.asarray(rho, dtype=float)
+    T = np.asarray(T, dtype=float)
+    sub = T < Tc
+    return sub & (rho > rho_sat_vap(T)) & (rho < rho_sat_liq(T))

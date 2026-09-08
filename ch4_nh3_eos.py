@@ -42,10 +42,14 @@ CURR_DIR = os.path.dirname(os.path.realpath(__file__))
 CACHE_DIR = os.path.join(CURR_DIR, 'methane_ammonia')
 
 SPECIES = ('methane', 'ammonia')
-TABLE_VERSION = 'v2'
+TABLE_VERSION = 'v3'
 
-# Molar masses [g/mol], used only for the optional ideal entropy of mixing.
-MOLAR_MASS = {'methane': 16.043, 'ammonia': 17.031}
+# Molar masses [g/mol], used only for the optional ideal entropy of mixing and
+# the C:N:O conversion.  Taken from the fit's own ideal terms (Setzmann & Wagner
+# 1991: 16.043; Gao et al. 2023: 17.03052) so that every module agrees; v2
+# carried 17.031 here against 17.03052 in the fit.
+from eos.ch4_nh3_helmholtz import IDEAL as _IDEAL
+MOLAR_MASS = {sp: float(_IDEAL[sp].M) for sp in ('methane', 'ammonia')}
 
 erg_to_kbbar = float((u.erg / u.Kelvin / u.gram).to(k_B / amu))
 R_GAS = float((k_B / amu).to('erg/(K*g)').value)   # erg/(g K) per (g/mol)
@@ -189,7 +193,7 @@ class HelmholtzSpeciesEOS:
         if pt:
             self._load_pt_table(pt_table_path(species, self.version))
 
-        self.s_offset = self._load_s_offset(fit_cache_path(species, self.version))
+        self.s_offset, self.u_offset = self._load_offsets(fit_cache_path(species, self.version))
         self.domain = self._build_domain()
 
     def __repr__(self):
@@ -235,27 +239,35 @@ class HelmholtzSpeciesEOS:
         self._logu_rgi_pt = RGI(axes, _log10(d['u']), **_RGI_KW)
         self._logs_rgi_pt = RGI(axes, _log10(d['s']), **_RGI_KW)
 
-        # `supported` marks cells inside the DFT density range; elsewhere the
-        # surface is a constrained extrapolation.  Nearest-neighbour, since a
-        # linear blend of a boolean mask means nothing.
+        # `supported` marks cells inside the (rho, T) hull of the DFT-MD points;
+        # `provenance` (v3) records which data class each cell rests on
+        # (0 none, 1 reference hull, 2 DFT hull, 3 cold anchor, 4 continuation).
+        # Nearest-neighbour, since a linear blend of a label means nothing.
         self._supported_rgi = RGI(axes, np.asarray(d['supported'], dtype=float),
                                   method='nearest', bounds_error=False, fill_value=0.0)
+        prov = d['provenance'] if 'provenance' in d.files else np.where(d['supported'], 2, 0)
+        self._provenance_rgi = RGI(axes, np.asarray(prov, dtype=float),
+                                   method='nearest', bounds_error=False, fill_value=0.0)
 
         self.meta_pt = json.loads(str(d['meta'][0]))
         self._has_pt = True
 
-    def _load_s_offset(self, path):
-        """The post-fit third-law entropy gauge, in erg/(g K).
+    def _load_offsets(self, path):
+        """The post-fit gauges (s_offset, u_offset), both in CGS.
 
-        A constant added to s so that the tabulated entropy stays positive over
-        the whole domain (the consumers store log10 s).  It cancels from every
-        derivative, so it changes no thermodynamics, but it dominates the
-        absolute value: see `CH4_NH3_EOS.gauge_report`.
+        Constants added to s and u so that the tabulated values stay positive
+        over the whole domain (the consumers store log10 s and log10 u).  They
+        cancel from every derivative, so they change no thermodynamics.  In v3
+        the entropy offset is small (the third-law minimum of the fit sits near
+        zero) and the energy offset is of order the cohesive energy; in v2 the
+        entropy offset was 100.5 R_s and dominated the absolute value.
         """
         if not os.path.exists(path):
-            return 0.0
+            return 0.0, 0.0
         z = np.load(path, allow_pickle=False)
-        return float(z['s_offset'][0]) if 's_offset' in z.files else 0.0
+        s_off = float(z['s_offset'][0]) if 's_offset' in z.files else 0.0
+        u_off = float(z['u_offset'][0]) if 'u_offset' in z.files else 0.0
+        return s_off, u_off
 
     def _build_domain(self):
         rho_min = rho_max = T_min = T_max = P_min = P_max = np.nan
@@ -371,6 +383,14 @@ class HelmholtzSpeciesEOS:
         scalar, P_arr, T_arr = _broadcast(P, T)
         vals = _interp(self._supported_rgi, _log10(T_arr), _log10(P_arr)) > 0.5
         return bool(vals.reshape(-1)[0]) if scalar else vals
+
+    def provenance_pt(self, P, T):
+        """Provenance label at (P,T): 0 none, 1 reference, 2 DFT, 3 cold anchor,
+        4 high-density continuation (int8)."""
+        self._require('pt')
+        scalar, P_arr, T_arr = _broadcast(P, T)
+        vals = np.rint(_interp(self._provenance_rgi, _log10(T_arr), _log10(P_arr))).astype(np.int8)
+        return int(vals.reshape(-1)[0]) if scalar else vals
 
     def in_domain_pt(self, P, T):
         """True where (P,T) is inside the table, i.e. not extrapolated."""
