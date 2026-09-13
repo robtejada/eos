@@ -201,6 +201,19 @@ def build_parser():
     p.add_argument('--species', nargs='+',
                    default=['water_revised'],
                    help="Z species for val_mixtures (default: water_revised)")
+    p.add_argument('--ices_eos', action='store_true',
+                   help="Serve the ice budget (water + CH4 + NH3) with the "
+                        "ternary ICES_COMB_EOS as ONE volume-addition "
+                        "component instead of the legacy per-species tables. "
+                        "Tags every output file with 'icescomb'.")
+    p.add_argument('--cno', default=None,
+                   help="C:N:O atom-number ratio for the ice budget, e.g. "
+                        "'4:1:7' (solar) or the shorthand '417'.  Converted "
+                        "to the nested sub-fractions _zm (methane) and _za "
+                        "(ammonia) that the table is built at, and recorded "
+                        "inside the table so the getters know which queries "
+                        "it may answer.  Tags the filename with "
+                        "'zm{_zm:.3f}_za{_za:.3f}'.  Implies --ices_eos.")
     p.add_argument('--f_rock', type=float, default=0.0,
                    help="Rock (mg2sio4) mass fraction WITHIN the metal "
                         "budget Z, i.e. the nested sub-fraction _zr "
@@ -309,6 +322,22 @@ def main():
     smooth_z = args.smooth_z
     mu_h_vary = args.mu_h_vary
 
+    # --- Ice sub-composition (nested _zm, _za) from the C:N:O ratio ------
+    ices_eos = bool(args.ices_eos or args.cno)
+    if args.cno:
+        from eos.ices_comb_eos import cno_to_mass_fractions, cno_label
+        _Zm, _Za, _fw = cno_to_mass_fractions(args.cno)
+        # direct (water-primary) -> nested: Z_m = _zm (1 - _za), Z_a = _za
+        za_ice = float(_Za)
+        zm_ice = float(_Zm) / (1.0 - float(_Za)) if float(_Za) < 1.0 else 0.0
+        ices_comp = (zm_ice, za_ice)
+        print(f"C:N:O {cno_label(args.cno)} -> direct Z_m={_Zm:.6f}, "
+              f"Z_a={_Za:.6f}, water={_fw:.6f}")
+        print(f"                 -> nested _zm={zm_ice:.6f}, _za={za_ice:.6f}")
+    else:
+        ices_comp = None
+        zm_ice = za_ice = 0.0
+
     # --- Rock mass fraction (nested sub-fraction _zr; _zm = _za = 0) ---
     f_rock = float(args.f_rock)
     if not (0.0 <= f_rock <= 1.0):
@@ -335,6 +364,9 @@ def main():
                             if args.suffix else rock_tag)
     else:
         effective_suffix = args.suffix
+    # The ice tag and the 'icescomb' tag are added by hhe_z_mixtures itself
+    # from ices_comp / ices_eos, so that a build here and a load in ORCHARD
+    # resolve to the same filename from the same two arguments.
 
     # --- Print summary ---
     print("=" * 65)
@@ -346,6 +378,8 @@ def main():
     print(f"  H-He EOS:    {args.hhe_eos}")
     print(f"  Z EOS:       {args.z_eos}")
     print(f"  f_rock (_zr):{f_rock:.3f}")
+    print(f"  ices_eos    : {ices_eos}"
+          + (f"   _zm={zm_ice:.6f} _za={za_ice:.6f}" if ices_comp else ""))
     if effective_suffix:
         print(f"  Suffix:      {effective_suffix}  "
               f"(-> ..._square_{effective_suffix}.npz)")
@@ -420,6 +454,8 @@ def main():
         mu_h_vary=mu_h_vary,
         species_list=species_list,
         z_eos=args.z_eos,
+        ices_eos=ices_eos,
+        ices_comp=ices_comp,
         pt_tab=_pt_tab,
         inv_tab=_inv_tab,
         srho_tab=False,
@@ -435,11 +471,13 @@ def main():
     t0 = time.time()
 
     if args.basis == 'pt':
-        result = eos.build_pt_table(yvals, zvals, _zr=f_rock)
+        result = eos.build_pt_table(yvals, zvals, _zm=zm_ice, _za=za_ice,
+                                    _zr=f_rock)
         eos.save_pt_table(result, path=args.output)
 
     elif args.basis == 'sp':
-        result = eos.build_sp_table(yvals, zvals, _zr=f_rock,
+        result = eos.build_sp_table(yvals, zvals, _zm=zm_ice,
+                                    _za=za_ice, _zr=f_rock,
                                     s_lo=args.s_lo, s_hi=args.s_hi,
                                     s_step=args.s_step,
                                     smooth_inverted=args.smooth_inverted,
@@ -447,13 +485,15 @@ def main():
         eos.save_sp_table(result, path=args.output)
 
     elif args.basis == 'rhot':
-        result = eos.build_rhot_table(yvals, zvals, _zr=f_rock,
+        result = eos.build_rhot_table(yvals, zvals, _zm=zm_ice,
+                                    _za=za_ice, _zr=f_rock,
                                       smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_rhot_table(result, path=args.output)
 
     elif args.basis == 'rhop':
-        result = eos.build_rhop_table(yvals, zvals, _zr=f_rock,
+        result = eos.build_rhop_table(yvals, zvals, _zm=zm_ice,
+                                    _za=za_ice, _zr=f_rock,
                                       smooth_inverted=args.smooth_inverted,
                                       n_workers=args.n_workers)
         eos.save_rhop_table(result, path=args.output)
@@ -470,7 +510,8 @@ def main():
                   "--basis rhot ...")
             sys.exit(1)
 
-        result = eos.build_srho_table(yvals, zvals, _zr=f_rock,
+        result = eos.build_srho_table(yvals, zvals, _zm=zm_ice,
+                                    _za=za_ice, _zr=f_rock,
                                       s_lo=args.s_lo, s_hi=args.s_hi,
                                       s_step=args.s_step,
                                       smooth_inverted=args.smooth_inverted,

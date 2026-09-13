@@ -33,8 +33,10 @@
         u_mix     = f_w*u_w + Z_m*u_m + Z_a*u_a
         s_mix     = f_w*s_w + Z_m*s_m + Z_a*s_a  [+ ideal mixing, optional]
 
-    Entropy gauge.  The CH4/NH3 tables carry a post-fit offset of 100.50 R_s per
-    species, added only so downstream log10(s) storage stays defined; measured at
+    Entropy gauge.  The CH4/NH3 tables carry a post-fit offset per species,
+    added only so downstream log10(s) storage stays defined: 5.50 R_s in v3
+    (2.850e7 erg/g/K for methane, 2.685e7 for ammonia, i.e. 0.343 and 0.323
+    k_B per baryon), against 100.50 R_s in v2.  Measured at
     1 bar and 500 K, subtracting it returns both species to the third-law scale
     (207.1 and 212.6 J/mol/K against the JANAF standard values), where the
     revised AQUA water table already sits (206.5 J/mol/K at the same state).
