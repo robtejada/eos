@@ -1,0 +1,76 @@
+{
+  "blend_rho": [
+    -6.0,
+    -5.0
+  ],
+  "blend_rho_z": [
+    -7.0,
+    -2.0
+  ],
+  "effective_domain": {
+    "logT_at_logrho_hi": [
+      2.017523819010745,
+      3.931531015397091
+    ],
+    "logT_at_logrho_lo": [
+      1.717760815589021,
+      3.460924276646411
+    ],
+    "logrho": [
+      -14.95,
+      -0.049999999999998934
+    ]
+  },
+  "eos": "cd",
+  "eos_git": "a4e2951eac9b1a6cdd612d6df0fce43160ab9b97-dirty",
+  "header": "  0.23704568   300  -15.0  0.0  1.69897 3.4771212547197  2.0  3.9542425094393",
+  "header_tokens": [
+    0.23704568,
+    300,
+    -15.0,
+    0.0,
+    1.69897,
+    3.4771212547197,
+    2.0,
+    3.9542425094393
+  ],
+  "hg": false,
+  "logt_anchor": 2.25,
+  "mixing_entropy": "ORCHARD convention (_m_h_atomic = 1)",
+  "n_below_anchor": 2401,
+  "n_blend": 9900,
+  "n_cells": 30000,
+  "n_entropy_floored": 24,
+  "n_ideal_only": 16100,
+  "n_pressure_floored": 0,
+  "n_root_repaired": 23,
+  "n_source_failed": 0,
+  "n_source_only": 4000,
+  "numpy": "2.3.5",
+  "orchard_git": "1a61c38d5ba49a414a24c40dc7cfbb1a3ce588c5-dirty",
+  "ptab": "ptab_cd_Y0.25_Z3.16solar.dat",
+  "ptab_range": [
+    -5.763244281436537,
+    12.206995857625174
+  ],
+  "python": "3.13.13",
+  "s_unit": "mH",
+  "sha256": {
+    "ptab_cd_Y0.25_Z3.16solar.dat": "8552ea7e5cef8480546faea5607d612b27cb416133012238b924ddc2c316aac1",
+    "stab_cd_Y0.25_Z3.16solar.dat": "e9191dd6ca034b997b72e21f5cc5d5c8d3338489476ff7c6bd923d508f43efd1"
+  },
+  "source": "VAL forward model (get_logrho_pt_val inverted, get_s_pt_val)",
+  "stab": "stab_cd_Y0.25_Z3.16solar.dat",
+  "stab_range": [
+    -2.996614859856124,
+    1.5153431614075148
+  ],
+  "x_diss_max": 0.9999999726163495,
+  "x_e_max": 3.352230533816985e-05,
+  "y_absolute": 0.23704568,
+  "y_prime": 0.25,
+  "z": 0.05181726985106876,
+  "z_eos": "aqua_revised (pure water)",
+  "z_solar": 3.16,
+  "z_sun": 0.017
+}
