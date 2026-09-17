@@ -169,7 +169,7 @@ class HelmholtzSpeciesEOS:
     ----------
     species : {'methane', 'ammonia'}
     version : str
-        Table version tag, e.g. 'v2'.
+        Table version tag; defaults to the current TABLE_VERSION ('v3').
     rhot, pt : bool
         Load the (rho,T) and (P,T) tables respectively.  Both default True;
         skipping one halves the load time and memory if only one basis is used.
