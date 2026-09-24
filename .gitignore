@@ -49,6 +49,8 @@ FPEOS/*
 coolTlusty_tables_brianna/*
 coolTlusty_tables_yixian/*
 total_mixture_eos/*
+# hhe_z_mixtures(ices_endmembers=True) per-composition table caches: regenerable
+*/endmembers/compositions/
 sesame-unc.ascii2.ascii
 cd/cd_ice_mixture_pt.npz
 cd/cd_ice_mixture_rhot.npz

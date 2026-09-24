@@ -214,6 +214,17 @@ def build_parser():
                         "inside the table so the getters know which queries "
                         "it may answer.  Tags the filename with "
                         "'zm{_zm:.3f}_za{_za:.3f}'.  Implies --ices_eos.")
+    p.add_argument('--ices_zm', type=float, default=None,
+                   help="Nested methane sub-fraction _zm for this table, in "
+                        "[0,1].  Use with --ices_za to request one node of a "
+                        "composition grid; --cno is the alternative spelling "
+                        "for a named C:N:O ratio.  Implies --ices_eos.")
+    p.add_argument('--ices_za', type=float, default=None,
+                   help="Nested ammonia sub-fraction _za for this table, in "
+                        "[0,1].  Nested fractions are independent on [0,1]^2, "
+                        "so a rectangular (_zm,_za) grid tiles the composition "
+                        "simplex exactly.  NOTE _za=1 is pure ammonia for any "
+                        "_zm, so that row of a grid is degenerate.")
     p.add_argument('--f_rock', type=float, default=0.0,
                    help="Rock (mg2sio4) mass fraction WITHIN the metal "
                         "budget Z, i.e. the nested sub-fraction _zr "
@@ -296,6 +307,11 @@ def build_parser():
                         "fully vectorised).")
 
     # Output
+    p.add_argument('--table_dir', type=str, default=None,
+                   help="Folder to read the P-T (and rho-T) table from and "
+                        "write the output to (default: eos/<hhe_eos>).  "
+                        "Used for composition-specific table sets built "
+                        "from the end-member P-T tables (eos/endmembers.py).")
     p.add_argument('--output', type=str, default=None,
                    help='Output path (default: auto from hhe_eos/z_eos)')
     p.add_argument('--suffix', type=str, default='',
@@ -323,8 +339,20 @@ def main():
     mu_h_vary = args.mu_h_vary
 
     # --- Ice sub-composition (nested _zm, _za) from the C:N:O ratio ------
-    ices_eos = bool(args.ices_eos or args.cno)
-    if args.cno:
+    if args.cno and (args.ices_zm is not None or args.ices_za is not None):
+        parser.error('--cno and --ices_zm/--ices_za are alternative spellings '
+                     'of the same thing; pass one or the other')
+    ices_eos = bool(args.ices_eos or args.cno
+                    or args.ices_zm is not None or args.ices_za is not None)
+    if args.ices_zm is not None or args.ices_za is not None:
+        zm_ice = float(args.ices_zm or 0.0)
+        za_ice = float(args.ices_za or 0.0)
+        for nm, v in (('--ices_zm', zm_ice), ('--ices_za', za_ice)):
+            if not (0.0 <= v <= 1.0):
+                parser.error(f'{nm} must be in [0, 1] (got {v})')
+        ices_comp = (zm_ice, za_ice) if (zm_ice or za_ice) else None
+        print(f"Ice sub-composition: nested _zm={zm_ice:.6f}, _za={za_ice:.6f}")
+    elif args.cno:
         from eos.ices_comb_eos import cno_to_mass_fractions, cno_label
         _Zm, _Za, _fw = cno_to_mass_fractions(args.cno)
         # direct (water-primary) -> nested: Z_m = _zm (1 - _za), Z_a = _za
@@ -381,8 +409,10 @@ def main():
     print(f"  ices_eos    : {ices_eos}"
           + (f"   _zm={zm_ice:.6f} _za={za_ice:.6f}" if ices_comp else ""))
     if effective_suffix:
-        print(f"  Suffix:      {effective_suffix}  "
-              f"(-> ..._square_{effective_suffix}.npz)")
+        # NB: this is the suffix BEFORE hhe_z_mixtures appends its own tags
+        # (the zm/za ice tag and 'icescomb').  The resolved destination is
+        # printed after construction; do not predict the filename here.
+        print(f"  Suffix:      {effective_suffix}")
     print(f"  Species:     {species_list}")
     print(f"  HG23:        {hg}")
     print(f"  Smooth H-He: {smooth_hhe}")
@@ -456,6 +486,15 @@ def main():
         z_eos=args.z_eos,
         ices_eos=ices_eos,
         ices_comp=ices_comp,
+        # Declare the rock fraction so load_pt_table can tell that a
+        # frock-tagged table matches this instance.  Without it the loader
+        # compared a recorded _zr=0.5 against a default 0.0 and warned that
+        # the table would go unused, while in fact using it.  rock_interp is
+        # forced off: a builder must evaluate the composition directly, and
+        # leaving it on auto would silently switch to three-sub-instance
+        # interpolation for any f_rock outside {0, 0.5, 1}.
+        f_rock=f_rock,
+        rock_interp=False,
         pt_tab=_pt_tab,
         inv_tab=_inv_tab,
         srho_tab=False,
@@ -465,7 +504,10 @@ def main():
         logrho_range=(args.logrho_lo, args.logrho_hi),
         logrho_step=args.logrho_step,
         table_suffix=effective_suffix,
+        table_dir=args.table_dir,
     )
+
+    print(f"  Output:      {os.path.basename(args.output or eos._table_path(args.basis))}")
 
     # --- Build table ---
     t0 = time.time()

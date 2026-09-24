@@ -28,6 +28,145 @@ mhe = 4.0026
 # difference, but loose enough to absorb float round-trips through the NPZ.
 _COMP_TOL = 1e-6
 
+# ---------------------------------------------------------------------------
+# Byte-shuffled table storage
+# ---------------------------------------------------------------------------
+# npz stores float32 with plain zlib and only reaches ~1.2x, because consecutive
+# bytes of a float array are uncorrelated: an exponent byte sits next to a low
+# mantissa byte that is effectively noise.  Byte-shuffling deinterleaves them --
+# all byte-0s, then all byte-1s, and so on -- so the exponent plane becomes long
+# runs and the noisy low-mantissa plane is isolated.  LZMA then reaches ~2.1x on
+# these tables (514 MB -> 240 MB for one composition across five bases).
+#
+# It is a pure permutation followed by a lossless codec, so it round trips BIT
+# EXACTLY.  That is the point: the alternative, quantising to a fixed 1e-4 dex
+# quantum, reaches 9.7x but inflates ORCHARD's sub-cell finite-difference
+# derivatives (dt=1e-2 against 0.05 dex grid spacing) to 21.5% p99 on
+# dlogrho/dlogT and 10.4% on dS/dY, against ~2e-6 today.  Those are the Ledoux
+# terms in the convective-stability criterion, so the lossy route is not taken.
+#
+# Only arrays above _SHUFFLE_MIN_BYTES are packed; axis vectors and scalars are
+# stored plainly so the files stay inspectable.  Readers accept both layouts, so
+# every table written before this existed still loads unchanged.
+_SHUFFLE_MIN_BYTES = 1 << 20          # 1 MiB
+_SHUFFLE_PREFIX = '_shuf__'
+_SHUFFLE_LZMA_PRESET = 6
+
+
+def _shuffle_bytes(raw, itemsize):
+    """Deinterleave byte planes: b0b1b2b3 b0b1b2b3 ... -> b0b0... b1b1... etc."""
+    return np.frombuffer(raw, dtype=np.uint8).reshape(-1, itemsize).T.tobytes()
+
+
+def _unshuffle_bytes(buf, itemsize):
+    """Inverse of _shuffle_bytes."""
+    a = np.frombuffer(buf, dtype=np.uint8).reshape(itemsize, -1).T
+    return np.ascontiguousarray(a).tobytes()
+
+
+def _savez_shuffled(path, **arrays):
+    """np.savez_compressed with byte-shuffle + LZMA on the bulk float arrays."""
+    import lzma
+    out = {}
+    for key, val in arrays.items():
+        a = np.asarray(val)
+        if a.nbytes >= _SHUFFLE_MIN_BYTES and a.dtype.kind in 'fiu':
+            a = np.ascontiguousarray(a)
+            blob = lzma.compress(_shuffle_bytes(a.tobytes(), a.dtype.itemsize),
+                                 preset=_SHUFFLE_LZMA_PRESET)
+            out[_SHUFFLE_PREFIX + key] = np.frombuffer(blob, dtype=np.uint8)
+            # plain unicode / int arrays, so the reader never needs allow_pickle
+            out[_SHUFFLE_PREFIX + key + '__dtype'] = np.array(str(a.dtype))
+            out[_SHUFFLE_PREFIX + key + '__shape'] = np.asarray(a.shape, dtype=np.int64)
+        else:
+            out[key] = a
+    # Write to a temporary name in the same directory and swap it in only once
+    # complete.  The builders run under a resumable queue that skips any node
+    # whose output file exists, so a save killed mid-write (a shutdown did
+    # this on 2026-09-17) must never leave a truncated table at the real
+    # name: the queue would treat it as done and skip that node forever.
+    final = str(path) if str(path).endswith('.npz') else str(path) + '.npz'
+    tmp = '%s.partial-%d' % (final, os.getpid())
+    try:
+        # no second zlib pass: the payload is already LZMA'd, so
+        # savez_compressed would re-compress incompressible bytes for nothing.
+        # A file object stops np.savez appending its own .npz to the name.
+        with open(tmp, 'wb') as fh:
+            np.savez(fh, **out)
+        os.replace(tmp, final)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+class _ShuffledNPZ:
+    """dict-like view over an npz, transparently unpacking shuffled arrays."""
+
+    def __init__(self, path):
+        self._z = np.load(path)
+        self.files = []
+        self._packed = set()
+        for k in self._z.files:
+            if k.startswith(_SHUFFLE_PREFIX):
+                if k.endswith('__dtype') or k.endswith('__shape'):
+                    continue
+                name = k[len(_SHUFFLE_PREFIX):]
+                self.files.append(name)
+                self._packed.add(name)
+            else:
+                self.files.append(k)
+
+    def __contains__(self, key):
+        return key in self.files
+
+    def keys(self):
+        return list(self.files)
+
+    def __iter__(self):
+        return iter(self.files)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __getitem__(self, key):
+        if key not in self._packed:
+            return self._z[key]
+        import lzma
+        dtype = np.dtype(str(self._z[_SHUFFLE_PREFIX + key + '__dtype']))
+        shape = tuple(int(n) for n in self._z[_SHUFFLE_PREFIX + key + '__shape'])
+        blob = self._z[_SHUFFLE_PREFIX + key].tobytes()
+        planes = np.frombuffer(lzma.decompress(blob), dtype=np.uint8)
+        # one contiguous copy, which is also what makes the result writable,
+        # as np.load's arrays are
+        a = np.ascontiguousarray(planes.reshape(dtype.itemsize, -1).T)
+        return a.view(dtype).reshape(shape)
+
+    def close(self):
+        self._z.close()
+
+
+def _suffix_has_tag(suffix, tag):
+    """True if ``tag`` appears as whole ``_``-separated token(s) in ``suffix``.
+
+    Table suffixes are composed as ``zm.._za.._frock.._icescomb``: the ice tag
+    is placed IN FRONT of the rock tag, so "is it already tagged?" has to look
+    anywhere in the suffix, not only at its start.  A build worker rebuilt
+    from ``_init_kwargs`` receives the fully tagged suffix and must not tag it
+    again, or it looks for a file that does not exist and silently inverts
+    raw VAL instead of the table (review 2026-09-18).
+    """
+    return ('_' + str(suffix).strip('_') + '_').find('_' + tag + '_') >= 0
+
+
+def _loadz_shuffled(path):
+    """np.load for tables that may or may not use the shuffled layout."""
+    return _ShuffledNPZ(path)
+
+
 ##### useful unit conversions #####
 
 mp = amu.to('g') # grams
@@ -1030,7 +1169,7 @@ class z_eos_val_mixtures:
         self.ices = None
         if self.ices_eos:
             from eos.ices_comb_eos import ICES_COMB_EOS
-            self.ices = ICES_COMB_EOS(s_gauge=ices_gauge)
+            self.ices = ICES_COMB_EOS(s_gauge=ices_gauge, smooth_z=smooth_z)
 
         # Z EOS instances keyed by canonical role
         # ('water', 'methane', 'ammonia', 'mg2sio4', 'iron').
@@ -1050,6 +1189,11 @@ class z_eos_val_mixtures:
             filled = self._build_filled_logs(eos_obj) if fill_z_nans else None
             self._logs_fn[key] = (filled if filled is not None
                                   else eos_obj.get_logs_pt)
+
+        # Hand the ices block this instance's own water, so the Z_m = Z_a = 0
+        # limit is the same object the legacy path mixes, not a second copy.
+        if self.ices is not None and 'water' in self.z:
+            self.ices.bind_water(self.z['water'], self._logs_fn.get('water'))
 
     # -----------------------------------------------------------------
     # construction helper
@@ -1941,6 +2085,7 @@ def _worker_init(init_kwargs, build_kind):
     """
     global _WORKER_EOS
     kwargs = dict(init_kwargs)
+    kwargs['rhop_tab'] = False          # no build reads the rho-P table
     if build_kind in ('sp', 'rhot', 'rhop'):
         kwargs['pt_tab'] = True
         kwargs['inv_tab'] = False
@@ -2005,8 +2150,10 @@ class hhe_z_mixtures():
     """H-He-Z EOS with pre-computed inversion tables.
 
     Wraps ``val_mixtures`` (smoothed H-He + Z species via VAL) and
-    serves the four basis inversions (S-P, ρ-T, ρ-P, S-ρ) used by
-    ORCHARD's hydrostatic, transport, and evolution solvers.
+    serves the basis inversions (S-P, ρ-T, S-ρ) used by ORCHARD's
+    hydrostatic, transport, and evolution solvers.  A ρ-P inversion also
+    exists but ORCHARD never reads it, so its table is opt-in
+    (``rhop_tab``).
 
     Pipeline overview
     -----------------
@@ -2057,6 +2204,7 @@ class hhe_z_mixtures():
                  pt_tab=True,
                  inv_tab=True,
                  srho_tab=False,
+                 rhop_tab=False,
                  y_prime=True,
                  yprime_clip=False,
                  logp_range=(6.0, 14.0), logp_step=0.05,
@@ -2064,11 +2212,17 @@ class hhe_z_mixtures():
                  logrho_range=(-8.0, 2.0), logrho_step=0.05,
                  interp_method='linear',
                  table_suffix='',
+                 table_dir=None,
                  f_rock=0.0,
                  rock_interp=None,
                  ices_eos=False,
                  ices_gauge='thirdlaw',
-                 ices_comp=None):
+                 ices_comp=None,
+                 ices_endmembers=False,
+                 ices_build=True,
+                 ices_build_workers=10,
+                 ices_rock_nodes=None,
+                 ices_build_log=None):
         """
         Parameters
         ----------
@@ -2092,13 +2246,27 @@ class hhe_z_mixtures():
             interpolation instead of raw VAL evaluation.
         inv_tab : bool
             If True (default), auto-load pre-computed inverted tables
-            (S-P, ρ-T, ρ-P) for fast inversions and derivatives.
+            (S-P, ρ-T) for fast inversions and derivatives.
             Set False to use on-the-fly root-finding.
         srho_tab : bool
             If True, also load the pre-computed S-ρ table when
             ``inv_tab=True``.  Default False — the S-ρ inversion
             uses the 1-D decomposition via the ρ-T or S-P tables
             instead of the pre-computed 2-D S-ρ table.
+        rhop_tab : bool
+            If True, also load the pre-computed ρ-P table (T(ρ, P)) when
+            ``inv_tab=True`` and the file exists.  Default False: ORCHARD
+            never reads it -- its (∂S/∂Y), (∂S/∂Z) at constant (ρ, P) use
+            the triple-product rule on the S-ρ table, and χ_Y/χ_T, χ_Z/χ_T
+            use the ρ-T table -- so skipping it saves ~65 MB per instance
+            (x3 under ``rock_interp``).  Without it, ``get_logt_rhop`` and
+            the functions built on it root-find on the forward model.
+            Per-composition ice/rock tables (``ices_endmembers``) are built
+            without a ρ-P table.  To add one, run ``eos_inversions.py --basis
+            rhop`` with the composition (``--ices_zm --ices_za --f_rock``),
+            ``--table_dir <its folder>`` and ``--smooth_inverted``; without
+            the composition flags it writes a pure-water table the
+            composition never loads.
         yprime_clip : bool
             If True, ``_to_yprime`` clips the converted Y' to [0, 1]
             (the tabulated Y' domain).  Protects high-Z cells where
@@ -2123,6 +2291,11 @@ class hhe_z_mixtures():
             ``{hhe}_{z}_{basis}_square_highz.npz`` instead. Pair with
             the ``--suffix`` flag of ``eos_inversions.py`` when building
             tables from the CLI.
+        table_dir : str or None
+            Folder the basis tables are read from and saved to.  Default
+            ``eos/<hhe_eos_name>`` (the v2.0 location).  A composition-
+            specific table set (see ``eos/endmembers.py``) lives in its own
+            folder so its files never collide with the shared tables.
         f_rock : float
             Fixed rock (mg2sio4) mass fraction WITHIN the metal budget Z
             (the nested sub-fraction ``_zr``, with ``_zm = _za = 0``).
@@ -2168,7 +2341,87 @@ class hhe_z_mixtures():
             root-finding) until they are.
         ices_gauge : {'thirdlaw', 'table'}
             Entropy gauge for that module ('thirdlaw' by default).
+        ices_comp : (float, float) or None
+            Nested ice sub-composition ``(Z_m, Z_a)`` this instance answers
+            at when a getter is called without ``_zm``/``_za`` -- which is
+            every ORCHARD call site; it also picks which table file loads.
+            None = pure water.
+        ices_endmembers : bool
+            Serve ONE exact table set at this instance's composition
+            (``ices_comp`` = (Z_m, Z_a), ``f_rock`` = Z_r), built from the
+            end-member P-T tables in ``eos/<hhe>/endmembers/`` (see
+            ``eos/endmembers.py``) and cached in its own folder there.  The
+            composition is fixed for the run, so nothing is interpolated
+            across composition and ``rock_interp`` is off.  Requires
+            ``ices_eos=True``.  Default False.
+        ices_build : bool
+            With ``ices_endmembers``: build a composition's missing tables on
+            first use (default True; ~15-25 min with 10 workers, S-rho peaks
+            near 23 GB; no rho-P table is built).  False raises instead, e.g. on a machine that should only
+            read a pre-built cache.
+        ices_build_workers : int
+            Worker processes for that build (default 10, as in EOS v2.0).
+        ices_rock_nodes : sequence of float or None
+            With ``ices_endmembers``: the rock fractions Z_r at which exact
+            table sets are served, for a run whose f_rock varies from cell to
+            cell (e.g. an f_rock struct profile).  With two or more nodes this
+            instance holds no tables itself: each node is an end-member
+            instance at (``ices_comp``, node) in its own cache folder, and
+            every quantity is interpolated linearly in the per-call rock
+            fraction (the 5th positional) between the two neighbouring nodes.
+            A query exactly on a node returns that node's table values.
+            Queries outside [first, last] node are clamped.  None (default)
+            or a single node serves one composition at ``f_rock`` (or at that
+            node).  ``table_dir`` is not supported with several nodes.
+        ices_build_log : callable or None
+            With ``ices_endmembers``: where build progress goes.  None
+            (default) prints.  A callable (e.g. ORCHARD's ``logger.info``)
+            receives the progress messages AND the build steps' own output,
+            which is still written to ``build_<basis>.log`` in the cache
+            folder as well.
         """
+
+        # --- End-member mode: one exact table set at this composition ----
+        # The metals are well mixed and fixed for a run, so the instance
+        # serves the tables built at exactly its (Z_m, Z_a, Z_r).  Degenerate
+        # compositions are collapsed first so that, e.g., every Z_m on
+        # Z_a = 1 shares one cache folder and one filename set.
+        self.ices_endmembers = bool(ices_endmembers)
+        self._ices_build_log = ices_build_log
+        _rock_nodes = None
+        if self.ices_endmembers:
+            if not ices_eos:
+                raise ValueError('ices_endmembers=True requires ices_eos=True')
+            if str(table_suffix).strip('_'):
+                raise ValueError('ices_endmembers=True names its tables itself; '
+                                 'table_suffix=%r is not supported' % table_suffix)
+            from eos import endmembers as _EM
+            _cm, _ca = (float(v) for v in (ices_comp or (0.0, 0.0)))
+            if ices_rock_nodes is not None and len(ices_rock_nodes) > 1:
+                # Several rock fractions: this instance only interpolates
+                # between exact per-node table sets (built below), each in its
+                # own composition folder.
+                _rock_nodes = tuple(sorted(float(v) for v in ices_rock_nodes))
+                if (len(set(_rock_nodes)) != len(_rock_nodes)
+                        or not 0.0 <= _rock_nodes[0] <= _rock_nodes[-1] <= 1.0):
+                    raise ValueError('ices_rock_nodes must be distinct rock '
+                                     'fractions in [0, 1]; got %r' % (ices_rock_nodes,))
+                if len(_rock_nodes) > 32:          # np.choose's limit (numpy 1.x)
+                    raise ValueError('at most 32 ices_rock_nodes (each is a full '
+                                     'table set); got %d' % len(_rock_nodes))
+                _rock_nodes = tuple(v + 0.0 for v in _rock_nodes)   # no -0.0
+                if table_dir is not None:
+                    raise ValueError('ices_rock_nodes: every node has its own cache '
+                                     'folder; table_dir is not supported')
+                _cm, _ca = _EM.canonical(_cm, _ca, 0.0)[:2]
+                ices_comp, f_rock, rock_interp = (_cm, _ca), 0.0, True
+            else:
+                if ices_rock_nodes is not None:
+                    f_rock = float(ices_rock_nodes[0])
+                _cm, _ca, _cr = _EM.canonical(_cm, _ca, float(f_rock))
+                ices_comp, f_rock, rock_interp = (_cm, _ca), _cr, False
+                if table_dir is None:
+                    table_dir = _EM.composition_dir(_cm, _ca, _cr, hhe_eos_name)
 
         # --- 3-point rock-fraction interpolation across precomputed sets -
         # Auto-detect: interpolation is needed iff the requested rock
@@ -2182,8 +2435,9 @@ class hhe_z_mixtures():
                                   for g in _ROCK_TABLE_FRACS)
         self.rock_interp = bool(rock_interp)
         _sub_pt_tab, _sub_inv_tab, _sub_srho_tab = pt_tab, inv_tab, srho_tab
+        _sub_rhop_tab = rhop_tab
         if self.rock_interp:
-            pt_tab = inv_tab = srho_tab = False
+            pt_tab = inv_tab = srho_tab = rhop_tab = False
             f_rock = 0.0   # the main instance carries no single rock fraction
 
         # --- Fixed rock mass fraction within Z (nested _zr) -------------
@@ -2198,9 +2452,15 @@ class hhe_z_mixtures():
                     species_list = list(species_list) + ['mg2sio4']
             # Select the rock-fraction-tagged tables (frock tag first,
             # like eos_inversions.py).
+            # Idempotent, like the icescomb tag below: eos_inversions.py
+            # composes this suffix itself before constructing, and a build
+            # worker rebuilt from _init_kwargs carries the already-tagged
+            # suffix.  Without the guard either route lands on
+            # *_frock0.50_frock0.50.
             _rock_tag = f'frock{self.f_rock:.2f}'
             _suff = str(table_suffix).strip('_')
-            table_suffix = f'{_rock_tag}_{_suff}' if _suff else _rock_tag
+            if not _suffix_has_tag(_suff, _rock_tag):
+                table_suffix = f'{_rock_tag}_{_suff}' if _suff else _rock_tag
 
         # --- Ternary ices module (water + CH4 + NH3 in one VAL block) ---
         # The forward model differs from the legacy per-species path, so
@@ -2228,7 +2488,7 @@ class hhe_z_mixtures():
         if self.ices_comp is not None:
             _ice_tag = f'zm{self.ices_comp[0]:.3f}_za{self.ices_comp[1]:.3f}'
             _suff = str(table_suffix).strip('_')
-            if not _suff.startswith(_ice_tag):
+            if not _suffix_has_tag(_suff, _ice_tag):
                 table_suffix = f'{_ice_tag}_{_suff}' if _suff else _ice_tag
 
         _suff = str(table_suffix).strip('_')
@@ -2241,9 +2501,12 @@ class hhe_z_mixtures():
         # Normalize: strip leading/trailing underscores so callers can
         # pass either 'highz' or '_highz' and get the same filename.
         self.table_suffix = str(table_suffix).strip('_')
+        self.table_dir = (None if table_dir is None
+                          else os.path.abspath(str(table_dir)))
         self.pt_tab = pt_tab
         self.inv_tab = inv_tab
         self.srho_tab = srho_tab
+        self.rhop_tab = bool(rhop_tab)
         self.y_prime = y_prime
         self.yprime_clip = bool(yprime_clip)
         self._interp_method = interp_method
@@ -2257,6 +2520,7 @@ class hhe_z_mixtures():
             species_list=species_list,
             z_eos=z_eos,
             pt_tab=pt_tab, inv_tab=inv_tab, srho_tab=srho_tab,
+            rhop_tab=self.rhop_tab,
             y_prime=y_prime,
             logp_range=logp_range, logp_step=logp_step,
             logt_range=logt_range,
@@ -2265,6 +2529,12 @@ class hhe_z_mixtures():
             table_suffix=table_suffix,
             ices_eos=ices_eos, ices_gauge=ices_gauge,
             ices_comp=self.ices_comp,
+            # a build worker must read the SAME tables as its parent: same
+            # folder, same rock fraction, and never rock_interp (a builder
+            # evaluates its own composition directly)
+            table_dir=self.table_dir,
+            f_rock=self.f_rock,
+            rock_interp=False,
         )
 
         # --- Forward-model mixer ---
@@ -2295,6 +2565,7 @@ class hhe_z_mixtures():
         # 2026-09-10; those are read as pure water so the gate below keeps its
         # historical behaviour exactly.
         self._pt_tab_comp = None
+        self._sp_tab_comp = None
         self._s_pt_rgi = None
         self._logrho_pt_rgi = None
         self._logu_pt_rgi = None
@@ -2309,11 +2580,16 @@ class hhe_z_mixtures():
         self._svals_srho = None    # 1-D S grid for square S-rho tables
 
         # --- Auto-load tables based on pt_tab / inv_tab / srho_tab flags ---
+        if self.ices_endmembers and not self.rock_interp:
+            self._ensure_endmember_tables(ices_build, ices_build_workers,
+                                          ices_build_log)
         self._auto_load_tables()
 
-        # --- Rock-fraction interpolation sub-instances (f_rock=0,0.5,1) ---
+        # --- Rock-fraction interpolation sub-instances (f_rock=0,0.5,1, or
+        #     the end-member rock nodes) ---
+        self._rock_nodes_mode = _rock_nodes is not None
         if self.rock_interp:
-            self._rock_fracs = (0.0, 0.5, 1.0)
+            self._rock_fracs = _rock_nodes or (0.0, 0.5, 1.0)
             _sub_base = dict(
                 hhe_eos_name=hhe_eos_name, hg=hg,
                 smooth_hhe=smooth_hhe, smooth_z=smooth_z,
@@ -2323,40 +2599,77 @@ class hhe_z_mixtures():
                 logt_range=logt_range,
                 logrho_range=logrho_range, logrho_step=logrho_step,
                 pt_tab=_sub_pt_tab, inv_tab=_sub_inv_tab,
-                srho_tab=_sub_srho_tab, y_prime=y_prime,
+                srho_tab=_sub_srho_tab, rhop_tab=_sub_rhop_tab, y_prime=y_prime,
                 yprime_clip=yprime_clip,
                 ices_eos=ices_eos, ices_gauge=ices_gauge,
+                # the subs hold the parent's ICE composition at their own rock
+                # fraction; without it they loaded pure-water-ice tables
+                ices_comp=self.ices_comp, table_dir=self.table_dir,
                 rock_interp=False)
-            self._rock_subs = [
-                hhe_z_mixtures(species_list=['water_revised'],
-                               f_rock=fr, **_sub_base)
-                for fr in self._rock_fracs]
+            if not self._rock_nodes_mode:
+                self._rock_subs = [
+                    hhe_z_mixtures(species_list=['water_revised'],
+                                   f_rock=fr, **_sub_base)
+                    for fr in self._rock_fracs]
+            else:
+                # Each node is an end-member instance in its own folder.
+                # Build every missing node first (subs constructed without
+                # loading anything), then load them all, so a ~23 GB build
+                # never runs on top of tables already held in memory.
+                _load = dict(pt_tab=_sub_pt_tab, inv_tab=_sub_inv_tab,
+                             srho_tab=_sub_srho_tab, rhop_tab=_sub_rhop_tab)
+                _sub_base.update(pt_tab=False, inv_tab=False, srho_tab=False,
+                                 rhop_tab=False, table_dir=None,
+                                 ices_endmembers=True, ices_build=ices_build,
+                                 ices_build_workers=ices_build_workers,
+                                 ices_build_log=ices_build_log)
+                self._rock_subs = [
+                    hhe_z_mixtures(species_list=['water_revised'],
+                                   f_rock=fr, **_sub_base)
+                    for fr in self._rock_fracs]
+                for s in self._rock_subs:
+                    for k, v in _load.items():
+                        setattr(s, k, bool(v) if k == 'rhop_tab' else v)
+                    s._init_kwargs.update(_load)
+                    s._auto_load_tables()
 
     # =================================================================
     # Rock-fraction interpolation helper
     # =================================================================
 
-    def _interp_rock(self, frock, v0, v05, v1):
-        """3-point piecewise-linear interpolation in rock fraction over
-        the precomputed sets at f_rock = 0, 0.5, 1.0.
+    def _interp_rock(self, frock, *vals):
+        """Piecewise-linear interpolation in rock fraction over the sub-
+        instances' rock fractions ``self._rock_fracs`` (the precomputed sets
+        at f_rock = 0, 0.5, 1.0, or the end-member rock nodes).
 
         Handles scalar or array values and tuple returns (e.g. the S-ρ
         inversion returns ``(logP, logT)``).  ``frock`` is clipped to
-        [0, 1] and may be a scalar or a per-cell array broadcastable
-        against the returned values.
+        [first, last] node and may be a scalar or a per-cell array
+        broadcastable against the returned values.  A value exactly on an
+        interior node uses the segment below it (t = 1), as the original
+        3-point rule did, so the (0, 0.5, 1) results are unchanged bit for
+        bit.  With end-member rock nodes, a query exactly on a node returns
+        that node's value itself (``lo + (hi - lo)`` need not round to
+        ``hi``, and a NaN at the other node must not leak in).
         """
-        if isinstance(v0, tuple):
-            return tuple(self._interp_rock(frock, a, b, c)
-                         for a, b, c in zip(v0, v05, v1))
-        f = np.clip(np.asarray(frock, dtype=float), 0.0, 1.0)
-        a0 = np.asarray(v0, dtype=float)
-        a1 = np.asarray(v05, dtype=float)
-        a2 = np.asarray(v1, dtype=float)
-        lower = f <= 0.5
-        t = np.where(lower, f / 0.5, (f - 0.5) / 0.5)
-        lo = np.where(lower, a0, a1)
-        hi = np.where(lower, a1, a2)
+        if isinstance(vals[0], tuple):
+            return tuple(self._interp_rock(frock, *comp) for comp in zip(*vals))
+        nodes = np.asarray(self._rock_fracs, dtype=float)
+        f = np.clip(np.asarray(frock, dtype=float), nodes[0], nodes[-1])
+        if getattr(self, '_rock_nodes_mode', False):
+            # a profile value one rounding away from a node (0.30000000000000004
+            # from an accumulated delta) is that node
+            gap = np.abs(f[..., None] - nodes)
+            f = np.where(gap.min(axis=-1) <= 1e-9, nodes[gap.argmin(axis=-1)], f)
+        arrs = [np.asarray(v, dtype=float) for v in vals]
+        seg = np.clip(np.searchsorted(nodes, f, side='left') - 1,
+                      0, len(nodes) - 2)
+        t = (f - nodes[seg]) / (nodes[seg + 1] - nodes[seg])
+        lo = np.choose(seg, arrs)
+        hi = np.choose(seg + 1, arrs)
         out = lo + (hi - lo) * t
+        if getattr(self, '_rock_nodes_mode', False):
+            out = np.where(t == 0.0, lo, np.where(t == 1.0, hi, out))
         if np.ndim(out) == 0:
             return float(out)
         return out
@@ -2379,13 +2692,50 @@ class hhe_z_mixtures():
         if self.table_suffix:
             stem, ext = os.path.splitext(fname)
             fname = f'{stem}_{self.table_suffix}{ext}'
-        return os.path.join(CURR_DIR, self.hhe_eos_name, fname)
+        folder = self.table_dir or os.path.join(CURR_DIR, self.hhe_eos_name)
+        return os.path.join(folder, fname)
+
+    def _ensure_endmember_tables(self, build, n_workers, log=None):
+        """Make sure this composition's tables (P-T + ``INV_BASES``) exist.
+
+        ``log`` (None = print) receives the progress messages; when it is
+        given, the build steps' own output is forwarded to it too.
+        """
+        from eos import endmembers as _EM
+        say = log or print
+        paths = {b: self._table_path(b) for b in ('pt',) + _EM.INV_BASES}
+        folder = os.path.dirname(paths['pt'])
+        missing = [b for b, p in paths.items() if not os.path.exists(p)]
+        zm, za = self.ices_comp if self.ices_comp is not None else (0.0, 0.0)
+        if not missing and _EM.cache_is_current(paths['pt'], self.hhe_eos_name):
+            _EM.ensure_heatmaps(folder, zm, za, self.f_rock, paths,
+                                hhe=self.hhe_eos_name, log=say)
+            return
+        if not missing:
+            missing = ['all (built from end-members that have since changed)']
+        if not build:
+            raise FileNotFoundError(
+                'no cached %s table(s) for (Z_m, Z_a, Z_r) = (%g, %g, %g) in %s; '
+                'construct with ices_build=True to build them (~15-25 min)'
+                % ('/'.join(missing), zm, za, self.f_rock, folder))
+        say('hhe_z_mixtures: no complete table set for (Z_m, Z_a, Z_r) = '
+            '(%g, %g, %g) in %s (missing %s); building it with %d workers '
+            '(~15-25 min, S-rho step peaks near 23 GB), or waiting for '
+            'another process that is building it'
+            % (zm, za, self.f_rock, folder, '/'.join(missing), int(n_workers)))
+        if log is None:
+            import sys as _sys
+            _sys.stdout.flush()
+        _EM.build_tables(zm, za, self.f_rock, paths, hhe=self.hhe_eos_name,
+                         z_eos=self.z_eos_label, n_workers=n_workers,
+                         log=say, forward=log)
 
     def _auto_load_tables(self):
         """Try to load pre-computed tables from disk.
 
         Controlled by ``self.pt_tab`` (P-T basis table),
-        ``self.inv_tab`` (inverted S-P, ρ-T, ρ-P tables), and
+        ``self.inv_tab`` (inverted S-P and ρ-T tables),
+        ``self.rhop_tab`` (ρ-P table, loaded only when True) and
         ``self.srho_tab`` (S-ρ table, loaded only when True).  Each
         table is loaded from its canonical ``_square.npz`` path when
         the file is present.
@@ -2396,7 +2746,7 @@ class hhe_z_mixtures():
                 self.load_pt_table(pt_path)
 
         if self.inv_tab:
-            for basis in ('sp', 'rhot', 'rhop'):
+            for basis in ('sp', 'rhot') + (('rhop',) if self.rhop_tab else ()):
                 path = self._table_path(basis)
                 if os.path.isfile(path):
                     getattr(self, f'load_{basis}_table')(path)
@@ -2458,10 +2808,7 @@ class hhe_z_mixtures():
         # Default to the composition this instance declares, so that the
         # table written to `_table_path('pt')` always matches the composition
         # encoded in that filename.
-        _c_zm, _c_za = self.ices_comp if self.ices_comp is not None else (0.0, 0.0)
-        _zm = _c_zm if _zm is None else float(_zm)
-        _za = _c_za if _za is None else float(_za)
-        _zr = float(self.f_rock) if _zr is None else float(_zr)
+        _zm, _za, _zr = self._builder_comp(_zm, _za, _zr)
 
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
@@ -2597,14 +2944,8 @@ class hhe_z_mixtures():
         ``comp`` is the nested (_zm, _za, _zr) the table was evaluated at, or
         None for a table that does not record one (read as pure water).
         """
-        # A table that records no composition is read as (0, 0, 0), which
-        # makes the gate below behave exactly as it did before `tab_comp`
-        # existed.  That is deliberately conservative for the frock-tagged
-        # tables: they really do hold self.f_rock, so reading them as pure
-        # water leaves them unreachable -- but changing that would silently
-        # move every existing f_rock > 0 result.  Rebuild them with
-        # `build_pt_table` (which now records the composition) to make them
-        # serve the rock fraction they were built at.
+        # `comp` is always given by the loaders (see `_table_comp`, which
+        # infers it for legacy files); None is kept only for direct callers.
         self._pt_tab_comp = (None if comp is None
                              else tuple(float(c) for c in comp))
         rgi_kw = dict(method='linear', bounds_error=False,
@@ -2619,12 +2960,11 @@ class hhe_z_mixtures():
     def load_pt_table(self, path):
         """Load a pre-computed P-T table from NPZ.
 
-        A table written before 2026-09-10 carries no ``tab_comp``; it is read
-        as pure water, which is what those builds actually contain.
+        A table written before 2026-09-10 carries no ``tab_comp``; its
+        composition is inferred by ``_table_comp``.
         """
-        data = np.load(path)
-        comp = tuple(np.asarray(data['tab_comp'], dtype=float).ravel()[:3]) \
-            if 'tab_comp' in data.files else None
+        data = _loadz_shuffled(path)
+        comp = self._table_comp(data)
         self._load_pt_from_arrays(
             data['logpvals'], data['logtvals'],
             data['yvals'], data['zvals'],
@@ -2645,7 +2985,7 @@ class hhe_z_mixtures():
         if path is None:
             path = self._table_path('pt')
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(path, **result)
+        _savez_shuffled(path, **result)
         print(f"Saved {path}")
 
     # =================================================================
@@ -2725,8 +3065,9 @@ class hhe_z_mixtures():
         """
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr)
         if self.rock_interp:
-            return self._interp_rock(_zr, *[s._s_pt(lgp, lgt, yp, z, _zm, _za)
-                                            for s in self._rock_subs])
+            return self._interp_rock(_zr, *[
+                s._s_pt(lgp, lgt, yp, z, _zm, _za, s.f_rock)
+                for s in self._rock_subs])
         # the P-T table is built at ONE ice/rock sub-composition, so it cannot
         # answer for a state whose nested sub-fractions differ from it.  This is
         # the forward model `get_logt_sp` inverts: without the guard the solver
@@ -2740,8 +3081,9 @@ class hhe_z_mixtures():
         """logrho(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr)
         if self.rock_interp:
-            return self._interp_rock(_zr, *[s._logrho_pt(lgp, lgt, yp, z, _zm, _za)
-                                            for s in self._rock_subs])
+            return self._interp_rock(_zr, *[
+                s._logrho_pt(lgp, lgt, yp, z, _zm, _za, s.f_rock)
+                for s in self._rock_subs])
         # the P-T table is built at ONE ice/rock sub-composition, so it cannot
         # answer for a state whose nested sub-fractions differ from it.  This is
         # the forward model `get_logt_sp` inverts: without the guard the solver
@@ -2755,8 +3097,9 @@ class hhe_z_mixtures():
         """logU(P, T, Y', Z) — uses table RGI if loaded, else VAL."""
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr)
         if self.rock_interp:
-            return self._interp_rock(_zr, *[s._logu_pt(lgp, lgt, yp, z, _zm, _za)
-                                            for s in self._rock_subs])
+            return self._interp_rock(_zr, *[
+                s._logu_pt(lgp, lgt, yp, z, _zm, _za, s.f_rock)
+                for s in self._rock_subs])
         # the P-T table is built at ONE ice/rock sub-composition, so it cannot
         # answer for a state whose nested sub-fractions differ from it.  This is
         # the forward model `get_logt_sp` inverts: without the guard the solver
@@ -2791,6 +3134,48 @@ class hhe_z_mixtures():
             _zr = _frock
         return _zm, _za, _zr
 
+    def _builder_comp(self, _zm, _za, _zr):
+        """Composition a table builder builds: explicit values, else this
+        instance's own (``ices_comp`` and ``f_rock``), so a table written to
+        ``_table_path`` always holds the composition its filename encodes."""
+        c_zm, c_za = self.ices_comp if self.ices_comp is not None else (0.0, 0.0)
+        return (c_zm if _zm is None else float(_zm),
+                c_za if _za is None else float(_za),
+                float(self.f_rock) if _zr is None else float(_zr))
+
+    def _table_comp(self, data):
+        """The nested (_zm, _za, _zr) a loaded table was built at.
+
+        Tables record it as ``tab_comp``.  A legacy table written before that
+        record existed is inferred to hold the composition this instance
+        loaded it FOR: ``ices_comp`` (pure water if None) and ``self.f_rock``.
+        That is what the filename encodes -- the frock-tagged v2.0 tables were
+        built at their rock fraction, and the untagged ones at pure water.
+
+        Reading every legacy table as pure water (the rule before 2026-09-18)
+        made the frock tables unreachable at the rock fraction ORCHARD passes:
+        the P-T getters silently fell back to VAL and ``get_logt_sp`` dropped
+        into a slow path that raised TypeError on arrays, so every aquarock
+        (f_rock_ini > 0) run crashed at init.
+        """
+        if 'tab_comp' in data.files:
+            return tuple(float(c) for c in
+                         np.asarray(data['tab_comp'], dtype=float).ravel()[:3])
+        c_zm, c_za = self.ices_comp if self.ices_comp is not None else (0.0, 0.0)
+        return (float(c_zm), float(c_za), float(self.f_rock))
+
+    @staticmethod
+    def _off_composition(ref, _zm, _za, _zr):
+        """True if any query sub-fraction differs from the table's ``ref``."""
+        c_zm, c_za, c_zr = ref or (0.0, 0.0, 0.0)
+        for frac, c in ((_zm, c_zm), (_za, c_za), (_zr, c_zr)):
+            if frac is None:
+                frac = 0.0
+            a = np.atleast_1d(np.asarray(frac, dtype=float))
+            if float(np.max(np.abs(a - c))) > _COMP_TOL:
+                return True
+        return False
+
     def _pt_tab_off_composition(self, _zm, _za, _zr):
         """True when the loaded P-T table cannot answer for this composition.
 
@@ -2808,34 +3193,28 @@ class hhe_z_mixtures():
         array from the table and part from VAL would mix two forward models
         inside a single call.
         """
-        c_zm, c_za, c_zr = self._pt_tab_comp or (0.0, 0.0, 0.0)
-        for frac, ref in ((_zm, c_zm), (_za, c_za), (_zr, c_zr)):
-            if frac is None:
-                frac = 0.0
-            a = np.atleast_1d(np.asarray(frac, dtype=float))
-            if float(np.max(np.abs(a - ref))) > _COMP_TOL:
-                return True
-        return False
+        return self._off_composition(self._pt_tab_comp,
+                                     *self._gate_comp(_zm, _za, _zr))
 
-    @staticmethod
-    def _ice_subs_active(*fracs):
-        """True if any nested ice/rock sub-fraction is non-zero.
+    def _gate_comp(self, _zm, _za, _zr):
+        """The query sub-fractions as the table gates compare them.
 
-        The 4-D (logP, logT, Y, Z) tables are built at ONE ice
-        sub-composition, so they cannot represent (_zm, _za, _zr); when any
-        of them is set the getters must fall back to the direct
-        ``val_mixtures`` evaluation.  Before 2026-09-08 the forward getters
-        dropped these arguments silently: ``get_s_pt`` returned the same
-        entropy for pure methane, pure ammonia and pure rock, while
-        ``get_logt_sp`` honoured them, so the (S,P) round trip missed by up
-        to 1.4 dex in logT.
+        An end-member instance's tables hold a canonical composition
+        (``endmembers.canonical``: every (Z_m, Z_a) on Z_r = 1 is pure rock,
+        every Z_m on Z_a = 1 is ammonia + rock), so its queries are collapsed
+        the same way first.  A rock node at Z_r = 1, asked at the run's ice
+        fractions, then stays on its tables.  Any other instance compares
+        the fractions as given.
         """
-        for f in fracs:
-            if f is None:
-                continue
-            if float(np.max(np.abs(np.atleast_1d(np.asarray(f, dtype=float))))) > 0.0:
-                return True
-        return False
+        if not getattr(self, 'ices_endmembers', False):
+            return _zm, _za, _zr
+        zm = np.asarray(0.0 if _zm is None else _zm, dtype=float)
+        za = np.asarray(0.0 if _za is None else _za, dtype=float)
+        zr = np.asarray(0.0 if _zr is None else _zr, dtype=float)
+        rock = zr == 1.0
+        zm = np.where(rock | (za == 1.0), 0.0, zm)
+        za = np.where(rock, 0.0, za)
+        return zm, za, zr
 
     def get_s_pt_tab(self, _lgp, _lgt, _y, _z, _frock=0.0,
                      val=False, _zm=None, _za=None, _zr=None, **kw):
@@ -2846,11 +3225,12 @@ class hhe_z_mixtures():
         """
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
-            # rock is carried by the three precomputed sub-tables, so _zr must
-            # NOT be applied again inside val (it would be counted twice)
+            # each sub-instance holds ONE rock fraction (0, 0.5 or 1), so it
+            # is queried at that fraction: its tables serve it, and its VAL
+            # fallback evaluates its own mixture rather than pure water
             return self._interp_rock(_zr, *[
                 s.get_s_pt_tab(_lgp, _lgt, _y, _z, val=val,
-                      _zm=_zm, _za=_za, _zr=0.0, **kw)
+                      _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         _y = self._to_yprime(_y, _z)
         # the tables carry one ice sub-composition; anything else must be
@@ -2880,11 +3260,12 @@ class hhe_z_mixtures():
         """
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
-            # rock is carried by the three precomputed sub-tables, so _zr must
-            # NOT be applied again inside val (it would be counted twice)
+            # each sub-instance holds ONE rock fraction (0, 0.5 or 1), so it
+            # is queried at that fraction: its tables serve it, and its VAL
+            # fallback evaluates its own mixture rather than pure water
             return self._interp_rock(_zr, *[
                 s.get_logrho_pt_tab(_lgp, _lgt, _y, _z, val=val,
-                      _zm=_zm, _za=_za, _zr=0.0, **kw)
+                      _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         _y = self._to_yprime(_y, _z)
         # the tables carry one ice sub-composition; anything else must be
@@ -2913,11 +3294,12 @@ class hhe_z_mixtures():
         """
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
-            # rock is carried by the three precomputed sub-tables, so _zr must
-            # NOT be applied again inside val (it would be counted twice)
+            # each sub-instance holds ONE rock fraction (0, 0.5 or 1), so it
+            # is queried at that fraction: its tables serve it, and its VAL
+            # fallback evaluates its own mixture rather than pure water
             return self._interp_rock(_zr, *[
                 s.get_logu_pt_tab(_lgp, _lgt, _y, _z, val=val,
-                      _zm=_zm, _za=_za, _zr=0.0, **kw)
+                      _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         _y = self._to_yprime(_y, _z)
         # the tables carry one ice sub-composition; anything else must be
@@ -3310,10 +3692,10 @@ class hhe_z_mixtures():
             _zr = kw.pop('_frock')
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
-            # rock comes from the three sub-tables; _zr must not be re-applied
+            # each sub-instance is queried at its own rock fraction
             return self._interp_rock(_zr, *[
                 s.get_logt_sp(_s_kb, _lgp, _yp, _z, use_tab=use_tab,
-                              _zm=_zm, _za=_za, _zr=0.0, **kw)
+                              _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
 
@@ -3328,9 +3710,11 @@ class hhe_z_mixtures():
             return err
 
         # --- Fast path: pre-computed table ---
-        # the S-P table is built at ONE ice sub-composition too, so it cannot
-        # answer for a state whose nested sub-fractions differ from it
-        if self._ice_subs_active(_zm, _za, _zr):
+        # the S-P table is built at ONE ice/rock sub-composition, so it serves
+        # only queries at that composition (read from the table, or inferred
+        # for a legacy file); anything else takes the per-point solver
+        if self._off_composition(self._sp_tab_comp,
+                                 *self._gate_comp(_zm, _za, _zr)):
             use_tab = False
         if use_tab and self._logt_sp_rgi is not None:
             result = self._lookup_sp_table(_s_kb, _lgp, _yp, _z)
@@ -3345,13 +3729,14 @@ class hhe_z_mixtures():
                 _p_arr = np.atleast_1d(np.asarray(_lgp, dtype=float))
                 _yp_arr = np.atleast_1d(np.asarray(_yp, dtype=float))
                 _z_arr = np.atleast_1d(np.asarray(_z, dtype=float))
-                _s_arr, _p_arr, _yp_arr, _z_arr = np.broadcast_arrays(
-                    _s_arr, _p_arr, _yp_arr, _z_arr)
+                _zm_arr, _za_arr, _zr_arr = (
+                    np.atleast_1d(np.asarray(v, dtype=float))
+                    for v in (_zm, _za, _zr))
+                (_s_arr, _p_arr, _yp_arr, _z_arr,
+                 _zm_arr, _za_arr, _zr_arr) = np.broadcast_arrays(
+                    _s_arr, _p_arr, _yp_arr, _z_arr, _zm_arr, _za_arr, _zr_arr)
                 out = result_arr.copy()
                 bad = ~np.isfinite(out)
-                _zm_s = float(np.atleast_1d(_zm).ravel()[0])
-                _za_s = float(np.atleast_1d(_za).ravel()[0])
-                _zr_s = float(np.atleast_1d(_zr).ravel()[0])
                 if bad.any():
                     prev_sol = None
                     for idx in np.where(bad.ravel())[0]:
@@ -3360,7 +3745,9 @@ class hhe_z_mixtures():
                         yp_i = float(_yp_arr.ravel()[idx])
                         z_i = float(_z_arr.ravel()[idx])
                         err_f = _make_err(s_i, p_i, yp_i, z_i,
-                                          _zm_s, _za_s, _zr_s)
+                                          float(_zm_arr.ravel()[idx]),
+                                          float(_za_arr.ravel()[idx]),
+                                          float(_zr_arr.ravel()[idx]))
                         guess = (prev_sol if prev_sol is not None
                                  else ideal_xy.get_t_sp(s_i, p_i, yp_i))
                         sol, ok = self._newton_1d(
@@ -3371,20 +3758,27 @@ class hhe_z_mixtures():
                 return out.reshape(result_arr.shape)
 
         # --- Slow path: per-point Newton-Raphson ---
+        # Every input is broadcast to one shape and the solver is handed ONE
+        # point at a time.  It used to receive the whole Y'/Z/composition
+        # arrays and raised TypeError on any array query that reached it --
+        # e.g. an ORCHARD array whose per-cell f_rock differs from the table.
         scalar_input = np.isscalar(_s_kb) and np.isscalar(_lgp)
-        _s_kb = np.atleast_1d(np.asarray(_s_kb, dtype=float))
-        _lgp  = np.atleast_1d(np.asarray(_lgp, dtype=float))
-        _s_kb, _lgp = np.broadcast_arrays(_s_kb, _lgp)
+        (_s_kb, _lgp, _yp_a, _z_a, _zm_a, _za_a, _zr_a) = np.broadcast_arrays(
+            *(np.atleast_1d(np.asarray(v, dtype=float))
+              for v in (_s_kb, _lgp, _yp, _z, _zm, _za, _zr)))
         out = np.full_like(_s_kb, np.nan, dtype=float)
 
         prev_sol = None
         for idx in np.ndindex(_s_kb.shape):
             s_i   = float(_s_kb[idx])
             lgp_i = float(_lgp[idx])
+            yp_i  = float(_yp_a[idx])
 
-            err_f = _make_err(s_i, lgp_i, _yp, _z, _zm, _za, _zr)
+            err_f = _make_err(s_i, lgp_i, yp_i, float(_z_a[idx]),
+                              float(_zm_a[idx]), float(_za_a[idx]),
+                              float(_zr_a[idx]))
             guess = (prev_sol if prev_sol is not None
-                     else ideal_xy.get_t_sp(s_i, lgp_i, _yp))
+                     else ideal_xy.get_t_sp(s_i, lgp_i, yp_i))
             sol, ok = self._newton_1d(err_f, guess, 1.5, 7.0)
             if np.isfinite(sol):
                 out[idx] = sol
@@ -3406,7 +3800,8 @@ class hhe_z_mixtures():
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
             return self._interp_rock(_zr, *[
-                s.get_logrho_sp(_s_kb, _lgp, _yp, _z, **kw)
+                s.get_logrho_sp(_s_kb, _lgp, _yp, _z,
+                                _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         # Y->Y' conversion bug fix (2026-08): get_logt_sp is the PUBLIC
         # method and converts internally -- passing an already-converted
@@ -3464,13 +3859,14 @@ class hhe_z_mixtures():
         logrho is not stored — it is computed on-the-fly from the
         forward model via ``get_logrho_sp``.
         """
-        data = np.load(path)
+        data = _loadz_shuffled(path)
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
         self._load_sp_from_arrays(
             data['svals'], data['logpvals'],
             data['yvals'], data['zvals'],
             data['logt_sp'])
+        self._sp_tab_comp = self._table_comp(data)
 
     # =================================================================
     # NaN repair for tables
@@ -3808,7 +4204,7 @@ class hhe_z_mixtures():
         return out
 
     def build_sp_table(self, yvals, zvals,
-                       _zm=0.0, _za=0.0, _zr=0.0,
+                       _zm=None, _za=None, _zr=None,
                        s_lo=4.0, s_hi=12.0, s_step=0.1,
                        smooth_inverted=False,
                        n_workers=1,
@@ -3847,6 +4243,7 @@ class hhe_z_mixtures():
                  logt_sp (nS, nP, nY, nZ), logt_min, logt_max.
             Also loads the table into this instance.
         """
+        _zm, _za, _zr = self._builder_comp(_zm, _za, _zr)
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
         svals = np.arange(s_lo, s_hi + s_step * 0.1, s_step)
@@ -3940,6 +4337,7 @@ class hhe_z_mixtures():
 
         # Load into this instance
         self._load_sp_from_arrays(svals, logp, yvals, zvals, logt_sp_f32)
+        self._sp_tab_comp = (_zm, _za, _zr)
 
         if verbose:
             n_total = logt_sp.size
@@ -3956,7 +4354,7 @@ class hhe_z_mixtures():
         if path is None:
             path = self._table_path('sp')
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(path, **result)
+        _savez_shuffled(path, **result)
         print(f"Saved {path}")
 
     # =================================================================
@@ -3978,7 +4376,8 @@ class hhe_z_mixtures():
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
             return self._interp_rock(_zr, *[
-                s.get_logp_rhot(_lgrho, _lgt, _yp, _z, use_tab=use_tab, **kw)
+                s.get_logp_rhot(_lgrho, _lgt, _yp, _z, use_tab=use_tab,
+                                _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         # Y->Y' conversion bug fix (2026-08): the table's axis 2 is Y',
         # but the fast path used to feed it the caller's ABSOLUTE Y (the
@@ -4040,7 +4439,7 @@ class hhe_z_mixtures():
 
     def load_rhot_table(self, path):
         """Load a pre-computed ρ-T → P table from NPZ."""
-        data = np.load(path)
+        data = _loadz_shuffled(path)
         inv_rgi_kw = dict(method=self._interp_method, bounds_error=False,
                           fill_value=None)
         logt = data['logtvals']
@@ -4082,7 +4481,7 @@ class hhe_z_mixtures():
         return out
 
     def build_rhot_table(self, yvals, zvals,
-                         _zm=0.0, _za=0.0, _zr=0.0,
+                         _zm=None, _za=None, _zr=None,
                          smooth_inverted=False,
                          n_workers=1,
                          verbose=True):
@@ -4105,6 +4504,7 @@ class hhe_z_mixtures():
         verbose : bool
             Print progress.
         """
+        _zm, _za, _zr = self._builder_comp(_zm, _za, _zr)
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
         logrho = self.logrho_vals
@@ -4206,7 +4606,7 @@ class hhe_z_mixtures():
         if path is None:
             path = self._table_path('rhot')
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(path, **result)
+        _savez_shuffled(path, **result)
         print(f"Saved {path}")
 
     # =================================================================
@@ -4224,29 +4624,45 @@ class hhe_z_mixtures():
         if self._logt_rhop_rgi is not None:
             return self._lookup_rhop_table(_lgrho, _lgp, _yp, _z)
 
-        # Slow path: Newton-Raphson per point
-        scalar = np.isscalar(_lgrho) and np.isscalar(_lgp)
-        _lgrho = np.atleast_1d(np.asarray(_lgrho, dtype=float))
-        _lgp   = np.atleast_1d(np.asarray(_lgp, dtype=float))
-        _lgrho, _lgp = np.broadcast_arrays(_lgrho, _lgp)
+        # Slow path: Newton-Raphson per point.  Every input is broadcast and
+        # the solver gets ONE point at a time (it used to receive the whole
+        # Y'/Z arrays and raised TypeError on array queries), and only a
+        # converged root is kept: an unconverged Newton pinned at the bracket
+        # edge used to come back as logT = 1.5 instead of NaN.  _newton_1d
+        # returns early when a clipped step stalls, before its own bracket
+        # search, so a stalled point gets one brentq over [1.5, 7] here.
+        scalar = all(np.ndim(v) == 0
+                     for v in (_lgrho, _lgp, _yp, _z, _zm, _za, _zr))
+        (_lgrho, _lgp, _yp_a, _z_a, _zm_a, _za_a, _zr_a) = np.broadcast_arrays(
+            *(np.atleast_1d(np.asarray(v, dtype=float))
+              for v in (_lgrho, _lgp, _yp, _z, _zm, _za, _zr)))
         out = np.full_like(_lgrho, np.nan, dtype=float)
 
         prev_sol = None
         for idx in np.ndindex(_lgrho.shape):
             rho_i = float(_lgrho[idx])
             lgp_i = float(_lgp[idx])
+            yp_i = float(_yp_a[idx])
+            comp_i = (float(_z_a[idx]), float(_zm_a[idx]),
+                      float(_za_a[idx]), float(_zr_a[idx]))
 
-            def err(lgt, _r=rho_i, _p=lgp_i):
+            def err(lgt, _r=rho_i, _p=lgp_i, _y=yp_i, _c=comp_i):
                 try:
-                    return float(self._logrho_pt(
-                        _p, lgt, _yp, _z, _zm, _za, _zr) - _r)
+                    return float(self._logrho_pt(_p, lgt, _y, *_c) - _r)
                 except (ZeroDivisionError, FloatingPointError):
                     return np.nan
 
             guess = (prev_sol if prev_sol is not None
-                     else ideal_xy.get_t_rhop(rho_i, lgp_i, _yp))
+                     else ideal_xy.get_t_rhop(rho_i, lgp_i, yp_i))
             sol, ok = self._newton_1d(err, guess, 1.5, 7.0)
-            if np.isfinite(sol):
+            if not ok:
+                f_lo, f_hi = err(1.5), err(7.0)
+                if np.isfinite(f_lo) and np.isfinite(f_hi) and f_lo * f_hi < 0:
+                    try:
+                        sol, ok = brentq(err, 1.5, 7.0, xtol=1e-10), True
+                    except (ValueError, RuntimeError, ZeroDivisionError):
+                        pass
+            if ok and np.isfinite(sol):
                 out[idx] = sol
                 prev_sol = sol
 
@@ -4283,7 +4699,8 @@ class hhe_z_mixtures():
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
             return self._interp_rock(_zr, *[
-                s.get_logt_rhop(_lgrho, _lgp, _yp, _z, **kw)
+                s.get_logt_rhop(_lgrho, _lgp, _yp, _z,
+                                _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
         return self._logt_rhop_noconv(
@@ -4319,7 +4736,8 @@ class hhe_z_mixtures():
         _zm, _za, _zr = self._resolve_comp(_zm, _za, _zr, _frock)
         if self.rock_interp:
             return self._interp_rock(_zr, *[
-                s.get_s_rhop(_lgrho, _lgp, _yp, _z, **kw)
+                s.get_s_rhop(_lgrho, _lgp, _yp, _z,
+                             _zm=_zm, _za=_za, _zr=s.f_rock, **kw)
                 for s in self._rock_subs])
         logt = self.get_logt_rhop(
             _lgrho, _lgp, _yp, _z, _zm=_zm, _za=_za, _zr=_zr)
@@ -4358,7 +4776,7 @@ class hhe_z_mixtures():
 
     def load_rhop_table(self, path):
         """Load a ρ-P → T table from NPZ."""
-        data = np.load(path)
+        data = _loadz_shuffled(path)
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
         rgi_kw = dict(method=self._interp_method, bounds_error=False,
@@ -4400,7 +4818,7 @@ class hhe_z_mixtures():
         return out
 
     def build_rhop_table(self, yvals, zvals,
-                         _zm=0.0, _za=0.0, _zr=0.0,
+                         _zm=None, _za=None, _zr=None,
                          smooth_inverted=False,
                          n_workers=1,
                          verbose=True):
@@ -4423,6 +4841,7 @@ class hhe_z_mixtures():
         verbose : bool
             Print progress.
         """
+        _zm, _za, _zr = self._builder_comp(_zm, _za, _zr)
         yvals = np.asarray(yvals, dtype=float)
         zvals = np.asarray(zvals, dtype=float)
         logrho = self.logrho_vals
@@ -4520,7 +4939,7 @@ class hhe_z_mixtures():
         if path is None:
             path = self._table_path('rhop')
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(path, **result)
+        _savez_shuffled(path, **result)
         print(f"Saved {path}")
 
     # =================================================================
@@ -4638,7 +5057,7 @@ class hhe_z_mixtures():
         if self.rock_interp:
             return self._interp_rock(_zr, *[
                 s.get_logp_logt_srho(_s_kb, _lgrho, _yp, _z,
-                                     _zm=_zm, _za=_za, _zr=0.0,
+                                     _zm=_zm, _za=_za, _zr=s.f_rock,
                                      basis=basis, use_tab=use_tab, **kw)
                 for s in self._rock_subs])
         _yp = self._to_yprime(_yp, _z)
@@ -4720,7 +5139,7 @@ class hhe_z_mixtures():
 
     def load_srho_table(self, path):
         """Load a pre-computed S-ρ table from NPZ."""
-        data = np.load(path)
+        data = _loadz_shuffled(path)
         self.logt_min = float(data['logt_min'])
         self.logt_max = float(data['logt_max'])
         rgi_kw = dict(method=self._interp_method, bounds_error=False,
@@ -4782,7 +5201,7 @@ class hhe_z_mixtures():
         return out_p, out_t
 
     def build_srho_table(self, yvals, zvals,
-                         _zm=0.0, _za=0.0, _zr=0.0,
+                         _zm=None, _za=None, _zr=None,
                          s_lo=4.0, s_hi=12.0, s_step=0.1,
                          smooth_inverted=False,
                          n_workers=1,
@@ -4820,6 +5239,7 @@ class hhe_z_mixtures():
         verbose : bool
             Print progress.
         """
+        _zm, _za, _zr = self._builder_comp(_zm, _za, _zr)
         if self._logp_rhot_rgi is None:
             raise RuntimeError(
                 "build_srho_table requires a pre-computed rho-T table "
@@ -4949,7 +5369,7 @@ class hhe_z_mixtures():
         if path is None:
             path = self._table_path('srho')
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(path, **result)
+        _savez_shuffled(path, **result)
         print(f"Saved {path}")
 
     # =================================================================
@@ -5184,10 +5604,12 @@ class hhe_z_mixtures():
 
     def get_dsdy_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1,
                             dy=0.01, _zm=None, _za=None, _zr=None, use_tab=True, **kw):
-        """dS/dY|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
+        """dS/dY|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.  ORCHARD's path.
 
-        Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Y
-        and using the ρ-P inversion to find T(ρ, P, Y±dY, Z).
+        Triple-product rule on the S-ρ inversion:
+        (∂S/∂Y)_{ρ,P} = -(∂P/∂Y)_{S,ρ} / (∂P/∂S)_{ρ,Y}, both finite
+        differences of P(S, ρ).  Reads the S-ρ table (falling back to the
+        ρ-T table + forward model); never the ρ-P table.
 
         Differentiates w.r.t. TOTAL Y; the leaf inversions perform the
         single Y->Y' conversion, so we MUST NOT pre-convert here.
@@ -5206,10 +5628,11 @@ class hhe_z_mixtures():
     
     def get_dsdy_rhop(self, _lgrho, _lgp, _y, _z, _frock=0.0,
                             dy=0.01, _zm=None, _za=None, _zr=None, **kw):
-        """dS/dY|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
+        """dS/dY|_{ρ,P} (Ledoux).  Takes (ρ, P) inputs.  Not used by ORCHARD.
 
-        Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Y
-        and using the ρ-P inversion to find T(ρ, P, Y±dY, Z).
+        FD at fixed (ρ, P) by varying Y, with the ρ-P inversion giving
+        T(ρ, P, Y±dY, Z) (the ρ-P table if ``rhop_tab=True``, otherwise
+        root-finding).  ORCHARD uses ``get_dsdy_rhop_srho``.
         Differentiates w.r.t. TOTAL Y (leaves convert; do not pre-convert).
         """
         if _zr is None:
@@ -5222,10 +5645,11 @@ class hhe_z_mixtures():
     
     def get_dsdz_rhop_srho(self, _s, _lgrho, _y, _z, _frock=0.0, ds=0.1,
                             dz=0.01, _zm=None, _za=None, _zr=None, use_tab=True, **kw):
-        """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
+        """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.  ORCHARD's path.
 
-        Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Z
-        and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
+        Triple-product rule on the S-ρ inversion:
+        (∂S/∂Z)_{ρ,P} = -(∂P/∂Z)_{S,ρ} / (∂P/∂S)_{ρ,Z}; reads the S-ρ
+        table, never the ρ-P table.
         Total Y held fixed (leaves convert; do not pre-convert here).
         """
         # dPdS|{rho, Y, Z}:
@@ -5240,10 +5664,11 @@ class hhe_z_mixtures():
 
     def get_dsdz_rhop(self, _lgrho, _lgp, _y, _z, _frock=0.0,
                             dz=0.01, _zm=None, _za=None, _zr=None, **kw):
-        """dS/dZ|_{ρ,P} (Ledoux).  Takes (S, ρ) inputs.
+        """dS/dZ|_{ρ,P} (Ledoux).  Takes (ρ, P) inputs.  Not used by ORCHARD.
 
-        Inverts (S, ρ) → P first, then FD at fixed (ρ, P) by varying Z
-        and using the ρ-P inversion to find T(ρ, P, Y, Z±dZ).
+        FD at fixed (ρ, P) by varying Z, with the ρ-P inversion giving
+        T(ρ, P, Y, Z±dZ) (the ρ-P table if ``rhop_tab=True``, otherwise
+        root-finding).  ORCHARD uses ``get_dsdz_rhop_srho``.
         Total Y held fixed (leaves convert; do not pre-convert here).
         """
         if _zr is None:
@@ -8506,711 +8931,3 @@ class multifraction_mixtures(mixtures):
         t2 = 10**self.get_logt_sp(_s + ds, _lgp, _y, _z, _frock, **kwargs)
 
         return (t2 - t1)/(2 * ds / erg_to_kbbar)
-
-
-class total_eos(mixtures):
-
-    def __init__(self,
-                 hhe_eos = 'cd',
-                 z_eos = 'total_mixture',
-                 hg: bool = False,
-                 y_prime: bool = False,
-                 interp_method: str = 'linear',
-                 pt_only: bool = False, # for new inversions PT is calculated first to get Rho, T and S, P later
-                 srho_table: bool = True, # To obtain S, Rho table, we need Rho, T and S, P tables first or perform a double inversion
-                 new_z_mix: bool = True,
-                 smooth_hhe: bool = False
-                    ):
-
-        super().__init__(hhe_eos=hhe_eos, z_eos=z_eos, hg=hg, y_prime=y_prime, interp_method=interp_method, new_z_mix=new_z_mix, smooth_hhe=smooth_hhe)
-
-        self.hhe_eos = hhe_eos
-        self.z_eos = z_eos
-        self.y_prime = y_prime
-        self.hg = hg
-        self.interp_method = interp_method
-        self.table_types  = ['pt', 'rhot', 'sp', 'srho']  # or add 'rhop' if needed
-        self.interp_method = interp_method
-
-        self.pt_data = np.load('eos/total_mixture_eos/merged_eos_pt.npz')
-
-        # RGI interpolation functions
-
-        ####### P, T ####### tables
-        rgi_args = {'method': self.interp_method, 'bounds_error': False, 'fill_value': None}
-        # 1-D independent grids (P, T)
-        self.logpvals = self.pt_data['logpvals'] # Units: log10 dyn/cm^2
-        self.logtvals = self.pt_data['logtvals'] # log10 K
-        self.yvals_pt = self.pt_data['yvals'] # mass fraction -- yprime
-        self.zvals_pt = self.pt_data['zvals'] # mass fraction
-        self.zmvals_pt = self.pt_data['zmvals']
-        self.zavals_pt = self.pt_data['zavals']
-        #self.zrvals_pt = self.pt_data['zrvals']
-
-        # 7-D dependent grids (P, T)
-        self.s_pt_tab = self.pt_data['s'] # erg/g/K
-        self.logrho_pt_tab = self.pt_data['logrho'] # log10 g/cc
-        self.u_pt_tab = self.pt_data['u'] # log10 erg/g
-
-        self.s_pt_rgi = RGI((self.logpvals, self.logtvals, self.yvals_pt, self.zvals_pt, self.zmvals_pt, self.zavals_pt,
-                                    #self.zrvals_pt
-                                    ),
-                                self.s_pt_tab, **rgi_args)
-        self.logrho_pt_rgi = RGI((self.logpvals, self.logtvals, self.yvals_pt, self.zvals_pt, self.zmvals_pt, self.zavals_pt,
-                                    #self.zrvals_pt
-                                    ),
-                                self.logrho_pt_tab, **rgi_args)
-        self.u_pt_rgi = RGI((self.logpvals, self.logtvals, self.yvals_pt, self.zvals_pt, self.zmvals_pt, self.zavals_pt,
-                                #self.zrvals_pt
-                                ),
-                                self.u_pt_tab, **rgi_args)
-
-        if not pt_only:
-            # RGI interpolation functions
-
-            ####### Rho, T ####### tables
-            # self.rhot_data = np.load('eos/total_mixture_eos/merged_eos_rhot.npz'))
-            # self.logrhovals = self.rhot_data['logrhovals'] # log10 g/cc
-            # self.logtvals_rhot = self.rhot_data['logtvals'] # log10 K
-            # self.yvals_rhot = self.rhot_data['yvals'] # mass fraction -- yprime
-            # self.zvals_rhot = self.rhot_data['zvals'] # mass fraction
-            # self.zmvals_rhot = self.rhot_data['zmvals']
-            # self.zavals_rhot = self.rhot_data['zavals']
-            ## self.zrvals_rhot = self.rhot_data['zrvals']
-
-            # # 7-D dependent grids (Rho, T)-- S(rho, T) can be calculated with S(P(rho, T), T)
-            # self.logp_rhot_tab = self.rhot_data['logP']
-
-            # self.logp_rhot_rgi = RGI((self.logrhovals, self.logtvals_rhot, self.yvals_rhot, self.zvals_rhot,
-            #                         self.zmvals_rhot, self.zavals_rhot,
-            #                         self.logp_rhot_tab, **rgi_args)
-
-            ####### S, P ####### tables
-            self.sp_data = np.load('eos/total_mixture_eos/merged_eos_sp.npz')
-            self.svals_sp = self.sp_data['svals'] # erg/g/K
-            self.logpvals_sp = self.sp_data['logpvals'] # log10 dyn/cm^2
-            self.yvals_sp = self.sp_data['yvals'] # mass fraction -- yprime
-            self.zvals_sp = self.sp_data['zvals'] # mass fraction
-            self.zmvals_sp = self.sp_data['zmvals']
-            self.zavals_sp = self.sp_data['zavals']
-            #self.zrvals_sp = self.sp_data['zrvals']
-
-            # 7-D dependent grids (S, P)-- Rho(S, P) can be calculated with Rho(P, T(S, P))
-            self.logt_sp_tab = self.sp_data['logT'] # log10 K
-
-            self.logt_sp_rgi = RGI((self.svals_sp, self.logpvals_sp, self.yvals_sp, self.zvals_sp,
-                                    self.zmvals_sp, self.zavals_sp),
-                                    self.logt_sp_tab, **rgi_args)
-
-            if srho_table:
-                # S, Rho tables
-                self.srho_data = np.load('eos/total_mixture_eos/merged_eos_srho.npz')
-                self.svals_srho = self.srho_data['svals']
-                self.logrhovals_srho = self.srho_data['logrhovals']
-                self.yvals_srho = self.srho_data['yvals'] # mass fraction -- yprime
-                self.zvals_srho = self.srho_data['zvals']
-                self.zmvals_srho = self.srho_data['zmvals']
-                self.zavals_srho = self.srho_data['zavals']
-
-                # 7-D dependent grids (S, Rho)-- T(S, Rho) can be calculated with T(S, P(S, Rho))
-                self.logp_srho_tab = self.srho_data['logP'] # log10 dyn/cm^2
-
-                self.logp_srho_rgi = RGI((self.svals_srho, self.logrhovals_srho, self.yvals_srho, self.zvals_srho,
-                                        self.zmvals_srho, self.zavals_srho, self.zrvals_srho),
-                                        self.logp_srho_tab, **rgi_args)
-
-    ######## P, T ####### getters
-    def get_s_pt(self, _lgp, _lgt, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            return self.s_pt_rgi(( _lgp, _lgt, _y, _z, _zm, _za))
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            #_za = _z / (1 - _zr+1e-6)
-            return self.s_pt_rgi(( _lgp, _lgt, _y, _z, _zm, _za))
-
-
-    def get_logrho_pt(self, _lgp, _lgt, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            return self.logrho_pt_rgi(( _lgp, _lgt, _y, _z, _zm, _za))
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            #_za = _z / (1 - _zr+1e-6)
-            return self.logrho_pt_rgi(( _lgp, _lgt, _y, _z, _zm, _za))
-
-    def get_u_pt(self, _lgp, _lgt, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            return self.u_pt_rgi(( _lgp, _lgt, _y, _z, _zm, _za))
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            #_za = _z / (1 - _zr+1e-6)
-            return self.u_pt_rgi(( _lgp, _lgt, _y, _z, _zm, _za))
-
-    ######## Rho, T ####### getters
-    def get_logp_rhot(self, _lgrho, _lgt, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            return self.logp_rhot_rgi(( _lgrho, _lgt, _y, _z, _zm, _za))
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zr+1e-6)
-            return self.logp_rhot_rgi(( _lgrho, _lgt, _y, _z, _zm, _za))
-
-    def get_s_rhot(self, _lgrho, _lgt, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            logp = self.get_logp_rhot( _lgrho, _lgt, _y, _z, _zm, _za)
-            return self.get_s_pt(logp, _lgt, _y, _z, _zm, _za)
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zr+1e-6)
-
-            logp = self.get_logp_rhot( _lgrho, _lgt, _y, _z, _zm, _za)
-            return self.get_s_pt(logp, _lgt, _y, _z, _zm, _za)
-
-    def get_u_rhot(self, _lgrho, _lgt, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            logp = self.get_logp_rhot( _lgrho, _lgt, _y, _z, _zm, _za)
-            return self.get_u_pt(logp, _lgt, _y, _z, _zm, _za)
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zr+1e-6)
-
-            logp = self.get_logp_rhot( _lgrho, _lgt, _y, _z, _zm, _za)
-            return self.get_u_pt(logp, _lgt, _y, _z, _zm, _za)
-
-    ######## S, P ####### getters
-    def get_logt_sp(self, _s, _lgp, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            return self.logt_sp_rgi(( _s, _lgp, _y, _z, _zm, _za))
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zr+1e-6)
-            return self.logt_sp_rgi(( _s, _lgp, _y, _z, _zm, _za))
-
-    def get_logrho_sp(self, _s, _lgp, _y, _z, _zm, _za, _zr=0.0):
-        if self.y_prime:
-            logt = self.get_logt_sp( _s, _lgp, _y, _z, _zm, _za)
-            return self.get_logrho_pt(_lgp, logt, _y, _z, _zm, _za)
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zr+1e-6)
-
-            logt = self.get_logt_sp( _s, _lgp, _y, _z, _zm, _za)
-            return self.get_logrho_pt(_lgp, logt, _y, _z, _zm, _za)
-
-    def get_logu_sp(self, _s, _lgp, _y, _z, _zm, _za):
-        if self.y_prime:
-            logt = self.get_logt_sp( _s, _lgp, _y, _z, _zm, _za)
-            return self.get_u_pt(_lgp, logt, _y, _z, _zm, _za)
-        else:
-            _y = _y / (1 - _z+1e-6)
-            _zm = _z / (1 - _za+1e-6)
-            _za = _z / (1 - _zm+1e-6)
-
-            logt = self.get_logt_sp( _s, _lgp, _y, _z, _zm, _za)
-            return self.get_u_pt(_lgp, logt, _y, _z, _zm, _za)
-
-   ### Inversion Functions ###
-
-    def get_logt_sp_inv(self, _s, _lgp, _y, _z, _zm, _za, _zr=0.0, _zfe=0.0, ideal_guess=True, arr_guess=None, method='newton_brentq'):
-
-        """
-        Compute the temperature given entropy, pressure, helium abundance, and metallicity.
-
-        Parameters:
-            _s (array_like): Entropy values.
-            _lgp (array_like): Log10 pressure values.
-            _y (array_like): Helium mass fraction values.
-            _z (array_like): Heavy metal mass fraction values.
-            ideal_guess (bool, optional): If True, use the ideal EOS for the initial guess (default is True).
-            logt_guess (array_like, optional): User-provided initial guess for log temperature when `ideal_guess` is False.
-
-        Returns:
-            ndarray: Computed temperature values.
-        """
-
-        _s = np.atleast_1d(_s)
-        _lgp = np.atleast_1d(_lgp)
-        _y = np.atleast_1d(_y)
-        _z = np.atleast_1d(_z)
-        _zm = np.atleast_1d(_zm)
-        _za = np.atleast_1d(_za)
-        _zr = np.atleast_1d(_zr)
-        _zfe = np.atleast_1d(_zfe)
-
-        # _y = _y if self.y_prime else _y * (1 - _z)
-        # Ensure inputs are numpy arrays and broadcasted to the same shape
-        _s, _lgp, _y, _z, _zm, _za, _zr, _zfe = np.broadcast_arrays(_s, _lgp, _y, _z, _zm, _za, _zr, _zfe)
-
-        if ideal_guess:
-            guess = ideal_xy.get_t_sp(_s, _lgp, _y)
-        else:
-            if arr_guess is None:
-                raise ValueError("arr_guess must be provided when ideal_guess is False.")
-            guess = arr_guess
-
-    # Define a function to compute root and capture convergence
-        def root_func(s_i, lgp_i, y_i, z_i, zm_i, za_i, zr_i, zfe_i, guess_i):
-            def err(_lgt):
-                # Error function for logt(S, logp)
-                #s_test = self.get_s_pt(lgp_i, _lgt, y_i, z_i, zm_i, za_i) * erg_to_kbbar
-                s_test = self.get_s_pt_val(lgp_i, _lgt, y_i, z_i, zm_i, za_i) * erg_to_kbbar
-                return (s_test/s_i) - 1
-
-            if method == 'root':
-                sol = root(err, guess_i, tol=1e-8)
-                if sol.success:
-                    return sol.x[0], True
-                else:
-                    return np.nan, False  # Assign np.nan to non-converged elements
-
-            elif method == 'newton':
-                try:
-                    sol_root = newton(err, x0=guess_i, tol=1e-5, maxiter=100)
-                    return sol_root, True
-                except RuntimeError:
-                    #Convergence failed
-                    return np.nan, False
-                except Exception as e:
-                    #Handle other exceptions
-                    return np.nan, False
-
-            elif method == 'brentq':
-                # Define an initial interval around the guess
-                delta = 0.1  # Initial interval half-width
-                a = guess_i - delta
-                b = guess_i + delta
-
-                # Try to find a valid interval where the function changes sign
-                max_attempts = 5
-                factor = 2.0  # Factor to expand the interval if needed
-
-                for attempt in range(max_attempts):
-                    try:
-                        fa = err(a)
-                        fb = err(b)
-                        if np.isnan(fa) or np.isnan(fb):
-                            raise ValueError("Function returned NaN.")
-
-                        if fa * fb < 0:
-                            # Valid interval found
-                            sol_root = brentq(err, a, b, xtol=1e-5, maxiter=100)
-                            return sol_root, True
-                        else:
-                            # Expand the interval and try again
-                            a -= delta * factor
-                            b += delta * factor
-                            delta *= factor  # Increase delta for next iteration
-                    except ValueError:
-                        # If err() cannot be evaluated, expand the interval
-                        a -= delta * factor
-                        b += delta * factor
-                        delta *= factor
-
-                # If no valid interval is found after max_attempts
-                return np.nan, False
-
-            elif method == 'newton_brentq':
-                # Try the Newton method first
-                try:
-                    sol_root = newton(err, x0=guess_i, tol=1e-5, maxiter=100)
-                    return sol_root, True
-                except RuntimeError:
-                    # Fall back to the Brentq method if Newton fails
-                    delta = 0.1
-                    a = guess_i - delta
-                    b = guess_i + delta
-                    max_attempts = 5
-                    factor = 2.0
-
-                    for attempt in range(max_attempts):
-                        try:
-                            fa = err(a)
-                            fb = err(b)
-                            if np.isnan(fa) or np.isnan(fb):
-                                raise ValueError("Function returned NaN.")
-                            if fa * fb < 0:
-                                sol_root = brentq(err, a, b, xtol=1e-5, maxiter=100)
-                                return sol_root, True
-                            else:
-                                a -= delta * factor
-                                b += delta * factor
-                                delta *= factor
-                        except ValueError:
-                            a -= delta * factor
-                            b += delta * factor
-                            delta *= factor
-                    return np.nan, False
-
-                except OverflowError:
-                    print('Failed at s={}, logp={}, y={}, z={}'.format(s_i, lgp_i, y_i, z_i, zm_i, za_i, zr_i))
-                    raise
-            else:
-                raise ValueError("Invalid method specified. Use 'root', 'newton', or 'brentq'.")
-        # Vectorize the root_func
-        vectorized_root_func = np.vectorize(root_func, otypes=[np.float64, bool])
-
-        # Apply the vectorized function
-        temperatures, converged = vectorized_root_func(_s, _lgp, _y, _z, _zm, _za, _zr, _zfe, guess)
-
-        return temperatures, converged
-
-    def get_logrho_sp_inv(self, _s, _lgp, _y, _z, _zm, _za, _zr, _zfe=0.0, ideal_guess=True, arr_guess=None, method='newton_brentq'):
-        logt, conv = self.get_logt_sp_inv( _s, _lgp, _y, _z, _zm, _za, _zr, _zfe=0.0, ideal_guess=ideal_guess, arr_guess=arr_guess, method=method)
-        return self.get_logrho_pt(_lgp, logt, _y, _z, _zm, _za, _zr)
-
-    def get_logp_rhot_inv(self, _lgrho, _lgt, _y, _z, _zm, _za, _zr=0.0, _zfe=0.0, ideal_guess=True, arr_guess=None, method='newton_brentq'):
-
-        """
-        Compute the pressure given density, temperature, helium abundance, and metallicity.
-
-        Parameters:
-            _lgrho (array_like): Log10 density values.
-            _lgt (array_like): Log10 temperature values.
-            _y (array_like): Helium mass fraction values.
-            _z (array_like): Heavy metal mass fraction values.
-            ideal_guess (bool, optional): If True, use the ideal EOS for the initial guess (default is True).
-            logt_guess (array_like, optional): User-provided initial guess for log temperature when `ideal_guess` is False.
-
-        Returns:
-            ndarray: Computed temperature values.
-        """
-
-        _lgrho = np.atleast_1d(_lgrho)
-        _lgt = np.atleast_1d(_lgt)
-        _y = np.atleast_1d(_y)
-        _z = np.atleast_1d(_z)
-        _zm = np.atleast_1d(_zm)
-        _za = np.atleast_1d(_za)
-        _zr = np.atleast_1d(_zr)
-        _zfe = np.atleast_1d(_zfe)
-
-        #_y = _y if self.y_prime else _y / (1 - _z+1e-6)
-        # Ensure inputs are numpy arrays and broadcasted to the same shape
-        _lgrho, _lgt, _y, _z, _zm, _za, _zr, _zfe = np.broadcast_arrays(_lgrho, _lgt, _y, _z, _zm, _za, _zr, _zfe)
-
-        if ideal_guess:
-            guess = ideal_xy.get_p_rhot(_lgrho, _lgt, _y)
-        else:
-            if arr_guess is None:
-                raise ValueError("logt_guess must be provided when ideal_guess is False.")
-            guess = arr_guess
-       # Define a function to compute root and capture convergence
-        def root_func(lgrho_i, lgt_i, y_i, z_i, zm_i, za_i, zr_i, zfe_i, guess_i):
-            def err(_lgp):
-                # Error function for logt(S, logp)
-                # _y_call = y_i if self.y_prime else y_i / (1 - z_i)
-                logrho_test = self.get_logrho_pt(_lgp, lgt_i, y_i, z_i, zm_i, za_i)
-                return (logrho_test/lgrho_i) - 1
-
-            if method == 'root':
-                sol = root(err, guess_i, tol=1e-8)
-                if sol.success:
-                    return sol.x[0], True
-                else:
-                    return np.nan, False  # Assign np.nan to non-converged elements
-
-            elif method == 'newton':
-                try:
-                    sol_root = newton(err, x0=guess_i, tol=1e-5, maxiter=100)
-                    return sol_root, True
-                except RuntimeError:
-                    #Convergence failed
-                    return np.nan, False
-                except Exception as e:
-                    #Handle other exceptions
-                    return np.nan, False
-
-            elif method == 'brentq':
-                # Define an initial interval around the guess
-                delta = 0.1  # Initial interval half-width
-                a = guess_i - delta
-                b = guess_i + delta
-
-                # Try to find a valid interval where the function changes sign
-                max_attempts = 5
-                factor = 2.0  # Factor to expand the interval if needed
-
-                for attempt in range(max_attempts):
-                    try:
-                        fa = err(a)
-                        fb = err(b)
-                        if np.isnan(fa) or np.isnan(fb):
-                            raise ValueError("Function returned NaN.")
-
-                        if fa * fb < 0:
-                            # Valid interval found
-                            sol_root = brentq(err, a, b, xtol=1e-5, maxiter=100)
-                            return sol_root, True
-                        else:
-                            # Expand the interval and try again
-                            a -= delta * factor
-                            b += delta * factor
-                            delta *= factor  # Increase delta for next iteration
-                    except ValueError:
-                        # If err() cannot be evaluated, expand the interval
-                        a -= delta * factor
-                        b += delta * factor
-                        delta *= factor
-
-            elif method == 'newton_brentq':
-                # Try the Newton method first
-                try:
-                    sol_root = newton(err, x0=guess_i, tol=1e-5, maxiter=100)
-                    return sol_root, True
-                except RuntimeError:
-                    # Fall back to the Brentq method if Newton fails
-                    delta = 0.1
-                    a = guess_i - delta
-                    b = guess_i + delta
-                    max_attempts = 5
-                    factor = 2.0
-
-                    for attempt in range(max_attempts):
-                        try:
-                            fa = err(a)
-                            fb = err(b)
-                            if np.isnan(fa) or np.isnan(fb):
-                                raise ValueError("Function returned NaN.")
-                            if fa * fb < 0:
-                                sol_root = brentq(err, a, b, xtol=1e-5, maxiter=100)
-                                return sol_root, True
-                            else:
-                                a -= delta * factor
-                                b += delta * factor
-                                delta *= factor
-                        except ValueError:
-                            a -= delta * factor
-                            b += delta * factor
-                            delta *= factor
-                    return np.nan, False
-                # If no valid interval is found after max_attempts
-                return np.nan, False
-            else:
-                raise ValueError("Invalid method specified. Use 'root', 'newton', or 'brentq'.")
-        # Vectorize the root_func
-        vectorized_root_func = np.vectorize(root_func, otypes=[np.float64, bool])
-
-        # Apply the vectorized function
-        pressure, converged = vectorized_root_func(_lgrho, _lgt, _y, _z, _zm, _za, _zr, _zfe, guess)
-
-        return pressure, converged
-
-
-    def get_logp_srho_inv(self, _s, _lgrho, _y, _z, _zm, _za, _zr=0.0, _zfe=0.0, ideal_guess=True, arr_guess=None, method='newton_brentq'):
-
-        """
-        Compute the pressure given entropy, density, helium abundance, and metallicity.
-
-        Parameters:
-            _s (array_like): Entropy values.
-            _lgrho (array_like): Log10 density values.
-            _y (array_like): Helium mass fraction values.
-            _z (array_like): Heavy metal mass fraction values.
-            ideal_guess (bool, optional): If True, use the ideal EOS for the initial guess (default is True).
-            logt_guess (array_like, optional): User-provided initial guess for log temperature when `ideal_guess` is False.
-
-        Returns:
-            ndarray: Computed temperature values.
-        """
-
-        _s = np.atleast_1d(_s)
-        _lgrho = np.atleast_1d(_lgrho)
-        _y = np.atleast_1d(_y)
-        _z = np.atleast_1d(_z)
-        _zm = np.atleast_1d(_zm)
-        _za = np.atleast_1d(_za)
-        _zr = np.atleast_1d(_zr)
-        _zfe = np.atleast_1d(_zfe)
-
-        #_y = _y if self.y_prime else _y / (1 - _z+1e-6)
-
-        # Ensure inputs are numpy arrays and broadcasted to the same shape
-        _s, _lgrho, _y, _z, _zm, _za, _zr, _zfe = np.broadcast_arrays(_s, _lgrho, _y, _z, _zm, _za, _zr, _zfe)
-
-        if ideal_guess:
-            guess = ideal_xy.get_p_srho(_s, _lgrho, _y)
-        else:
-            if arr_guess is None:
-                raise ValueError("logt_guess must be provided when ideal_guess is False.")
-            guess = arr_guess
-        # Define a function to compute root and capture convergence
-        def root_func(s_i, lgrho_i, y_i, z_i, zm_i, za_i, zr_i, zfe_i, guess_i):
-            def err(_lgp):
-                # Error function for logt(S, logp)
-                logrho_test = self.get_logrho_sp(s_i, _lgp, y_i, z_i, zm_i, za_i)
-                return (logrho_test/lgrho_i) - 1
-
-            if method == 'root':
-                sol = root(err, guess_i, tol=1e-8)
-                if sol.success:
-                    return sol.x[0], True
-                else:
-                    return np.nan, False  # Assign np.nan to non-converged elements
-
-            elif method == 'newton':
-                try:
-                    sol_root = newton(err, x0=guess_i, tol=1e-5, maxiter=100)
-                    return sol_root, True
-                except RuntimeError:
-                    #Convergence failed
-                    return np.nan, False
-                except Exception as e:
-                    #Handle other exceptions
-                    return np.nan, False
-
-            elif method == 'brentq':
-                # Define an initial interval around the guess
-                delta = 0.1  # Initial interval half-width
-                a = guess_i - delta
-                b = guess_i + delta
-
-                # Try to find a valid interval where the function changes sign
-                max_attempts = 5
-                factor = 2.0  # Factor to expand the interval if needed
-
-                for attempt in range(max_attempts):
-                    try:
-                        fa = err(a)
-                        fb = err(b)
-                        if np.isnan(fa) or np.isnan(fb):
-                            raise ValueError("Function returned NaN.")
-
-                        if fa * fb < 0:
-                            # Valid interval found
-                            sol_root = brentq(err, a, b, xtol=1e-5, maxiter=100)
-                            return sol_root, True
-                        else:
-                            # Expand the interval and try again
-                            a -= delta * factor
-                            b += delta * factor
-                            delta *= factor  # Increase delta for next iteration
-                    except ValueError:
-                        # If err() cannot be evaluated, expand the interval
-                        a -= delta * factor
-                        b += delta * factor
-                        delta *= factor
-
-                # If no valid interval is found after max_attempts
-                return np.nan, False
-
-            elif method == 'newton_brentq':
-                # Try the Newton method first
-                try:
-                    sol_root = newton(err, x0=guess_i, tol=1e-5, maxiter=100)
-                    return sol_root, True
-                except RuntimeError:
-                    # Fall back to the Brentq method if Newton fails
-                    delta = 0.1
-                    a = guess_i - delta
-                    b = guess_i + delta
-                    max_attempts = 5
-                    factor = 2.0
-
-                    for attempt in range(max_attempts):
-                        try:
-                            fa = err(a)
-                            fb = err(b)
-                            if np.isnan(fa) or np.isnan(fb):
-                                raise ValueError("Function returned NaN.")
-                            if fa * fb < 0:
-                                sol_root = brentq(err, a, b, xtol=1e-5, maxiter=100)
-                                return sol_root, True
-                            else:
-                                a -= delta * factor
-                                b += delta * factor
-                                delta *= factor
-                        except ValueError:
-                            a -= delta * factor
-                            b += delta * factor
-                            delta *= factor
-                    return np.nan, False
-            else:
-                raise ValueError("Invalid method specified. Use 'root', 'newton', or 'brentq'.")
-        # Vectorize the root_func
-        vectorized_root_func = np.vectorize(root_func, otypes=[np.float64, bool])
-
-        # Apply the vectorized function
-        temperatures, converged = vectorized_root_func(_s, _lgrho, _y, _z, _zm, _za, _zr, _zfe, guess)
-
-        return temperatures, converged
-
-
-    def glitch_correct_1d(self, y, window=5, n_sigmas=3):
-        """
-        1) Identify outliers in y with a hampel filter, window +/- 'window'.
-        2) Mark them as nan in a copy.
-        3) Interpolate the nans.
-        Returns y_corrected.
-        """
-        y_copy = np.asarray(y, float).copy()
-        n = len(y_copy)
-        outlier_inds = []
-        for i in range(n):
-            w_start = max(0, i-window)
-            w_end   = min(n, i+window+1)
-            local_y = y_copy[w_start:w_end]
-            med = np.median(local_y)
-            mad = 1.4826 * np.median(np.abs(local_y - med)) or 1e-6
-            if abs(y_copy[i] - med) > n_sigmas*mad:
-                outlier_inds.append(i)
-
-        # set them to nan
-        y_copy[outlier_inds] = np.nan
-
-        # now interpolate the nan
-        y_fixed = self.fill_nans_1d(y_copy, kind='linear')
-        return y_fixed
-
-    def fill_nans_1d(self, arr, kind='linear'):
-        """
-        Fill NaNs in a 1D array by interpolation of any specified 'kind'
-        recognized by scipy.interpolate.interp1d:
-        'linear', 'nearest', 'zero', 'slinear', 'quadratic', 'cubic', etc.
-
-        Parameters
-        ----------
-        arr : 1D numpy array
-            Array that may contain NaNs.
-        kind : str
-            Interpolation type to pass to interp1d (e.g. 'linear', 'quadratic').
-
-        Returns
-        -------
-        arr_filled : 1D numpy array
-            A copy of arr with NaNs replaced by interpolation of the specified kind.
-            If there are not enough valid points to interpolate (e.g., all NaN),
-            we simply return arr unchanged.
-        """
-
-        arr = np.asarray(arr)
-        if arr.ndim != 1:
-            raise ValueError("This function only handles 1D arrays.")
-
-        x = np.arange(len(arr))
-        valid_mask = ~np.isnan(arr)
-
-        # If everything is NaN, or only 1 valid point, we can’t do a real polynomial interpolation.
-        if np.count_nonzero(valid_mask) < 2:
-            return arr  # or decide on a default fill approach
-
-        # Build the interpolator.  'fill_value="extrapolate"' lets us fill beyond the data range.
-        f = interp1d(
-            x[valid_mask],
-            arr[valid_mask],
-            kind=kind,
-            fill_value="extrapolate"
-        )
-
-        # Create a copy for the result
-        arr_filled = arr.copy()
-        # Where arr is NaN, replace with the interpolation
-        arr_filled[~valid_mask] = f(x[~valid_mask])
-
-        return arr_filled

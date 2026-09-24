@@ -253,18 +253,46 @@ class ICES_COMB_EOS:
         the pure species; use it only for comparisons against those tables.
     """
 
-    def __init__(self, version=TABLE_VERSION, s_gauge='thirdlaw'):
+    def __init__(self, version=TABLE_VERSION, s_gauge='thirdlaw', smooth_z=False):
         if s_gauge not in ('thirdlaw', 'table'):
             raise ValueError("s_gauge must be 'thirdlaw' or 'table'")
         self.s_gauge = s_gauge
+        # Water must come from the SAME interpolant the precomputed tables use,
+        # including the same smoothing.  `aqua_eos` is the raw module-level
+        # table: unsmoothed, and with its own NaN fill.  `z_eos` applies
+        # smooth_z and a pressure-first fill.  Sourcing water from the wrong one
+        # breaks the Z_m = Z_a = 0 limit -- with smooth_z on, by up to 1.0 dex
+        # in rho, 0.63 dex in u and 37% in s, concentrated wherever smoothing
+        # actually does work (the saturation discontinuity and the fill corner).
+        self._smooth_z = bool(smooth_z)
+        self._water_src = None
         self.version = str(version)
 
         # Pure species: methane and ammonia from the Helmholtz tables (P-T
         # basis only; the rho-T basis plays no role in P-T mixing), water from
         # the module-level revised-AQUA interpolants.
+        # NOTE: deliberately NOT smoothed, and `smooth_z` is deliberately not
+        # threaded in here.  `smooth_z` drives `eos.ch4/nh3.smooth_pt_tables`, a
+        # Hampel + Gaussian ARTEFACT filter written for the legacy per-species
+        # tables.  The v3 surfaces are a penalised spline fit with an explicit
+        # roughness penalty, so they carry no such artefacts: measured RMS second
+        # difference of log10 rho along logP over logP 6.5-13.5 x logT 2.2-4.2 is
+        #
+        #     methane  v3 2.59e-3   legacy raw 7.10e-3   legacy smoothed 6.51e-3
+        #     ammonia  v3 1.88e-2   legacy raw 1.44e-1   legacy smoothed 7.11e-2
+        #
+        # i.e. the v3 surfaces are already 2.5x (CH4) and 3.8x (NH3) smoother than
+        # the filter's own output on the legacy data.  Running the filter over them
+        # would only blur real structure the fit resolves on purpose (the
+        # saturation dome), so the asymmetry with water/rock under --smooth_z is
+        # intentional, not an oversight.
         self.ch4_nh3 = CH4_NH3_EOS(version=self.version, rhot=False, pt=True)
         self.methane = self.ch4_nh3.methane
         self.ammonia = self.ch4_nh3.ammonia
+        # Raw module handle, kept only for grid metadata (axis bounds and the
+        # filled-cell mask below).  VALUES come from the bound z_eos water via
+        # _water(), so that the Z_m = Z_a = 0 limit is the same interpolant the
+        # precomputed tables were built from.
         self.water = aqua_eos
 
         # Where the water entropy is an invented fill rather than table data:
@@ -350,13 +378,52 @@ class ICES_COMB_EOS:
         return vals.reshape(lgp.shape)
 
     def _water_rho(self, lgp, lgt):
-        return 10.0 ** self._water_call(self.water.get_logrho_pt_tab, lgp, lgt)
+        return 10.0 ** self._water_call(self._water()[0].get_logrho_pt, lgp, lgt)
 
     def _water_u(self, lgp, lgt):
-        return 10.0 ** self._water_call(self.water.get_logu_pt_tab, lgp, lgt)
+        return 10.0 ** self._water_call(self._water()[0].get_logu_pt, lgp, lgt)
+
+    def bind_water(self, z_water, logs_fn=None):
+        """Adopt an already-built water `z_eos` (and its filled log-S accessor).
+
+        `z_eos_val_mixtures` calls this once it has constructed `self.z`, so the
+        ices block and the legacy per-species path share one water object rather
+        than two independently-built copies of the same table.
+        """
+        self._water_src = (z_water, logs_fn if logs_fn is not None
+                           else z_water.get_logs_pt)
+
+    def _water(self):
+        """(z_eos water, log10-S accessor), built lazily if not bound."""
+        if self._water_src is None:
+            from eos.eos_class import z_eos_val_mixtures
+            zv = z_eos_val_mixtures(species_list=['water_revised'],
+                                    smooth_z=self._smooth_z)
+            self._water_src = (zv.z['water'], zv._logs_fn['water'])
+        return self._water_src
+
+    def _water_logs_fn(self):
+        """log10 S accessor for water, matching the precomputed-table path.
+
+        `aqua_eos` interpolates LINEAR entropy; `z_eos` interpolates log10 S and
+        fills AQUA's sentinel corner pressure-first with monotonisation.  Both
+        read the same revised-AQUA CSV and agree to 2e-15 at the grid nodes, so
+        the choice looks cosmetic -- it is not.  Using the linear interpolant
+        here made pure water disagree with the tables by up to 5.9e2 relative,
+        and below AQUA's 100 K floor the linear extrapolation drove S NEGATIVE
+        over ~10% of the production box (logP 5-15.1 x logT 1.3-6.0), where the
+        table path has no such cells.  A P-T table built on that would bake in
+        negative entropies and no S-P inversion could be built across the strip.
+
+        Built lazily and cached rather than in __init__: `eos_class` imports
+        this module, so the import cannot be top-level, and this class is itself
+        constructed from inside `z_eos_val_mixtures.__init__` before that
+        instance has finished building its own `_logs_fn`.
+        """
+        return self._water()[1]
 
     def _water_s(self, lgp, lgt):
-        return self._water_call(self.water.get_s_pt_tab, lgp, lgt)
+        return 10.0 ** self._water_call(self._water_logs_fn(), lgp, lgt)
 
     def _species_s(self, species, P, T):
         """Entropy of one CH4/NH3 species in the active gauge."""
